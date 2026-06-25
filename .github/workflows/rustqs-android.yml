@@ -205,15 +205,18 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          VCPKG_ROOT: /opt/artifacts/vcpkg
         run: |
+          set -euo pipefail
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
-          rustup target add aarch64-linux-android
-          python3 ./build.py --flutter --target=aarch64-linux-android || true
-          # Прямой путь сборки нативной либы (как в generator-android.yml):
-          cargo ndk --platform 21 --target aarch64-linux-android --output-dir ./flutter/android/app/src/main/jniLibs build --release || true
-          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
-          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
-             ./flutter/android/app/src/main/jniLibs/arm64-v8a/ || true
+          cargo ndk --platform 21 --target aarch64-linux-android -o ./flutter/android/app/src/main/jniLibs build --release
+          # Verify native lib was built
+          if [ ! -f ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so ]; then
+            echo "::error::librustdesk.so not found after cargo ndk build"
+            find ./flutter/android/app/src/main/jniLibs -type f
+            exit 1
+          fi
+          ls -lh ./flutter/android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Build APK (flutter, arm64)
         shell: bash
