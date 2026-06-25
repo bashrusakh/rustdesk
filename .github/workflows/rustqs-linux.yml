@@ -165,7 +165,7 @@ jobs:
             libgtk-3-dev libxcb-randr0-dev libxdo-dev libxfixes-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libpulse-dev \
             libpam0g-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libclang-dev llvm-dev
+            libunwind-dev libclang-dev llvm-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
