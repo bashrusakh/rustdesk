@@ -303,7 +303,7 @@ jobs:
       - name: Download RustDeskTempTopMostWindow artifacts (→ Release/)
         uses: actions/download-artifact@v8
         with:
-          name: topmostwindow-artifacts
+          name: topmostwindow-artifacts-x64
           path: "./flutter/build/windows/x64/runner/Release"
 
       # L2-B: положить custom_.txt в Release/ ДО запуска packer'a, чтобы он
