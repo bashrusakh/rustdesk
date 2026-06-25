@@ -57,7 +57,7 @@ jobs:
 
   build:
     needs: [bridge]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Maximize build space
         run: |
@@ -176,7 +176,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ubuntu-22.04
+          prefix-key: ubuntu-24.04
 
 
       - name: Setup vcpkg with Github Actions binary cache
