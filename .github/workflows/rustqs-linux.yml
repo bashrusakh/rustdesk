@@ -57,7 +57,7 @@ jobs:
 
   build:
     needs: [bridge]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Maximize build space
         run: |
@@ -65,14 +65,14 @@ jobs:
           df -h
 
       - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -164,7 +164,8 @@ jobs:
           sudo apt-get install -y nasm libva-dev imagemagick \
             libgtk-3-dev libxcb-randr0-dev libxdo-dev libxfixes-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libpulse-dev \
-            libpam0g-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+            libpam0g-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libunwind-dev libclang-dev llvm-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -175,10 +176,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ubuntu-22.04
+          prefix-key: ubuntu-24.04
 
-      - name: Disable rust bridge build (cdylib only)
-        run: sed -i 's/\["cdylib", "staticlib", "rlib"\]/\["cdylib"\]/g' Cargo.toml
 
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@v11
