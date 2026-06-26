@@ -214,23 +214,40 @@ jobs:
           printf '%s' "$RQS_CUSTOM_TXT" > "$dst"
           ls -la "$dst"
 
-      - name: Package artifact (.deb / .rpm)
+      - name: Install rpm-build
+        run: |
+          sudo apt-get install -y rpm-build
+
+      - name: Package artifact (.deb + .rpm)
         shell: bash
+        env:
+          HBB: ${{ github.workspace }}
         run: |
           set -eu
           APP="${RQS_APP_NAME:-rustdesk}"
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           mkdir -p ./output
-          # build.py → build_flutter_deb() создаёт rustdesk-{version}.deb в корне проекта
-          for pkg in rustdesk-*.deb rustdesk-*.rpm rustdesk-*.pkg.tar.zst; do
+
+          # 1) .deb — создан build.py → build_flutter_deb()
+          for pkg in rustdesk-*.deb; do
             [ -f "$pkg" ] || continue
             new_name="$(echo "$pkg" | sed "s/^rustdesk/${APP}/")"
             cp "$pkg" "./output/${new_name}"
+            echo "::notice::DEB: $pkg → output/${new_name}"
           done
-          # Если пакетов нет — fallback: plain tar.gz из bundle
-          if [ -z "$(ls -A ./output 2>/dev/null)" ]; then
-            bundle=flutter/build/linux/x64/release/bundle
-            tar -C "$bundle" -czf "./output/${APP}-linux-x86_64.tar.gz" .
+
+          # 2) .rpm — rpmbuild из того же flutter bundle
+          if [ -d flutter/build/linux/x64/release/bundle ]; then
+            sed -i "s/^Version:.*/Version:    ${VERSION}/" res/rpm-flutter.spec
+            rpmbuild -ba res/rpm-flutter.spec
+            rpm_file=$(find "$HOME/rpmbuild/RPMS" -name 'rustdesk-*.rpm' | head -1)
+            if [ -n "$rpm_file" ]; then
+              new_name="${APP}-${VERSION}-0.x86_64.rpm"
+              cp "$rpm_file" "./output/${new_name}"
+              echo "::notice::RPM: ${new_name}"
+            fi
           fi
+
           ls -lh ./output/
 
       - name: Upload artifact
