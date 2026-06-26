@@ -250,9 +250,9 @@ jobs:
           printf '%s' "$RQS_CUSTOM_TXT" > "$dst"
           ls -la "$dst"
 
-      - name: Install rpm-build
+      - name: Install rpm
         run: |
-          sudo apt-get install -y rpm-build
+          sudo apt-get install -y rpm
 
       - name: Package artifact (.deb + .rpm)
         shell: bash
