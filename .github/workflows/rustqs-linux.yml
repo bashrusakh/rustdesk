@@ -214,20 +214,23 @@ jobs:
           printf '%s' "$RQS_CUSTOM_TXT" > "$dst"
           ls -la "$dst"
 
-      - name: Package artifact
+      - name: Package artifact (.deb / .rpm)
         shell: bash
         run: |
           set -eu
           APP="${RQS_APP_NAME:-rustdesk}"
           mkdir -p ./output
-          bundle=flutter/build/linux/x64/release/bundle
-          # Переименуем основной бинарь в ${APP} и упакуем bundle в tar.gz.
-          if [ -f "$bundle/rustdesk" ]; then
-            cp "$bundle/rustdesk" "$bundle/${APP}" || true
+          # build.py → build_flutter_deb() создаёт rustdesk-{version}.deb в корне проекта
+          for pkg in rustdesk-*.deb rustdesk-*.rpm rustdesk-*.pkg.tar.zst; do
+            [ -f "$pkg" ] || continue
+            new_name="$(echo "$pkg" | sed "s/^rustdesk/${APP}/")"
+            cp "$pkg" "./output/${new_name}"
+          done
+          # Если пакетов нет — fallback: plain tar.gz из bundle
+          if [ -z "$(ls -A ./output 2>/dev/null)" ]; then
+            bundle=flutter/build/linux/x64/release/bundle
+            tar -C "$bundle" -czf "./output/${APP}-linux-x86_64.tar.gz" .
           fi
-          tar -C "$bundle" -czf "./output/${APP}-linux-x86_64.tar.gz" .
-          # Плюс «голый» бинарь для прямого запуска/быстрой проверки.
-          [ -f "$bundle/${APP}" ] && cp "$bundle/${APP}" "./output/${APP}" || true
           ls -lh ./output/
 
       - name: Upload artifact
