@@ -201,7 +201,7 @@ jobs:
       - name: Install vcpkg dependencies
         run: |
           # libva-dev ставим заранее, иначе vcpkg-ffmpeg спотыкается на свежем ubuntu.
-          sudo apt-get install -y libva-dev && apt show libva-dev
+          sudo apt-get install -y libva-dev
           if ! $VCPKG_ROOT/vcpkg install --triplet x64-linux --x-install-root="$VCPKG_ROOT/installed"; then
             find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
               echo "$_1:"
@@ -252,6 +252,8 @@ jobs:
 
       - name: Install rpm
         run: |
+          # Долгий vcpkg-build (ffmpeg, 5-10 мин) мог состарить apt-кэш — обновим.
+          sudo apt-get update -y
           sudo apt-get install -y rpm
 
       - name: Package artifact (.deb + .rpm)
