@@ -764,15 +764,14 @@ async fn test_rendezvous_server_() {
     Config::reset_online();
 }
 
-// #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
 pub fn test_rendezvous_server() {
     std::thread::spawn(test_rendezvous_server_);
 }
 
 pub fn refresh_rendezvous_server() {
-    #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     test_rendezvous_server();
-    #[cfg(not(any(target_os = "android", target_os = "ios", feature = "cli")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     std::thread::spawn(|| {
         if crate::ipc::test_rendezvous_server().is_err() {
             test_rendezvous_server();
@@ -1025,7 +1024,7 @@ pub fn get_full_name() -> String {
 }
 
 pub fn is_setup(name: &str) -> bool {
-    name.to_lowercase().ends_with("install.exe")
+    !config::is_disable_installation() && name.to_lowercase().ends_with("install.exe")
 }
 
 pub fn get_custom_rendezvous_server(custom: String) -> String {
@@ -1404,6 +1403,58 @@ pub async fn post_request(url: String, body: String, header: &str) -> ResultType
         post_request_via_tcp_proxy(&url, &body, header),
     )
     .await
+}
+
+/// POST request via TCP proxy, preserving the HTTP status code.
+async fn post_request_via_tcp_proxy_status(
+    url: &str,
+    body: &str,
+    header: &str,
+) -> ResultType<(u16, String)> {
+    let headers = parse_simple_header(header);
+    let resp = tcp_proxy_request("POST", url, body.as_bytes(), headers).await?;
+    if !resp.error.is_empty() {
+        bail!("TCP proxy error: {}", resp.error);
+    }
+    Ok((
+        resp.status as u16,
+        String::from_utf8_lossy(&resp.body).to_string(),
+    ))
+}
+
+/// Like `post_request`, but returns the HTTP status code so callers can tell
+/// a server-side failure from success. Same fallback rules: on connection
+/// failure or 5xx, retry once through the raw TCP proxy when eligible.
+pub async fn post_request_with_status(
+    url: String,
+    body: String,
+    header: &str,
+) -> ResultType<(u16, String)> {
+    if should_use_raw_tcp_for_api(&url) {
+        return post_request_via_tcp_proxy_status(&url, &body, header).await;
+    }
+    let http_result = post_request_http(&url, &body, header).await;
+    let should_fallback = match &http_result {
+        Err(_) => true,
+        Ok((status, _)) => *status >= 500,
+    };
+    if should_fallback && can_fallback_to_raw_tcp(&url) {
+        log::warn!(
+            "HTTP POST to {} failed or 5xx (result: {:?}), trying TCP proxy fallback",
+            tcp_proxy_log_target(&url),
+            http_result
+                .as_ref()
+                .map(|(s, _)| *s)
+                .map_err(|e| e.to_string()),
+        );
+        match post_request_via_tcp_proxy_status(&url, &body, header).await {
+            Ok(resp) => return Ok(resp),
+            Err(tcp_err) => {
+                log::warn!("TCP proxy fallback also failed: {:?}", tcp_err);
+            }
+        }
+    }
+    http_result
 }
 
 #[async_recursion]
@@ -2620,6 +2671,24 @@ pub fn get_control_permission(
     }
 }
 
+pub fn is_direct_ip_access(peer: &str) -> bool {
+    hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer)
+}
+
+// Align the maximum length of the peer id to the maximum length of the peer id in the server.
+const MAX_UNTRUSTED_PEER_ID_LEN: usize = 253;
+const UNTRUSTED_PEER_ID_FORBIDDEN_CHARS: &[char] = &['"', '<', '>', '/', '\\', '|', '?', '*'];
+
+// Shared validation for peer/connect ids that cross untrusted boundaries before
+// they are stored or written into command/script contexts.
+pub fn is_valid_untrusted_peer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_UNTRUSTED_PEER_ID_LEN
+        && !id.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || UNTRUSTED_PEER_ID_FORBIDDEN_CHARS.contains(&ch)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2648,6 +2717,29 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
         )
+    }
+
+    #[test]
+    fn untrusted_peer_id_validation() {
+        let cases = [
+            ("123456789", true),
+            ("m\u{00FC}nchen-pc", true),
+            ("192.168.1.10:21118", true),
+            ("9123456234@public", true),
+            (
+                r#"1" & oWS.Run("cmd.exe /k whoami /priv",1,False) & ""#,
+                false,
+            ),
+            ("", false),
+            ("peer id", false),
+            ("peer\nid", false),
+            ("peer/id", false),
+            ("peer?id", false),
+        ];
+
+        for (id, expected) in cases {
+            assert_eq!(is_valid_untrusted_peer_id(id), expected, "{id:?}");
+        }
     }
 
     // ThrottledInterval tick at the same time as tokio interval, if no sleeps

@@ -763,5 +763,17 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Show on the minimized toolbar", "Prikaži na minimiziranoj alatnoj traci"),
         ("All monitors", "Svi monitori"),
         ("#{} monitor", "Monitor {}"),
+        ("conn-e2ee-unavailable-tip", "End-to-end enkripcija nije mogla biti potvrđena.\nUdaljeni uređaj se možda još postavlja. Pokušajte ponovno kasnije.\nAko se to nastavi događati, poslužitelj možda nije pouzdan.\nIpak nastaviti?"),
+        ("ID whitelisting", "ID pouzdana lista"),
+        ("Use ID whitelisting", "Koristi popis pouzdanih ID-ova"),
+        ("id_whitelist_tip", "Mogu mi pristupiti samo dozvoljeni ID-ovi"),
+        ("id_whitelist_wildcard_tip", "Podržani su zamjenski znakovi: '*' odgovara bilo kojem broju znakova, '?' točno jednom znaku"),
+        ("Invalid ID", "Nevažeći ID"),
+        ("Your ID is blocked by the peer", "Vaš ID je blokiralo udaljeno računalo"),
+        ("Your ip is blocked by the peer", "Vašu IP adresu je blokiralo udaljeno računalo"),
+        ("id_whitelist_caveat_tip", "ID prijavljuje klijent koji se povezuje. Ova lista smanjuje izloženost i ne zamjenjuje lozinku ni 2FA"),
+        ("whitelist_cidr_tip", "Podržan je CIDR zapis, primjerice 192.168.1.0/24"),
+        ("Continue", ""),
+        ("Browser didn't open? Use the url below to sign in.", ""),
     ].iter().cloned().collect();
 }

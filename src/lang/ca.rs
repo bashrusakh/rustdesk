@@ -763,5 +763,17 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Show on the minimized toolbar", "Mostra a la barra d’eines minimitzada"),
         ("All monitors", "Tots els monitors"),
         ("#{} monitor", "Monitor {}"),
+        ("conn-e2ee-unavailable-tip", "No s'ha pogut verificar el xifratge d'extrem a extrem.\nEl dispositiu remot encara es pot estar configurant. Torneu-ho a provar més tard.\nSi això continua passant, el servidor pot no ser de confiança.\nVoleu continuar igualment?"),
+        ("ID whitelisting", "ID admesos"),
+        ("Use ID whitelisting", "Utilitza un llistat d'ID admesos"),
+        ("id_whitelist_tip", "Només els ID admesos es podran connectar"),
+        ("id_whitelist_wildcard_tip", "S'admeten comodins: '*' coincideix amb qualsevol nombre de caràcters, '?' amb un sol caràcter"),
+        ("Invalid ID", "ID no vàlid"),
+        ("Your ID is blocked by the peer", "El vostre ID està bloquejat per l'altre extrem"),
+        ("Your ip is blocked by the peer", "La vostra IP està bloquejada per l'altre extrem"),
+        ("id_whitelist_caveat_tip", "L'ID és informat pel client que es connecta. Aquesta llista blanca redueix l'exposició i no substitueix la contrasenya ni la 2FA"),
+        ("whitelist_cidr_tip", "S'admet la notació CIDR, per exemple 192.168.1.0/24"),
+        ("Continue", ""),
+        ("Browser didn't open? Use the url below to sign in.", ""),
     ].iter().cloned().collect();
 }

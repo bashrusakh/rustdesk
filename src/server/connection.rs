@@ -73,8 +73,16 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
+const FAILURE_IDX_ID_WHITELIST: usize = 2;
+// How long a rejection counts, so also how long a blocked address stays blocked. Longer
+// throttles enumeration harder; shorter limits collateral on whitelisted neighbours.
+const ID_WHITELIST_FAILURE_DECAY_MINUTES: i32 = 10;
+
 lazy_static::lazy_static! {
-    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
+    // [0] password, [1] 2FA, [2] ID whitelist.
+    // Bucket 2 is separate so its rejections do not touch the password / 2FA budgets. It is
+    // decayed in `check_id_whitelist` and cleared on auth, never on a bare id match.
+    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 3] = Default::default();
     static ref SESSIONS: Arc::<Mutex<HashMap<SessionKey, Session>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
@@ -240,6 +248,48 @@ pub enum AuthConnType {
     Terminal,
 }
 
+impl AuthConnType {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthConnType::Remote => "remote",
+            AuthConnType::FileTransfer => "file_transfer",
+            AuthConnType::PortForward => "port_forward",
+            AuthConnType::ViewCamera => "view_camera",
+            AuthConnType::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+enum ConnAuditPrimaryAuth {
+    None = 0,
+    Click = 1,
+    TemporaryPassword = 2,
+    PermanentPassword = 3,
+    SwitchSides = 4,
+}
+
+impl ConnAuditPrimaryAuth {
+    fn as_i64(self) -> i64 {
+        self as i64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+enum ConnAuditTwoFactor {
+    None = 0,
+    Totp = 1,
+    TrustedDevice = 2,
+}
+
+impl ConnAuditTwoFactor {
+    fn as_i64(self) -> i64 {
+        self as i64
+    }
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Clone, Debug)]
 enum TerminalUserToken {
@@ -275,6 +325,7 @@ pub struct Connection {
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
     require_2fa: Option<totp_rs::TOTP>,
+    awaiting_2fa: bool,
     keyboard: bool,
     clipboard: bool,
     audio: bool,
@@ -345,6 +396,8 @@ pub struct Connection {
     // For post requests that need to be sent sequentially.
     // eg. post_conn_audit
     tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
+    conn_audit_primary_auth: ConnAuditPrimaryAuth,
+    conn_audit_two_factor: ConnAuditTwoFactor,
     // Tracks read job IDs delegated to CM process.
     // When a read job is delegated to CM (via FS::ReadFile), the job id is added here.
     // Used to filter stale responses (FileBlockFromCM, FileReadDone, etc.) for
@@ -352,6 +405,8 @@ pub struct Connection {
     cm_read_job_ids: HashSet<i32>,
     terminal_service_id: String,
     terminal_persistent: bool,
+    // Used to avoid too many repeated scope violation warnings.
+    scope_violation_messages: HashSet<&'static str>,
     // The user token must be set when terminal is enabled.
     // 0 indicates SYSTEM user
     // other values indicate current user
@@ -457,7 +512,10 @@ impl Connection {
                 tx_video: Some(tx_video),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
-            display_idx: *display_service::PRIMARY_DISPLAY_IDX,
+            awaiting_2fa: false,
+            // Defer display enumeration until login succeeds. Monitor login replaces this
+            // with the primary index returned with the refreshed display snapshot.
+            display_idx: 0,
             stream,
             server,
             hash,
@@ -539,9 +597,12 @@ impl Connection {
             cm_read_job_ids: HashSet::new(),
             terminal_service_id: "".to_owned(),
             terminal_persistent: false,
+            scope_violation_messages: HashSet::new(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
             terminal_generic_service: None,
+            conn_audit_primary_auth: ConnAuditPrimaryAuth::None,
+            conn_audit_two_factor: ConnAuditTwoFactor::None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -625,6 +686,7 @@ impl Connection {
                 Some(data) = rx_from_cm.recv() => {
                     match data {
                         ipc::Data::Authorize => {
+                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
                             conn.require_2fa.take();
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
@@ -1323,6 +1385,64 @@ impl Connection {
         true
     }
 
+    async fn check_id_whitelist(&mut self) -> bool {
+        let id_whitelist: Vec<String> = Config::get_option(keys::OPTION_ID_WHITELIST)
+            .split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if id_whitelist.is_empty() {
+            return true;
+        }
+        // Limit before matching, or a match returning early would never touch the counter and
+        // leave enumeration unthrottled. Not cleared here: `my_id` is self-reported, so that
+        // would let anyone holding one allowed id reset the budget between probes.
+        self.decay_id_whitelist_failures();
+        let (failure, res) = self.check_failure(FAILURE_IDX_ID_WHITELIST).await;
+        if !res {
+            return false;
+        }
+        if id_whitelist_allows(&id_whitelist, &self.lr.my_id) {
+            return true;
+        }
+        self.update_failure(failure, false, FAILURE_IDX_ID_WHITELIST);
+        self.send_login_error("Your ID is blocked by the peer")
+            .await;
+        self.post_alarm_audit(
+            AlarmAuditType::IdWhitelist,
+            json!({ "id": self.lr.my_id.clone(), "ip": self.ip.clone(), "name": self.lr.my_name.clone() }),
+        );
+        false
+    }
+
+    // What `check_failure` consults: the source address, plus shared IPv6 prefixes.
+    fn failure_keys(&self) -> Vec<String> {
+        let mut keys = vec![self.ip.clone()];
+        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+            keys.extend([p64, p56, p48]);
+        }
+        keys
+    }
+
+    // Only this connection's own keys, so it stays O(1) instead of scanning the map.
+    fn decay_id_whitelist_failures(&self) {
+        decay_stale_failures(
+            &mut LOGIN_FAILURES[FAILURE_IDX_ID_WHITELIST].lock().unwrap(),
+            &self.failure_keys(),
+            (get_time() / 60_000) as i32,
+            ID_WHITELIST_FAILURE_DECAY_MINUTES,
+        );
+    }
+
+    // Not `update_failure(.., true, ..)`: it no-ops when the peer's own address has no entry,
+    // normal on IPv6, leaving the shared prefixes that are what actually block it.
+    fn clear_id_whitelist_failures(&self) {
+        clear_failures(
+            &mut LOGIN_FAILURES[FAILURE_IDX_ID_WHITELIST].lock().unwrap(),
+            &self.failure_keys(),
+        );
+    }
+
     async fn on_open(&mut self, addr: SocketAddr) -> bool {
         log::debug!("#{} Connection opened from {}.", self.inner.id, addr);
         if !self.check_whitelist(&addr).await {
@@ -1386,6 +1506,8 @@ impl Connection {
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["conn_id"] = json!(self.inner.id);
         v["session_id"] = json!(self.lr.session_id);
+        // Unique per record; the api server dedups retried posts by it.
+        v["nonce"] = json!(uuid::Uuid::new_v4().to_string());
         allow_err!(self.tx_post_seq.send((url, v)));
     }
 
@@ -1435,6 +1557,7 @@ impl Connection {
             "path":path,
             "is_file":is_file,
             "info":json!(info).to_string(),
+            "nonce": uuid::Uuid::new_v4().to_string(),
         });
         tokio::spawn(async move {
             allow_err!(Self::post_audit_async(url, v).await);
@@ -1456,7 +1579,8 @@ impl Connection {
         v["typ"] = json!(typ as i8);
         v["info"] = serde_json::Value::String(info.to_string());
         v["conn_id"] = json!(self.inner.id());
-        if typ == AlarmAuditType::IpWhitelist {
+        v["nonce"] = json!(uuid::Uuid::new_v4().to_string());
+        if typ == AlarmAuditType::IpWhitelist || typ == AlarmAuditType::IdWhitelist {
             if let Some(audit_ref) = self.conn_audit_ref() {
                 v["conn_audit_ref"] = json!(audit_ref);
             }
@@ -1466,9 +1590,137 @@ impl Connection {
         });
     }
 
-    #[inline]
+    fn post_session_scope_violation_alarm(&self, message: &'static str) {
+        let conn_type = self
+            .authed_conn_type()
+            .map(AuthConnType::as_str)
+            .unwrap_or("unknown");
+        self.post_alarm_audit(
+            AlarmAuditType::SessionScopeViolation,
+            json!({
+                "id": self.lr.my_id.clone(),
+                "name": self.lr.my_name.clone(),
+                "ip": &self.ip,
+                "conn_type": conn_type,
+                "message": message,
+            }),
+        );
+    }
+
     async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        crate::post_request(url, v.to_string(), "").await
+        // Audit records are compliance evidence; retry transport errors and
+        // 5xx (e.g. a reverse proxy answering while the api server restarts)
+        // so transient failures don't silently drop them. A 4xx is a
+        // deterministic rejection and fails immediately.
+        //
+        // The delays, not the attempt count, are what cover the case this exists
+        // for: a proxy answering 502 during a restart fails fast, so without them
+        // every attempt lands within a few seconds and none outlives the restart.
+        //
+        // The window is bounded on the other side: the api server only remembers a
+        // record's nonce for five minutes, so a retry arriving after that expired
+        // would be stored a second time. Counting attempts cannot bound it - one
+        // attempt is already up to 84s (post_request_ retries the TLS handshake up
+        // to four times at 12s each, then the TCP-proxy fallback adds 36s), and a
+        // suspend between attempts stretches the wall clock without limit. So stop
+        // by elapsed time instead, early enough that the last attempt still lands
+        // inside the server's window.
+        const RETRY_DEADLINE: Duration = Duration::from_secs(120);
+        // One delay per retry, so the attempt count follows from the table and the
+        // two cannot drift apart.
+        const RETRY_BACKOFF_SECS: [u64; 2] = [10, 30];
+        const ATTEMPTS: usize = RETRY_BACKOFF_SECS.len() + 1;
+        let body = v.to_string();
+        let started = Instant::now();
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let (retryable, err) =
+                match crate::post_request_with_status(url.clone(), body.clone(), "").await {
+                    Ok((status, text)) => {
+                        if (200..300).contains(&status) {
+                            // Success is an empty body. hbbs reports handler
+                            // failures (e.g. a db write error) as 200 with an
+                            // {"error": ...} body - retryable: the server
+                            // releases the record's nonce when its write fails,
+                            // so trying again is what stores the record. Any
+                            // other nonempty body did not come from the audit
+                            // handler (a proxy interposing a 2xx maintenance
+                            // page, a malformed error) and must not be mistaken
+                            // for storage, so it is retried rather than dropped.
+                            if text.trim().is_empty() {
+                                return Ok(text);
+                            }
+                            let server_err = serde_json::from_str::<Value>(&text)
+                                .ok()
+                                .and_then(|v| v.get("error")?.as_str().map(|s| s.to_owned()))
+                                .filter(|e| !e.is_empty());
+                            let (label, detail) = match &server_err {
+                                Some(e) => ("server error", e.as_str()),
+                                None => ("unexpected response body", text.as_str()),
+                            };
+                            let brief: String = detail.chars().take(128).collect();
+                            (true, format!("{}: {}", label, brief))
+                        } else {
+                            let brief: String = text.chars().take(128).collect();
+                            // 408 and 429 are the transient 4xx: the request timed
+                            // out upstream, or a proxy is shedding load. Every other
+                            // 4xx is a deterministic rejection and retrying it would
+                            // only delay the log line.
+                            let transient = status >= 500 || status == 408 || status == 429;
+                            (transient, format!("status {}: {}", status, brief))
+                        }
+                    }
+                    Err(e) => (true, e.to_string()),
+                };
+            let elapsed = started.elapsed();
+            if !retryable || attempt >= ATTEMPTS || elapsed >= RETRY_DEADLINE {
+                log::error!(
+                    "Audit post dropped (attempt {}/{}, {:?} elapsed): {}",
+                    attempt,
+                    ATTEMPTS,
+                    elapsed,
+                    err
+                );
+                bail!("{}", err);
+            }
+            log::warn!(
+                "Audit post failed (attempt {}/{}): {}",
+                attempt,
+                ATTEMPTS,
+                err
+            );
+            // In range by construction: the guard above returns at ATTEMPTS.
+            time::sleep(Duration::from_secs(RETRY_BACKOFF_SECS[attempt - 1])).await;
+            // Re-checked after the delay so no attempt starts past the deadline;
+            // the check above alone would let one begin up to a backoff later.
+            if started.elapsed() >= RETRY_DEADLINE {
+                log::error!(
+                    "Audit post dropped (attempt {}/{}, deadline passed during backoff): {}",
+                    attempt,
+                    ATTEMPTS,
+                    err
+                );
+                bail!("{}", err);
+            }
+        }
+    }
+
+    fn set_conn_audit_primary_auth(&mut self, method: ConnAuditPrimaryAuth) {
+        self.conn_audit_primary_auth = method;
+    }
+
+    fn set_conn_audit_two_factor(&mut self, two_factor: ConnAuditTwoFactor) {
+        self.conn_audit_two_factor = two_factor;
+    }
+
+    fn normalize_conn_audit_auth_fields(&mut self) {
+        if matches!(
+            self.conn_audit_primary_auth,
+            ConnAuditPrimaryAuth::Click | ConnAuditPrimaryAuth::SwitchSides
+        ) {
+            self.conn_audit_two_factor = ConnAuditTwoFactor::None;
+        }
     }
 
     fn normalize_port_forward_target(pf: &mut PortForward) -> (String, bool) {
@@ -1560,10 +1812,12 @@ impl Connection {
                     });
                 }
             });
+            self.awaiting_2fa = true;
             self.send_login_error(crate::client::REQUIRE_2FA).await;
             // Keep the connection alive so the client can continue with 2FA.
             return true;
         }
+        self.awaiting_2fa = false;
         if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {
             return keep_alive;
         }
@@ -1571,6 +1825,9 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        // Releases the budget `check_id_whitelist` charges against this address: only a peer
+        // that got this far proved more than a self-reported id.
+        self.clear_id_whitelist_failures();
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -1594,10 +1851,15 @@ impl Connection {
             .unwrap()
             .get(&self.session_key())
             .map(|s| s.last_recv_time.clone());
-        self.post_conn_audit(json!({
-            "peer": ((&self.lr.my_id, &self.lr.my_name)),
-            "type": conn_type,
-        }));
+        self.normalize_conn_audit_auth_fields();
+        let mut audit = json!({"peer": ((&self.lr.my_id, &self.lr.my_name)), "type": conn_type});
+        if self.conn_audit_primary_auth != ConnAuditPrimaryAuth::None {
+            audit["primary_auth"] = json!(self.conn_audit_primary_auth.as_i64());
+        }
+        if self.conn_audit_two_factor != ConnAuditTwoFactor::None {
+            audit["two_factor"] = json!(self.conn_audit_two_factor.as_i64());
+        }
+        self.post_conn_audit(audit);
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
         let mut res = LoginResponse::new();
@@ -1802,13 +2064,15 @@ impl Connection {
                 Err(err) => {
                     res.set_error(format!("{}", err));
                 }
-                Ok(displays) => {
+                Ok((displays, primary_display_idx)) => {
                     // For compatibility with old versions, we need to send the displays to the peer.
                     // But the displays may be updated later, before creating the video capturer.
                     #[cfg(target_os = "macos")]
                     {
                         self.retina.set_displays(&displays);
                     }
+                    // A separate primary lookup here could race with display hot-plug.
+                    self.display_idx = primary_display_idx;
                     pi.displays = displays;
                     pi.current_display = self.display_idx as _;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1840,10 +2104,9 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
         self.send(msg_out).await;
-        if let Some(o) = self.options_in_login.take() {
-            self.update_options(&o).await;
-        }
+        self.update_scoped_login_options().await;
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
+            self.keyboard = false;
             let dir = if !dir.is_empty() && std::path::Path::new(&dir).is_dir() {
                 &dir
             } else {
@@ -1918,8 +2181,8 @@ impl Connection {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let _h = try_start_record_cursor_pos();
                 self.auto_disconnect_timer = Self::get_auto_disconenct_timer();
-                s.try_add_primay_video_service();
-                s.add_connection(self.inner.clone(), &noperms);
+                s.try_add_monitor_service(self.display_idx);
+                s.add_monitor_connection(self.inner.clone(), &noperms, self.display_idx);
             }
         }
     }
@@ -2209,6 +2472,7 @@ impl Connection {
         if password::temporary_enabled() {
             let password = password::temporary_password();
             if self.validate_password_plain(&password) {
+                self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::TemporaryPassword);
                 raii::AuthedConnID::update_or_insert_session(
                     self.session_key(),
                     Some(password),
@@ -2232,6 +2496,7 @@ impl Connection {
                 if local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
                     && self.validate_password_storage(&local_storage)
                 {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
                     print_fallback();
                     return true;
                 }
@@ -2240,6 +2505,7 @@ impl Connection {
                 if preset_permanent_password_storage_is_usable_for_auth(&hard, &salt)
                     && self.validate_preset_password_storage(&hard, &salt)
                 {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
                     print_fallback();
                     return true;
                 }
@@ -2264,6 +2530,11 @@ impl Connection {
                 && (tfa && session.tfa
                     || !tfa && self.validate_password_plain(&session.random_password))
             {
+                if tfa {
+                    self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
+                } else {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::TemporaryPassword);
+                }
                 log::info!("is recent session");
                 return true;
             }
@@ -2342,6 +2613,14 @@ impl Connection {
         )
     }
 
+    fn reset_session_scope_for_login(&mut self) {
+        self.file_transfer = None;
+        self.view_camera = false;
+        self.terminal = false;
+        self.port_forward_address.clear();
+        self.terminal_persistent = false;
+    }
+
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
         self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
@@ -2357,6 +2636,7 @@ impl Connection {
                     && device.platform == lr.my_platform
                 {
                     log::info!("2FA bypassed by trusted devices");
+                    self.set_conn_audit_two_factor(ConnAuditTwoFactor::TrustedDevice);
                     self.require_2fa = None;
                 }
             }
@@ -2408,11 +2688,24 @@ impl Connection {
                 return false;
             }
         }
+        if self.authorized {
+            if matches!(msg.union.as_ref(), Some(message::Union::LoginRequest(_))) {
+                return true;
+            }
+            if let Some(message) = self.authorized_scope_violation(&msg) {
+                return self.handle_authorized_scope_violation(message).await;
+            }
+        }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            self.awaiting_2fa = false;
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
+            }
+            self.reset_session_scope_for_login();
+            if !self.check_id_whitelist().await {
+                return false;
             }
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
@@ -2473,9 +2766,7 @@ impl Connection {
                 }
             }
 
-            if !hbb_common::is_ip_str(&lr.username)
-                && !hbb_common::is_domain_port_str(&lr.username)
-                && lr.username != Config::get_id()
+            if !crate::common::is_direct_ip_access(&lr.username) && lr.username != Config::get_id()
             {
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;
@@ -2640,6 +2931,11 @@ impl Connection {
                 }
             }
         } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
+            // A 2FA response may arrive after click authorization has completed.
+            // Ignore it unless this connection is still waiting for the response.
+            if !self.awaiting_2fa {
+                return true;
+            }
             let (failure, res) = self.check_failure(1).await;
             if !res {
                 return true;
@@ -2649,6 +2945,7 @@ impl Connection {
                     if res {
                         self.update_failure(failure, true, 1);
                         self.require_2fa.take();
+                        self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
                         raii::AuthedConnID::set_session_2fa(self.session_key());
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
@@ -2694,7 +2991,6 @@ impl Connection {
             #[cfg(feature = "flutter")]
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if let Some(lr) = _s.lr.clone().take() {
-                self.handle_login_request_without_validation(&lr).await;
                 SWITCH_SIDES_UUID
                     .lock()
                     .unwrap()
@@ -2703,7 +2999,22 @@ impl Connection {
                 if let Ok(uuid) = uuid::Uuid::from_slice(_s.uuid.to_vec().as_ref()) {
                     if let Some((_instant, uuid_old)) = uuid_old {
                         if uuid == uuid_old {
+                            if lr.union.is_some() {
+                                log::warn!(
+                                    "Rejected switch sides response for non-remote-desktop session; closing connection"
+                                );
+                                self.send_login_error("Connection not allowed").await;
+                                return false;
+                            }
+                            self.reset_session_scope_for_login();
+                            self.handle_login_request_without_validation(&lr).await;
+                            // Switching sides authorizes without a password, so it must not bypass
+                            // the whitelist, which can be a locked policy pushed by the server.
+                            if !self.check_id_whitelist().await {
+                                return false;
+                            }
                             self.from_switch = true;
+                            self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::SwitchSides);
                             if !self.send_logon_response_and_keep_alive().await {
                                 return false;
                             }
@@ -2921,7 +3232,7 @@ impl Connection {
                     self.update_auto_disconnect_timer();
                 }
                 Some(message::Union::Clipboard(cb)) => {
-                    if self.clipboard_enabled() {
+                    if self.should_handle_text_clipboard_message() && self.clipboard_enabled() {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Host);
                         // ios as the controlled side is actually not supported for now.
@@ -2949,7 +3260,7 @@ impl Connection {
                     }
                 }
                 Some(message::Union::MultiClipboards(_mcb)) => {
-                    if self.clipboard_enabled() {
+                    if self.should_handle_text_clipboard_message() && self.clipboard_enabled() {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(_mcb.clipboards, ClipboardSide::Host);
                         #[cfg(target_os = "android")]
@@ -3336,10 +3647,14 @@ impl Connection {
                     }
                     #[cfg(windows)]
                     Some(misc::Union::ToggleVirtualDisplay(t)) => {
-                        self.toggle_virtual_display(t).await;
+                        if !self.view_camera {
+                            self.toggle_virtual_display(t).await;
+                        }
                     }
                     Some(misc::Union::TogglePrivacyMode(t)) => {
-                        self.toggle_privacy_mode(t).await;
+                        if !self.view_camera {
+                            self.toggle_privacy_mode(t).await;
+                        }
                     }
                     Some(misc::Union::ChatMessage(c)) => {
                         self.send_to_cm(ipc::Data::ChatMessage { text: c.text });
@@ -3347,19 +3662,27 @@ impl Connection {
                         self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::Option(o)) => {
-                        self.update_options(&o).await;
+                        if self.authed_conn_type() == Some(AuthConnType::Remote) {
+                            self.update_options(&o).await;
+                        } else if let Some(option) = self.scoped_update_option_message(&o) {
+                            self.update_options(&option).await;
+                        }
                     }
                     Some(misc::Union::RefreshVideo(r)) => {
-                        if r {
-                            // Refresh all videos.
-                            // Compatibility with old versions and sciter(remote).
-                            self.refresh_video_display(None);
+                        if self.should_handle_render_broadcast_message() {
+                            if r {
+                                // Refresh all videos.
+                                // Compatibility with old versions and sciter(remote).
+                                self.refresh_video_display(None);
+                            }
+                            self.update_auto_disconnect_timer();
                         }
-                        self.update_auto_disconnect_timer();
                     }
                     Some(misc::Union::RefreshVideoDisplay(display)) => {
-                        self.refresh_video_display(Some(display as usize));
-                        self.update_auto_disconnect_timer();
+                        if self.should_handle_render_broadcast_message() {
+                            self.refresh_video_display(Some(display as usize));
+                            self.update_auto_disconnect_timer();
+                        }
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -3427,10 +3750,16 @@ impl Connection {
                         }
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::ChangeResolution(r)) => self.change_resolution(None, &r),
+                    Some(misc::Union::ChangeResolution(r)) => {
+                        if !self.view_camera {
+                            self.change_resolution(None, &r);
+                        }
+                    }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeDisplayResolution(dr)) => {
-                        self.change_resolution(Some(dr.display as _), &dr.resolution)
+                        if !self.view_camera {
+                            self.change_resolution(Some(dr.display as _), &dr.resolution);
+                        }
                     }
                     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -3516,6 +3845,7 @@ impl Connection {
                 Some(message::Union::ScreenshotRequest(request)) => {
                     if let Some(tx) = self.inner.tx.clone() {
                         crate::video_service::set_take_screenshot(
+                            self.video_source(),
                             request.display as _,
                             request.sid.clone(),
                             tx,
@@ -4009,10 +4339,12 @@ impl Connection {
         let display_idx = s.display as usize;
         if self.display_idx != display_idx {
             if let Some(server) = self.server.upgrade() {
-                self.switch_display_to(display_idx, server.clone());
+                if !self.switch_display_to(display_idx, server.clone()) {
+                    return;
+                }
 
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                if s.width != 0 && s.height != 0 {
+                if !self.view_camera && s.width != 0 && s.height != 0 {
                     self.change_resolution(
                         None,
                         &Resolution {
@@ -4036,6 +4368,13 @@ impl Connection {
         }
     }
 
+    fn video_source_count(video_source: VideoSource) -> usize {
+        match video_source {
+            VideoSource::Monitor => display_service::get_sync_displays().len(),
+            VideoSource::Camera => camera::Cameras::get_sync_cameras().len(),
+        }
+    }
+
     fn video_source(&self) -> VideoSource {
         if self.view_camera {
             VideoSource::Camera
@@ -4044,18 +4383,28 @@ impl Connection {
         }
     }
 
-    fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) {
+    fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) -> bool {
+        let source_count = Self::video_source_count(self.video_source());
+        if display_idx >= source_count {
+            // Do not remap an explicit switch: its resolution belongs to the requested source.
+            log::warn!(
+                "Ignore switch to invalid {:?} index {}, available source count: {}",
+                self.video_source(),
+                display_idx,
+                source_count
+            );
+            return false;
+        }
+
         let new_service_name = video_service::get_service_name(self.video_source(), display_idx);
         let old_service_name =
             video_service::get_service_name(self.video_source(), self.display_idx);
         let mut lock = server.write().unwrap();
-        if display_idx != *display_service::PRIMARY_DISPLAY_IDX {
-            if !lock.contains(&new_service_name) {
-                lock.add_service(Box::new(video_service::new(
-                    self.video_source(),
-                    display_idx,
-                )));
-            }
+        if !lock.contains(&new_service_name) {
+            lock.add_service(Box::new(video_service::new(
+                self.video_source(),
+                display_idx,
+            )));
         }
         // For versions greater than 1.2.4, a `CaptureDisplays` message will be sent immediately.
         // Unnecessary capturers will be removed then.
@@ -4064,6 +4413,7 @@ impl Connection {
         }
         lock.subscribe(&new_service_name, self.inner.clone(), true);
         self.display_idx = display_idx;
+        true
     }
 
     #[cfg(windows)]
@@ -4090,26 +4440,61 @@ impl Connection {
 
     async fn capture_displays(&mut self, add: &[usize], sub: &[usize], set: &[usize]) {
         let video_source = self.video_source();
-        if let Some(sever) = self.server.upgrade() {
-            let mut lock = sever.write().unwrap();
-            for display in add.iter() {
+        let source_count = Self::video_source_count(video_source);
+        // Only add/set can create services; sub only narrows existing subscriptions.
+        let valid_add = add
+            .iter()
+            .copied()
+            .filter(|display| *display < source_count)
+            .collect::<Vec<_>>();
+        let valid_sub = sub
+            .iter()
+            .copied()
+            .filter(|display| *display < source_count)
+            .collect::<Vec<_>>();
+        let valid_set = set
+            .iter()
+            .copied()
+            .filter(|display| *display < source_count)
+            .collect::<Vec<_>>();
+        let invalid_count =
+            add.len() + sub.len() + set.len() - valid_add.len() - valid_sub.len() - valid_set.len();
+        if invalid_count != 0 {
+            log::warn!(
+                "Ignore {} invalid {:?} indices, available source count: {}",
+                invalid_count,
+                video_source,
+                source_count
+            );
+        }
+        // Passing an invalid sub request as an empty exclude list would unsubscribe all services.
+        if (!add.is_empty() && valid_add.is_empty())
+            || (add.is_empty() && !sub.is_empty() && valid_sub.is_empty())
+            || (add.is_empty() && sub.is_empty() && !set.is_empty() && valid_set.is_empty())
+        {
+            return;
+        }
+
+        if let Some(server) = self.server.upgrade() {
+            let mut lock = server.write().unwrap();
+            for display in valid_add.iter() {
                 let service_name = video_service::get_service_name(video_source, *display);
                 if !lock.contains(&service_name) {
                     lock.add_service(Box::new(video_service::new(video_source, *display)));
                 }
             }
-            for display in set.iter() {
+            for display in valid_set.iter() {
                 let service_name = video_service::get_service_name(video_source, *display);
                 if !lock.contains(&service_name) {
                     lock.add_service(Box::new(video_service::new(video_source, *display)));
                 }
             }
             if !add.is_empty() {
-                lock.capture_displays(self.inner.clone(), video_source, add, true, false);
+                lock.capture_displays(self.inner.clone(), video_source, &valid_add, true, false);
             } else if !sub.is_empty() {
-                lock.capture_displays(self.inner.clone(), video_source, sub, false, true);
+                lock.capture_displays(self.inner.clone(), video_source, &valid_sub, false, true);
             } else {
-                lock.capture_displays(self.inner.clone(), video_source, set, true, true);
+                lock.capture_displays(self.inner.clone(), video_source, &valid_set, true, true);
             }
             self.multi_ui_session = lock.get_subbed_displays_count(self.inner.id()) > 1;
             if self.follow_remote_window {
@@ -5136,6 +5521,399 @@ impl Connection {
         false
     }
 
+    fn should_handle_render_broadcast_message(&self) -> bool {
+        matches!(
+            self.authed_conn_type(),
+            Some(AuthConnType::Remote | AuthConnType::ViewCamera)
+        )
+    }
+
+    fn should_handle_text_clipboard_message(&self) -> bool {
+        matches!(self.authed_conn_type(), Some(AuthConnType::Remote))
+    }
+
+    fn scoped_update_option_message(&self, option: &OptionMessage) -> Option<OptionMessage> {
+        match self.authed_conn_type() {
+            Some(AuthConnType::ViewCamera) => Self::scoped_view_camera_option(option).0,
+            Some(AuthConnType::Terminal) => Self::scoped_terminal_login_option(option).0,
+            Some(AuthConnType::Remote | AuthConnType::FileTransfer | AuthConnType::PortForward)
+            | None => None,
+        }
+    }
+
+    fn authed_conn_type(&self) -> Option<AuthConnType> {
+        self.authed_conn_id.as_ref().map(|id| id.conn_type())
+    }
+
+    async fn handle_authorized_scope_violation(&mut self, message: &'static str) -> bool {
+        let conn_type = self
+            .authed_conn_type()
+            .map(AuthConnType::as_str)
+            .unwrap_or("unknown");
+        let is_first = self.scope_violation_messages.insert(message);
+        if is_first {
+            log::warn!(
+                "Received out-of-scope message in {} session: {}",
+                conn_type,
+                message
+            );
+        } else {
+            log::debug!(
+                "Received repeated out-of-scope message in {} session: {}",
+                conn_type,
+                message
+            );
+        }
+        if is_first && Config::get_bool_option(keys::OPTION_ALLOW_SCOPE_VIOLATION_ALARM) {
+            self.post_session_scope_violation_alarm(message);
+        }
+        if Config::get_bool_option(keys::OPTION_ALLOW_SCOPE_VIOLATION_CLOSE) {
+            self.send_close_reason_no_retry("Connection not allowed")
+                .await;
+            self.on_close("Session scope violation", true).await;
+            return false;
+        }
+        true
+    }
+
+    fn authorized_scope_violation(&self, msg: &Message) -> Option<&'static str> {
+        let Some(conn_type) = self.authed_conn_type() else {
+            return (!Self::is_connection_housekeeping_message(msg)).then_some("session.auth_type");
+        };
+        Self::authorized_message_scope_violation(conn_type, msg)
+    }
+
+    async fn update_scoped_login_options(&mut self) {
+        let Some(option) = self.options_in_login.take() else {
+            return;
+        };
+        let Some(conn_type) = self.authed_conn_type() else {
+            // Unreachable, but just in case, we drop the options if the connection type is unknown.
+            log::warn!(
+                "Dropping scoped login options because authorized connection type is unknown"
+            );
+            return;
+        };
+        let (scoped, violation) = Self::scoped_login_option(conn_type, &option);
+        if let Some(message) = violation {
+            log::debug!(
+                "Filtering {} session login options outside scope: {}",
+                conn_type.as_str(),
+                message
+            );
+        }
+        if let Some(option) = scoped {
+            self.update_options(&option).await;
+        }
+    }
+
+    fn scoped_login_option(
+        conn_type: AuthConnType,
+        option: &OptionMessage,
+    ) -> (Option<OptionMessage>, Option<&'static str>) {
+        match conn_type {
+            AuthConnType::Remote => (Some(option.clone()), None),
+            AuthConnType::ViewCamera => Self::scoped_view_camera_option(option),
+            AuthConnType::Terminal => Self::scoped_terminal_login_option(option),
+            AuthConnType::FileTransfer | AuthConnType::PortForward => {
+                let violation = Self::option_has_any_field(option).then_some("login.option");
+                (None, violation)
+            }
+        }
+    }
+
+    fn scoped_terminal_login_option(
+        option: &OptionMessage,
+    ) -> (Option<OptionMessage>, Option<&'static str>) {
+        let mut scoped = OptionMessage::new();
+        let mut violation = false;
+        match option.terminal_persistent.enum_value() {
+            Ok(value) => scoped.terminal_persistent = value.into(),
+            Err(_) => violation = true,
+        }
+        if Self::option_has_non_terminal_login_field(option) {
+            violation = true;
+        }
+        let scoped = Self::option_has_any_field(&scoped).then_some(scoped);
+        (scoped, violation.then_some("login.option"))
+    }
+
+    fn authorized_message_scope_violation(
+        conn_type: AuthConnType,
+        msg: &Message,
+    ) -> Option<&'static str> {
+        if Self::is_connection_housekeeping_message(msg) {
+            return None;
+        }
+        // Legacy clients can broadcast render-refresh messages to all opened sessions.
+        // Clipboard messages may also be broadcast to FileTransfer/Terminal sessions while
+        // the client still considers text clipboard sync required, and handlers ignore them.
+        let noop_compat = match conn_type {
+            AuthConnType::FileTransfer | AuthConnType::Terminal => {
+                Self::is_render_broadcast_noop_compat_message(msg)
+                    || Self::is_text_clipboard_noop_compat_message(msg)
+            }
+            AuthConnType::PortForward => Self::is_render_broadcast_noop_compat_message(msg),
+            AuthConnType::ViewCamera => Self::is_text_clipboard_noop_compat_message(msg),
+            _ => false,
+        };
+        if noop_compat {
+            return None;
+        }
+        let allowed = match conn_type {
+            AuthConnType::Remote => true,
+            AuthConnType::FileTransfer => Self::is_file_transfer_scoped_message(msg),
+            AuthConnType::PortForward => false,
+            AuthConnType::ViewCamera => Self::is_view_camera_scoped_message(msg),
+            AuthConnType::Terminal => Self::is_terminal_scoped_message(msg),
+        };
+        (!allowed).then(|| Self::message_family(msg))
+    }
+
+    fn is_render_broadcast_noop_compat_message(msg: &Message) -> bool {
+        let Some(message::Union::Misc(misc)) = msg.union.as_ref() else {
+            return false;
+        };
+        match misc.union.as_ref() {
+            Some(misc::Union::RefreshVideo(_)) | Some(misc::Union::RefreshVideoDisplay(_)) => true,
+            Some(misc::Union::Option(option)) => Self::is_supported_decoding_only_option(option),
+            _ => false,
+        }
+    }
+
+    fn is_text_clipboard_noop_compat_message(msg: &Message) -> bool {
+        matches!(
+            msg.union.as_ref(),
+            Some(message::Union::Clipboard(_)) | Some(message::Union::MultiClipboards(_))
+        )
+    }
+
+    fn is_supported_decoding_only_option(option: &OptionMessage) -> bool {
+        option.supported_decoding.is_some()
+            && option.image_quality.enum_value() == Ok(ImageQuality::NotSet)
+            && option.custom_image_quality == 0
+            && option.custom_fps == 0
+            && Self::is_bool_option_not_set(option.lock_after_session_end)
+            && Self::is_bool_option_not_set(option.show_remote_cursor)
+            && Self::is_bool_option_not_set(option.privacy_mode)
+            && Self::is_bool_option_not_set(option.block_input)
+            && Self::is_bool_option_not_set(option.disable_audio)
+            && Self::is_bool_option_not_set(option.disable_clipboard)
+            && Self::is_bool_option_not_set(option.enable_file_transfer)
+            && Self::is_bool_option_not_set(option.disable_keyboard)
+            && Self::is_bool_option_not_set(option.follow_remote_cursor)
+            && Self::is_bool_option_not_set(option.follow_remote_window)
+            && Self::is_bool_option_not_set(option.disable_camera)
+            && Self::is_bool_option_not_set(option.terminal_persistent)
+            && Self::is_bool_option_not_set(option.show_my_cursor)
+    }
+
+    fn is_connection_housekeeping_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::LoginRequest(_)) => true,
+            Some(message::Union::TestDelay(_)) => true,
+            Some(message::Union::Misc(misc)) => {
+                matches!(misc.union.as_ref(), Some(misc::Union::CloseReason(_)))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_file_transfer_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) => true,
+            Some(message::Union::Misc(misc)) => Self::is_file_transfer_scoped_misc(misc),
+            _ => false,
+        }
+    }
+
+    fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {
+        #[cfg(windows)]
+        if matches!(misc.union.as_ref(), Some(misc::Union::SelectedSid(_))) {
+            return true;
+        }
+        #[cfg(not(windows))]
+        let _ = misc;
+        false
+    }
+
+    fn is_terminal_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::TerminalAction(_)) => true,
+            Some(message::Union::Misc(misc)) => Self::is_terminal_scoped_misc(misc),
+            _ => false,
+        }
+    }
+
+    fn is_terminal_scoped_misc(misc: &Misc) -> bool {
+        match misc.union.as_ref() {
+            Some(misc::Union::ChatMessage(_)) => true,
+            Some(misc::Union::Option(option)) => Self::is_terminal_scoped_option(option),
+            _ => false,
+        }
+    }
+
+    fn is_terminal_scoped_option(option: &OptionMessage) -> bool {
+        Self::scoped_terminal_login_option(option).1.is_none()
+    }
+
+    fn is_view_camera_scoped_message(msg: &Message) -> bool {
+        match msg.union.as_ref() {
+            Some(message::Union::ScreenshotRequest(_)) => true,
+            Some(message::Union::Misc(misc)) => Self::is_view_camera_scoped_misc(misc),
+            // Legacy clients may send auto-login input during view-camera connect.
+            // The handlers intentionally ignore these messages for view-camera sessions.
+            Some(message::Union::MouseEvent(_))
+            | Some(message::Union::PointerDeviceEvent(_))
+            | Some(message::Union::KeyEvent(_)) => true,
+            Some(message::Union::AudioFrame(_))
+            | Some(message::Union::VoiceCallRequest(_))
+            | Some(message::Union::VoiceCallResponse(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn is_view_camera_scoped_misc(misc: &Misc) -> bool {
+        match misc.union.as_ref() {
+            Some(misc::Union::SwitchDisplay(_))
+            | Some(misc::Union::CaptureDisplays(_))
+            | Some(misc::Union::RefreshVideo(_))
+            | Some(misc::Union::RefreshVideoDisplay(_))
+            | Some(misc::Union::VideoReceived(_))
+            | Some(misc::Union::ChatMessage(_))
+            | Some(misc::Union::AudioFormat(_))
+            | Some(misc::Union::ClientRecordStatus(_))
+            // Though these messages are not expected in normal view-camera sessions,
+            // keep them allowed to avoid breaking existing clients that may send them.
+            | Some(misc::Union::MessageQuery(_))
+            | Some(misc::Union::TogglePrivacyMode(_))
+            | Some(misc::Union::ToggleVirtualDisplay(_))
+            | Some(misc::Union::ChangeResolution(_))
+            | Some(misc::Union::ChangeDisplayResolution(_)) => true,
+            Some(misc::Union::Option(option)) => Self::is_view_camera_scoped_option(option),
+            #[cfg(windows)]
+            Some(misc::Union::SelectedSid(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn is_view_camera_scoped_option(option: &OptionMessage) -> bool {
+        Self::scoped_view_camera_option(option).1.is_none()
+    }
+
+    // Keep these OptionMessage field lists in sync with message.proto and update_options().
+    // New fields must be classified here before limited session types can receive them.
+    fn scoped_view_camera_option(
+        option: &OptionMessage,
+    ) -> (Option<OptionMessage>, Option<&'static str>) {
+        let mut scoped = OptionMessage::new();
+        let mut violation = false;
+        if option.image_quality.enum_value().is_ok() {
+            scoped.image_quality = option.image_quality;
+        }
+        if option.custom_image_quality >= 0 {
+            scoped.custom_image_quality = option.custom_image_quality;
+        }
+        if option.custom_fps >= 0 {
+            scoped.custom_fps = option.custom_fps;
+        }
+        scoped.supported_decoding = option.supported_decoding.clone();
+        if let Ok(value) = option.disable_audio.enum_value() {
+            scoped.disable_audio = value.into();
+        }
+        if Self::option_has_non_view_camera_login_field(option) {
+            violation = true;
+        }
+        let scoped = Self::option_has_any_field(&scoped).then_some(scoped);
+        (scoped, violation.then_some("login.option"))
+    }
+
+    fn option_has_non_view_camera_login_field(option: &OptionMessage) -> bool {
+        !(Self::is_bool_option_not_set(option.lock_after_session_end)
+            && Self::is_bool_option_not_set(option.show_remote_cursor)
+            && Self::is_bool_option_not_set(option.privacy_mode)
+            && Self::is_bool_option_not_set(option.block_input)
+            && Self::is_bool_option_not_set(option.disable_clipboard)
+            && Self::is_bool_option_not_set(option.enable_file_transfer)
+            && Self::is_bool_option_not_set(option.disable_keyboard)
+            && Self::is_bool_option_not_set(option.follow_remote_cursor)
+            && Self::is_bool_option_not_set(option.follow_remote_window)
+            && Self::is_bool_option_not_set(option.disable_camera)
+            && Self::is_bool_option_not_set(option.terminal_persistent)
+            && Self::is_bool_option_not_set(option.show_my_cursor))
+    }
+
+    fn option_has_non_terminal_login_field(option: &OptionMessage) -> bool {
+        option.image_quality.enum_value() != Ok(ImageQuality::NotSet)
+            || option.custom_image_quality != 0
+            || option.custom_fps != 0
+            || option.supported_decoding.is_some()
+            || !Self::is_bool_option_not_set(option.lock_after_session_end)
+            || !Self::is_bool_option_not_set(option.show_remote_cursor)
+            || !Self::is_bool_option_not_set(option.privacy_mode)
+            || !Self::is_bool_option_not_set(option.block_input)
+            || !Self::is_bool_option_not_set(option.disable_audio)
+            || !Self::is_bool_option_not_set(option.disable_clipboard)
+            || !Self::is_bool_option_not_set(option.enable_file_transfer)
+            || !Self::is_bool_option_not_set(option.disable_keyboard)
+            || !Self::is_bool_option_not_set(option.follow_remote_cursor)
+            || !Self::is_bool_option_not_set(option.follow_remote_window)
+            || !Self::is_bool_option_not_set(option.disable_camera)
+            || !Self::is_bool_option_not_set(option.show_my_cursor)
+    }
+
+    fn option_has_any_field(option: &OptionMessage) -> bool {
+        Self::option_has_non_terminal_login_field(option)
+            || !Self::is_bool_option_not_set(option.terminal_persistent)
+    }
+
+    fn is_bool_option_not_set(option: hbb_common::protobuf::EnumOrUnknown<BoolOption>) -> bool {
+        option.enum_value() == Ok(BoolOption::NotSet)
+    }
+
+    fn message_family(msg: &Message) -> &'static str {
+        match msg.union.as_ref() {
+            Some(message::Union::MouseEvent(_)) => "mouse_event",
+            Some(message::Union::AudioFrame(_)) => "audio_frame",
+            Some(message::Union::PointerDeviceEvent(_)) => "pointer_device_event",
+            Some(message::Union::KeyEvent(_)) => "key_event",
+            Some(message::Union::Clipboard(_)) => "clipboard",
+            Some(message::Union::FileAction(_)) => "file_action",
+            Some(message::Union::FileResponse(_)) => "file_response",
+            Some(message::Union::VoiceCallRequest(_)) => "voice_call_request",
+            Some(message::Union::VoiceCallResponse(_)) => "voice_call_response",
+            Some(message::Union::MultiClipboards(_)) => "multi_clipboards",
+            Some(message::Union::ScreenshotRequest(_)) => "screenshot_request",
+            Some(message::Union::ScreenshotResponse(_)) => "screenshot_response",
+            Some(message::Union::TerminalAction(_)) => "terminal_action",
+            Some(message::Union::TerminalResponse(_)) => "terminal_response",
+            Some(message::Union::Misc(misc)) => Self::misc_message_family(misc),
+            Some(_) => "message.other",
+            None => "empty",
+        }
+    }
+
+    fn misc_message_family(misc: &Misc) -> &'static str {
+        match misc.union.as_ref() {
+            Some(misc::Union::ChatMessage(_)) => "misc.chat_message",
+            Some(misc::Union::SwitchDisplay(_)) => "misc.switch_display",
+            Some(misc::Union::Option(_)) => "misc.option",
+            Some(misc::Union::AudioFormat(_)) => "misc.audio_format",
+            Some(misc::Union::CaptureDisplays(_)) => "misc.capture_displays",
+            Some(misc::Union::ClientRecordStatus(_)) => "misc.client_record_status",
+            Some(misc::Union::TogglePrivacyMode(_)) => "misc.toggle_privacy_mode",
+            Some(misc::Union::ToggleVirtualDisplay(_)) => "misc.toggle_virtual_display",
+            Some(misc::Union::SelectedSid(_)) => "misc.selected_sid",
+            Some(misc::Union::ChangeResolution(_)) => "misc.change_resolution",
+            Some(misc::Union::ChangeDisplayResolution(_)) => "misc.change_display_resolution",
+            Some(misc::Union::MessageQuery(_)) => "misc.message_query",
+            Some(misc::Union::FollowCurrentDisplay(_)) => "misc.follow_current_display",
+            Some(misc::Union::SwitchSidesRequest(_)) => "misc.switch_sides_request",
+            Some(_) => "misc.other",
+            None => "misc.empty",
+        }
+    }
+
     #[cfg(feature = "unix-file-copy-paste")]
     async fn handle_file_clip(&mut self, clip: clipboard::ClipboardFile) {
         let is_stopping_allowed = clip.is_stopping_allowed();
@@ -5531,6 +6309,8 @@ pub enum AlarmAuditType {
     ExceedIPv6PrefixAttempts = 6,
     TerminalOsLoginBackoff = 7,
     TerminalOsLoginConcurrency = 8,
+    SessionScopeViolation = 9,
+    IdWhitelist = 10,
 }
 
 pub enum FileAuditType {
@@ -6148,9 +6928,219 @@ mod raii {
     }
 }
 
+// An empty whitelist allows everyone.
+//
+// A peer connecting across servers reports `<its id>@<its own server>` (see
+// `create_login_msg`), so the bare id is matched as well. That suffix is self-asserted and
+// unsigned, so matching only the full form would reject the honest cross-server peer while
+// an attacker just reports the bare id: it can produce false rejects but no true ones.
+fn id_whitelist_allows(id_whitelist: &[String], my_id: &str) -> bool {
+    if id_whitelist.is_empty() {
+        return true;
+    }
+    let bare_id = my_id.split('@').next().unwrap_or(my_id);
+    id_whitelist
+        .iter()
+        .any(|x| wildcard_match(x, my_id) || wildcard_match(x, bare_id))
+}
+
+// Drop `keys` whose last failure (`.0`, in minutes) is at least `window` old. A backwards
+// clock gives a negative age and keeps the entry, so it never widens access.
+fn decay_stale_failures(
+    failures: &mut HashMap<String, (i32, i32, i32)>,
+    keys: &[String],
+    now: i32,
+    window: i32,
+) {
+    for key in keys {
+        if failures
+            .get(key)
+            .is_some_and(|v| now.saturating_sub(v.0) >= window)
+        {
+            failures.remove(key);
+        }
+    }
+}
+
+// Unconditionally forget `keys`, unlike `update_failure`'s remove path which requires the
+// per-address entry to exist.
+fn clear_failures(failures: &mut HashMap<String, (i32, i32, i32)>, keys: &[String]) {
+    for key in keys {
+        failures.remove(key);
+    }
+}
+
+// Simple glob matching for the ID whitelist: '*' matches any sequence of characters
+// (including the empty one), '?' matches exactly one character. Case-insensitive.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.trim().to_lowercase().chars().collect();
+    let t: Vec<char> = text.trim().to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+#[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[test]
+    fn test_wildcard_match() {
+        // Exact match.
+        assert!(wildcard_match("123456789", "123456789"));
+        assert!(!wildcard_match("123456789", "123456780"));
+        assert!(!wildcard_match("12345678", "123456789"));
+        assert!(!wildcard_match("123456789", "12345678"));
+        // Case-insensitive.
+        assert!(wildcard_match("MyCustomId", "mycustomid"));
+        // '*' matches any sequence.
+        assert!(wildcard_match("*", "123456789"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("*", "*abc"));
+        assert!(wildcard_match("123*", "123456789"));
+        assert!(wildcard_match("123*", "123"));
+        assert!(wildcard_match("12*", "12*9"));
+        assert!(!wildcard_match("123*", "124456789"));
+        assert!(wildcard_match("*789", "123456789"));
+        assert!(wildcard_match("1*9", "123456789"));
+        assert!(wildcard_match("1*4*9", "123456789"));
+        assert!(!wildcard_match("1*4*9", "123456780"));
+        assert!(wildcard_match("*456*", "123456789"));
+        // '?' matches exactly one character.
+        assert!(wildcard_match("12345678?", "123456789"));
+        assert!(!wildcard_match("123456789?", "123456789"));
+        assert!(wildcard_match("???456???", "123456789"));
+        assert!(wildcard_match("1?3*7?9", "123456789"));
+        // Whitespace around entries is ignored.
+        assert!(wildcard_match(" 123456789 ", "123456789"));
+    }
+
+    #[test]
+    fn test_decay_stale_failures() {
+        let entry = |minute: i32| (minute, 1, 40);
+        let keys = ["ip".to_string(), "p64".to_string(), "absent".to_string()];
+        let mut m: HashMap<String, (i32, i32, i32)> = HashMap::new();
+        m.insert("ip".to_string(), entry(100));
+        m.insert("p64".to_string(), entry(160));
+        m.insert("untouched".to_string(), entry(100));
+
+        // Exactly at the window: forgotten. Still inside it: kept.
+        decay_stale_failures(&mut m, &keys, 160, 60);
+        assert!(!m.contains_key("ip"));
+        assert!(m.contains_key("p64"));
+        // Keys that were not passed in are never visited, absent ones are a no-op.
+        assert!(m.contains_key("untouched"));
+
+        // One minute short of the window keeps the entry.
+        decay_stale_failures(&mut m, &keys, 219, 60);
+        assert!(m.contains_key("p64"));
+        decay_stale_failures(&mut m, &keys, 220, 60);
+        assert!(!m.contains_key("p64"));
+
+        // A clock that jumped backwards must not drop anything.
+        m.insert("ip".to_string(), entry(500));
+        decay_stale_failures(&mut m, &keys, 0, 60);
+        assert!(m.contains_key("ip"));
+    }
+
+    #[test]
+    fn test_clear_failures_drops_shared_prefixes() {
+        // On IPv6 a whitelisted peer usually has no entry of its own, while the shared
+        // prefixes that block it do. Clearing must not depend on the per-address entry.
+        let mut m: HashMap<String, (i32, i32, i32)> = HashMap::new();
+        m.insert("p64".to_string(), (100, 1, 55));
+        m.insert("p56".to_string(), (100, 1, 75));
+        m.insert("p48".to_string(), (100, 1, 95));
+        m.insert("someone-else".to_string(), (100, 1, 95));
+        let keys = ["ip", "p64", "p56", "p48"].map(|k| k.to_string());
+
+        clear_failures(&mut m, &keys);
+
+        for key in ["p64", "p56", "p48"] {
+            assert!(!m.contains_key(key), "{key} should have been cleared");
+        }
+        // Keys belonging to other peers are left alone.
+        assert!(m.contains_key("someone-else"));
+    }
+
+    #[test]
+    fn test_id_whitelist_allows() {
+        let list = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // An empty whitelist allows everyone.
+        assert!(id_whitelist_allows(&[], "123456789"));
+
+        // Same server: the peer reports a bare id.
+        assert!(id_whitelist_allows(&list(&["123456789"]), "123456789"));
+        assert!(!id_whitelist_allows(&list(&["123456789"]), "987654321"));
+
+        // Cross server: the peer appends its own server, which must not reject it.
+        assert!(id_whitelist_allows(
+            &list(&["123456789"]),
+            "123456789@example.com:21116"
+        ));
+        // Cross server from web, whose server is a WebSocket URI.
+        assert!(id_whitelist_allows(
+            &list(&["123456789"]),
+            "123456789@wss://example.com:21118/ws/id"
+        ));
+        // A different id is still rejected, suffix or not.
+        assert!(!id_whitelist_allows(
+            &list(&["123456789"]),
+            "987654321@example.com:21116"
+        ));
+
+        // An entry pinned to one server keeps matching that exact form.
+        assert!(id_whitelist_allows(
+            &list(&["123456789@example.com:21116"]),
+            "123456789@example.com:21116"
+        ));
+        assert!(!id_whitelist_allows(
+            &list(&["123456789@example.com:21116"]),
+            "123456789@other.com:21116"
+        ));
+        // ... and no longer matches the bare id, which is the point of pinning.
+        assert!(!id_whitelist_allows(
+            &list(&["123456789@example.com:21116"]),
+            "123456789"
+        ));
+
+        // Wildcards keep working on both forms.
+        assert!(id_whitelist_allows(&list(&["abc*"]), "abcdef"));
+        assert!(id_whitelist_allows(
+            &list(&["abc*"]),
+            "abcdef@example.com:21116"
+        ));
+        assert!(id_whitelist_allows(
+            &list(&["*"]),
+            "123456789@example.com:21116"
+        ));
+
+        // Any entry of the list is enough.
+        assert!(id_whitelist_allows(
+            &list(&["111111111", "123456789", "222222222"]),
+            "123456789@example.com:21116"
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -6189,5 +7179,346 @@ mod test {
         assert!(Ipv6Addr::from_str("::1").is_ok());
         assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
         assert!(Ipv6Addr::from_str("0").is_err());
+    }
+
+    fn msg(set: impl FnOnce(&mut Message)) -> Message {
+        let mut msg = Message::new();
+        set(&mut msg);
+        msg
+    }
+
+    fn misc_msg(set: impl FnOnce(&mut Misc)) -> Message {
+        msg(|msg| {
+            let mut misc = Misc::new();
+            set(&mut misc);
+            msg.set_misc(misc);
+        })
+    }
+
+    fn option_msg(set: impl FnOnce(&mut OptionMessage)) -> Message {
+        misc_msg(|misc| {
+            let mut option = OptionMessage::new();
+            set(&mut option);
+            misc.set_option(option);
+        })
+    }
+
+    fn set_supported_decoding(option: &mut OptionMessage) {
+        option.supported_decoding = hbb_common::protobuf::MessageField::some(Default::default());
+    }
+
+    fn assert_scopes(
+        conn_type: AuthConnType,
+        cases: impl IntoIterator<Item = (Message, Option<&'static str>)>,
+    ) {
+        for (msg, expected) in cases {
+            assert_eq!(
+                Connection::authorized_message_scope_violation(conn_type, &msg),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_scope_allows_only_messages_for_authenticated_session_type() {
+        let cases = [
+            (
+                AuthConnType::FileTransfer,
+                vec![
+                    (msg(|m| m.set_file_action(FileAction::new())), None),
+                    (msg(|m| m.set_file_response(FileResponse::new())), None),
+                    (msg(|m| m.set_login_request(LoginRequest::new())), None),
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        Some("screenshot_request"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_capture_displays(CaptureDisplays::new())),
+                        Some("misc.capture_displays"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
+                    ),
+                    (msg(|m| m.set_clipboard(Clipboard::new())), None),
+                    (
+                        msg(|m| m.set_multi_clipboards(MultiClipboards::new())),
+                        None,
+                    ),
+                    (misc_msg(|m| m.set_refresh_video(true)), None),
+                    (misc_msg(|m| m.set_refresh_video_display(0)), None),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default())
+                        }),
+                        None,
+                    ),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default());
+                            o.disable_audio = BoolOption::Yes.into();
+                        }),
+                        Some("misc.option"),
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::Terminal,
+                vec![
+                    (msg(|m| m.set_terminal_action(TerminalAction::new())), None),
+                    (
+                        option_msg(|o| o.terminal_persistent = BoolOption::Yes.into()),
+                        None,
+                    ),
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        Some("screenshot_request"),
+                    ),
+                    (
+                        msg(|m| m.set_file_action(FileAction::new())),
+                        Some("file_action"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_privacy_mode(TogglePrivacyMode::new())),
+                        Some("misc.toggle_privacy_mode"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
+                    ),
+                    (misc_msg(|m| m.set_chat_message(ChatMessage::new())), None),
+                    (msg(|m| m.set_clipboard(Clipboard::new())), None),
+                    (
+                        msg(|m| m.set_multi_clipboards(MultiClipboards::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_virtual_display(ToggleVirtualDisplay::new())),
+                        Some("misc.toggle_virtual_display"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_resolution(Resolution::new())),
+                        Some("misc.change_resolution"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_display_resolution(DisplayResolution::new())),
+                        Some("misc.change_display_resolution"),
+                    ),
+                    (misc_msg(|m| m.set_refresh_video(true)), None),
+                    (misc_msg(|m| m.set_refresh_video_display(0)), None),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default())
+                        }),
+                        None,
+                    ),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default());
+                            o.disable_audio = BoolOption::Yes.into();
+                        }),
+                        Some("misc.option"),
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::ViewCamera,
+                vec![
+                    (
+                        misc_msg(|m| m.set_switch_display(SwitchDisplay::new())),
+                        None,
+                    ),
+                    (misc_msg(|m| m.set_chat_message(ChatMessage::new())), None),
+                    (
+                        msg(|m| m.set_voice_call_request(VoiceCallRequest::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_audio_frame(AudioFrame::new())), None),
+                    (
+                        option_msg(|o| o.image_quality = ImageQuality::Balanced.into()),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_privacy_mode(TogglePrivacyMode::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_toggle_virtual_display(ToggleVirtualDisplay::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_resolution(Resolution::new())),
+                        None,
+                    ),
+                    (
+                        misc_msg(|m| m.set_change_display_resolution(DisplayResolution::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_mouse_event(MouseEvent::new())), None),
+                    (
+                        msg(|m| m.set_pointer_device_event(PointerDeviceEvent::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_key_event(KeyEvent::new())), None),
+                    (misc_msg(|m| m.set_client_record_status(true)), None),
+                    (
+                        msg(|m| m.set_file_response(FileResponse::new())),
+                        Some("file_response"),
+                    ),
+                    (
+                        msg(|m| m.set_terminal_action(TerminalAction::new())),
+                        Some("terminal_action"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::Remote,
+                vec![
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        None,
+                    ),
+                    (msg(|m| m.set_terminal_action(TerminalAction::new())), None),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        None,
+                    ),
+                ],
+            ),
+            (
+                AuthConnType::PortForward,
+                vec![
+                    (msg(|m| m.set_test_delay(TestDelay::new())), None),
+                    (misc_msg(|m| m.set_close_reason("closed".to_owned())), None),
+                    (
+                        msg(|m| m.set_file_action(FileAction::new())),
+                        Some("file_action"),
+                    ),
+                    (
+                        msg(|m| m.set_terminal_action(TerminalAction::new())),
+                        Some("terminal_action"),
+                    ),
+                    (
+                        msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
+                        Some("screenshot_request"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
+                    ),
+                    (misc_msg(|m| m.set_refresh_video(true)), None),
+                    (misc_msg(|m| m.set_refresh_video_display(0)), None),
+                    (
+                        option_msg(|o| {
+                            o.supported_decoding =
+                                hbb_common::protobuf::MessageField::some(Default::default())
+                        }),
+                        None,
+                    ),
+                ],
+            ),
+        ];
+
+        for (conn_type, messages) in cases {
+            assert_scopes(conn_type, messages);
+        }
+    }
+
+    #[test]
+    fn session_scope_login_options_are_limited_to_authenticated_session_type() {
+        let mut option = OptionMessage::new();
+        option.image_quality = ImageQuality::Balanced.into();
+        option.disable_audio = BoolOption::Yes.into();
+        option.block_input = BoolOption::Yes.into();
+        option.privacy_mode = BoolOption::Yes.into();
+
+        let (scoped, violation) =
+            Connection::scoped_login_option(AuthConnType::ViewCamera, &option);
+        let scoped = scoped.unwrap();
+        assert_eq!(violation, Some("login.option"));
+        assert_eq!(
+            scoped.image_quality.enum_value(),
+            Ok(ImageQuality::Balanced)
+        );
+        assert_eq!(scoped.disable_audio.enum_value(), Ok(BoolOption::Yes));
+        assert_eq!(scoped.block_input.enum_value(), Ok(BoolOption::NotSet));
+        assert_eq!(scoped.privacy_mode.enum_value(), Ok(BoolOption::NotSet));
+
+        let (scoped, violation) =
+            Connection::scoped_login_option(AuthConnType::FileTransfer, &option);
+        assert!(scoped.is_none());
+        assert_eq!(violation, Some("login.option"));
+    }
+
+    #[test]
+    fn session_scope_limited_render_noop_options_reject_mixed_fields() {
+        for conn_type in [
+            AuthConnType::FileTransfer,
+            AuthConnType::Terminal,
+            AuthConnType::PortForward,
+        ] {
+            let supported_decoding_only = option_msg(set_supported_decoding);
+            assert_eq!(
+                Connection::authorized_message_scope_violation(conn_type, &supported_decoding_only),
+                None
+            );
+
+            let mixed_option = option_msg(|o| {
+                set_supported_decoding(o);
+                o.disable_audio = BoolOption::Yes.into();
+            });
+            assert_eq!(
+                Connection::authorized_message_scope_violation(conn_type, &mixed_option),
+                Some("misc.option")
+            );
+        }
+    }
+
+    #[test]
+    fn session_scope_view_camera_options_keep_only_camera_fields() {
+        let mut option = OptionMessage::new();
+        option.image_quality = ImageQuality::Balanced.into();
+        option.custom_image_quality = 80;
+        option.custom_fps = 24;
+        set_supported_decoding(&mut option);
+        option.disable_audio = BoolOption::Yes.into();
+        option.block_input = BoolOption::Yes.into();
+        option.disable_clipboard = BoolOption::Yes.into();
+        option.enable_file_transfer = BoolOption::Yes.into();
+        option.terminal_persistent = BoolOption::Yes.into();
+
+        let (scoped, violation) =
+            Connection::scoped_login_option(AuthConnType::ViewCamera, &option);
+        let scoped = scoped.unwrap();
+        assert_eq!(violation, Some("login.option"));
+        assert_eq!(
+            scoped.image_quality.enum_value(),
+            Ok(ImageQuality::Balanced)
+        );
+        assert_eq!(scoped.custom_image_quality, 80);
+        assert_eq!(scoped.custom_fps, 24);
+        assert!(scoped.supported_decoding.is_some());
+        assert_eq!(scoped.disable_audio.enum_value(), Ok(BoolOption::Yes));
+        assert_eq!(scoped.block_input.enum_value(), Ok(BoolOption::NotSet));
+        assert_eq!(
+            scoped.disable_clipboard.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
+        assert_eq!(
+            scoped.enable_file_transfer.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
+        assert_eq!(
+            scoped.terminal_persistent.enum_value(),
+            Ok(BoolOption::NotSet)
+        );
     }
 }
