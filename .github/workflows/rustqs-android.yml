@@ -231,8 +231,12 @@ jobs:
             reject_control_chars app_name "$value"
             byte_length=$(LC_ALL=C printf '%s' "$value" | wc -c)
             if [ -z "$value" ] || [ "$value" = "." ] || [ "$value" = ".." ] || [ "$byte_length" -gt 128 ]; then
-              echo "::error::app_name must be a non-empty filename component of at most 128 bytes"
-              exit 1
+               echo "::error::app_name must be a non-empty filename component of at most 128 bytes"
+               exit 1
+            fi
+            if [[ "$value" == @* || "$value" == \?* ]]; then
+                echo "::error::app_name must not start with @ or ?"
+                exit 1
             fi
             if [[ "$value" == */* || "$value" == *\\* || "$value" == *'<'* || "$value" == *'>'* || "$value" == *:* || "$value" == *'"'* || "$value" == *'|'* || "$value" == *'?'* || "$value" == *'*'* ]]; then
                 echo "::error::app_name contains unsafe filename characters"
@@ -468,8 +472,15 @@ jobs:
           from pathlib import Path
           from xml.sax.saxutils import escape
 
+          def escape_android_string(value):
+              if value.startswith(("@", "?")):
+                  raise SystemExit("Android app_name must not start with @ or ?")
+              value = value.replace("\\", "\\\\")
+              value = value.replace("'", "\\'").replace('"', '\\"')
+              return escape(value)
+
           app_id = os.environ["ANDROID_APP_ID"]
-          app_label = escape(os.environ["ANDROID_APP_LABEL"])
+          app_label = escape_android_string(os.environ["ANDROID_APP_LABEL"])
           gradle = Path("flutter/android/app/build.gradle")
           if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", app_id) or len(app_id) > 255:
               raise SystemExit("android_app_id failed the Android package contract")
@@ -666,9 +677,10 @@ jobs:
           MANIFEST_PLATFORM: android
           MANIFEST_WORKFLOW_SHA: ${{ github.sha }}
           MANIFEST_WORKFLOW_REF: ${{ github.ref }}
-          MANIFEST_PUBLICATION_TIMESTAMP: ${{ github.run_started_at }}
         run: |
           set -euo pipefail
+          MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          export MANIFEST_PUBLICATION_TIMESTAMP
           if [ -f flutter/assets/custom_.txt ]; then
             cp -- flutter/assets/custom_.txt output/custom_.txt
           fi

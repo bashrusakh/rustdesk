@@ -169,6 +169,7 @@ Lütfen bu komutları RustDesk reposunun root klasöründe çalıştırdığın�
 - **[flutter/web/js](https://github.com/rustdesk/rustdesk/tree/master/flutter/web/v1/js)**: Flutter web istemcisi için JavaScript
 
 
+<a id="screenshots"></a>
 ## Ekran Görüntüleri
 
 ![image](https://user-images.githubusercontent.com/71636191/113112362-ae4deb80-923b-11eb-957d-ff88daad4f06.png)

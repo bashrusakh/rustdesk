@@ -556,9 +556,10 @@ jobs:
           MANIFEST_PLATFORM: linux
           MANIFEST_WORKFLOW_SHA: ${{ github.sha }}
           MANIFEST_WORKFLOW_REF: ${{ github.ref }}
-          MANIFEST_PUBLICATION_TIMESTAMP: ${{ github.run_started_at }}
         run: |
           set -euo pipefail
+          MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          export MANIFEST_PUBLICATION_TIMESTAMP
           if [ -f flutter/build/linux/x64/release/bundle/custom_.txt ]; then
             cp -- flutter/build/linux/x64/release/bundle/custom_.txt output/custom_.txt
           fi

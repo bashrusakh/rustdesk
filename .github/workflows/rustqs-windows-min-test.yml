@@ -38,7 +38,6 @@ jobs:
     secrets: inherit
 
   topmost:
-    needs: [bridge]
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     with:
       upload-artifact: true
@@ -512,6 +511,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $requiredNames = @(
            'windows-x64-release.zip',
            'usbmmidd_v2.zip',
@@ -538,11 +538,11 @@ jobs:
           }
           $expectedByName = @{}
           foreach ($requiredName in $requiredNames) {
-            $matches = @($releaseAssets | Where-Object { $_.name -eq $requiredName })
-            if ($matches.Count -ne 1) {
+            $matchingAssets = @($releaseAssets | Where-Object { $_.name -eq $requiredName })
+            if ($matchingAssets.Count -ne 1) {
               throw "required release asset '$requiredName' is missing or ambiguous"
             }
-            $expected = $matches[0]
+            $expected = $matchingAssets[0]
             if ([int64]$expected.id -le 0 -or [string]::IsNullOrWhiteSpace([string]$expected.name) -or [string]$expected.digest -notmatch '(?i)^sha256:[0-9a-f]{64}$') {
               throw "required release asset '$requiredName' has invalid provider identity"
             }
@@ -561,12 +561,12 @@ jobs:
           function Download-VerifiedReleaseAsset([string]$name) {
             $expected = $expectedByName[$name]
             $assetURI = "https://api.github.com/repos/$($env:RQS_RELEASE_REPO)/releases/assets/$([int64]$expected.id)"
-            $remote = Invoke-RestMethod -UseBasicParsing -Headers $apiHeaders -Uri $assetURI -Method Get
+            $remote = Invoke-RestMethod -UseBasicParsing -Headers $apiHeaders -Uri $assetURI -Method Get -ConnectionTimeoutSeconds 30 -OperationTimeoutSeconds 120
             if ([int64]$remote.id -ne [int64]$expected.id -or [string]$remote.name -cne $name -or [string]$remote.digest -ine [string]$expected.digest) {
               throw "provider release asset identity mismatch for '$name'"
             }
             $path = Join-Path (Get-Location) $name
-            $null = Invoke-WebRequest -UseBasicParsing -Headers $downloadHeaders -Uri $assetURI -Method Get -OutFile $path
+            $null = Invoke-WebRequest -UseBasicParsing -Headers $downloadHeaders -Uri $assetURI -Method Get -OutFile $path -ConnectionTimeoutSeconds 30 -OperationTimeoutSeconds 120
             $actualDigest = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLowerInvariant()
             $expectedDigest = ([string]$expected.digest).Substring(7).ToLowerInvariant()
             if ($actualDigest -cne $expectedDigest) {
@@ -696,9 +696,10 @@ jobs:
           MANIFEST_PLATFORM: windows
           MANIFEST_WORKFLOW_SHA: ${{ github.sha }}
           MANIFEST_WORKFLOW_REF: ${{ github.ref }}
-          MANIFEST_PUBLICATION_TIMESTAMP: ${{ github.run_started_at }}
         run: |
           set -euo pipefail
+          MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          export MANIFEST_PUBLICATION_TIMESTAMP
           if [ -f flutter/build/windows/x64/runner/Release/custom_.txt ]; then
             cp -- flutter/build/windows/x64/runner/Release/custom_.txt output/custom_.txt
           fi

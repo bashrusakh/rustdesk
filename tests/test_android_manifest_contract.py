@@ -4,6 +4,7 @@
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,9 @@ def main() -> None:
     for marker in (
         'gradle.write_text(gradle_text.replace(\'applicationId "com.carriez.flutter_hbb"\'',
         'grep -F -q -- \'package="com.carriez.flutter_hbb"\'',
+        'value = value.replace("\\\\", "\\\\\\\\")',
+        'value = value.replace("\'", "\\\\\'").replace(\'"\', \'\\\\"\')',
+        'raise SystemExit("Android app_name must not start with @ or ?")',
     ):
         if marker not in workflow:
             raise AssertionError(f"Android workflow contract is missing {marker!r}")
@@ -59,6 +63,15 @@ def main() -> None:
             resolved = f"{BASE_PACKAGE}{name}"
             if resolved not in classes:
                 raise AssertionError(f"{manifest_path}: component {name!r} resolves to missing {resolved}")
+
+    app_label = "O'Reilly \\\"Client\\\" & <test>"
+    app_label = app_label.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+    app_label = escape(app_label)
+    generated = f'<resources><string name="app_name">{app_label}</string></resources>'
+    ET.fromstring(generated)
+    for marker in ("O\\'Reilly", '\\\\\\"Client\\\\\\"', "\\\\", "&amp;", "&lt;", "&gt;"):
+        if marker not in generated:
+            raise AssertionError(f"Android app_name escaping is missing {marker!r}")
 
 
 if __name__ == "__main__":

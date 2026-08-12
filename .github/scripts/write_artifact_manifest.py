@@ -245,7 +245,7 @@ def verify_bridge_artifact(
     records = manifest.get("files")
     if not isinstance(records, list) or len(records) != len(BRIDGE_FILES):
         raise SystemExit("bridge artifact manifest file records are invalid")
-    for record, name in zip(records, BRIDGE_FILES):
+    for record, name in zip(records, BRIDGE_FILES, strict=True):
         if not isinstance(record, dict) or set(record) != {"name", "size", "sha256"}:
             raise SystemExit("bridge artifact manifest file record schema is invalid")
         if record["name"] != name or not safe_relative_name(name, allow_nested=True):
@@ -264,9 +264,9 @@ def verify_bridge_artifact(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--platform", required=True)
-    parser.add_argument("--app-name", required=True)
-    parser.add_argument("--version", required=True)
+    parser.add_argument("--platform")
+    parser.add_argument("--app-name")
+    parser.add_argument("--version")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workflow-sha", required=True)
     parser.add_argument("--workflow-ref", required=True)
@@ -287,6 +287,8 @@ def main() -> None:
         )
         return
 
+    if not args.platform or not args.app_name or not args.version:
+        raise SystemExit("manifest production requires platform, app name, and version")
     output = output_root(args.output)
     names = expected_names(args.platform, args.app_name, args.version)
     validate_output_tree(output, set(names))
@@ -297,7 +299,7 @@ def main() -> None:
         safe_output_file(output, PRIVATE_FILENAME)
         private_filenames.append(PRIVATE_FILENAME)
     file_records: list[dict[str, str | int]] = []
-    for name, path in zip(names, paths):
+    for name, path in zip(names, paths, strict=True):
         before = path.lstat()
         data = path.read_bytes()
         after = path.lstat()

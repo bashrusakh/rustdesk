@@ -108,8 +108,6 @@ jobs:
             RQS_VERSION=$(printf '%s' "$decrypted" | jq -r '.version // ""')
             RQS_SOURCE_SHA=$(printf '%s' "$decrypted" | jq -r '.source_sha // ""')
             RQS_WORKFLOW_REPO=$(printf '%s' "$decrypted" | jq -r '.workflow_repo // ""')
-            RQS_RELEASE_REPO=$(printf '%s' "$decrypted" | jq -r '.release_repo // ""')
-            RQS_RELEASE_ASSETS=$(printf '%s' "$decrypted" | jq -c '.release_assets // empty')
             if ! printf '%s' "$decrypted" | jq -e '(.source_sha | type == "string") and (.workflow_repo | type == "string")' >/dev/null; then
               echo "::error::encrypted payload source identity fields must be strings"
               exit 1
@@ -124,27 +122,6 @@ jobs:
             fi
             if [ "${RQS_WORKFLOW_REPO,,}" != "${GITHUB_REPOSITORY,,}" ]; then
               echo "::error::authenticated workflow repository does not match this fork"
-              exit 1
-            fi
-            if [[ ! "$RQS_RELEASE_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
-              echo "::error::encrypted payload release_repo is missing or malformed"
-              exit 1
-            fi
-            release_owner=${RQS_RELEASE_REPO%%/*}
-            release_name=${RQS_RELEASE_REPO#*/}
-            if [ "$release_owner" = "." ] || [ "$release_owner" = ".." ] || [ "$release_name" = "." ] || [ "$release_name" = ".." ]; then
-              echo "::error::encrypted payload release_repo contains an invalid path segment"
-              exit 1
-            fi
-            if [ -z "$RQS_RELEASE_ASSETS" ] || ! printf '%s\n' "$RQS_RELEASE_ASSETS" | jq -e --argjson required '["windows-x64-release.zip", "usbmmidd_v2.zip", "rustdesk_printer_driver_v4-1.4.zip", "printer_driver_adapter.zip"]' '
-              type == "array" and length == ($required | length)
-              and ([.[].name] | sort) == ($required | sort)
-              and ([.[].id] | unique | length) == ([.[].id] | length)
-              and all(.[]; (.id | type == "number") and (.id == (.id | floor)) and (.id > 0)
-                and (.name | type == "string")
-                and (.digest | type == "string" and test("(?i)^sha256:[0-9a-f]{64}$")))
-            ' >/dev/null; then
-              echo "::error::encrypted payload release asset metadata is missing or malformed"
               exit 1
             fi
           reject_control_chars() {
@@ -168,8 +145,6 @@ jobs:
           fi
           reject_control_chars RQS_SOURCE_SHA "$RQS_SOURCE_SHA"
           reject_control_chars RQS_WORKFLOW_REPO "$RQS_WORKFLOW_REPO"
-          reject_control_chars RQS_RELEASE_REPO "$RQS_RELEASE_REPO"
-          reject_control_chars RQS_RELEASE_ASSETS "$RQS_RELEASE_ASSETS"
           write_github_env() {
             local name="$1" value="$2"
             reject_control_chars "$name" "$value"
@@ -184,7 +159,7 @@ jobs:
           echo "bridge source checkout: SET"
 
       - name: Checkout source code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           submodules: recursive
@@ -324,9 +299,10 @@ jobs:
           MANIFEST_PLATFORM: bridge
           MANIFEST_WORKFLOW_SHA: ${{ github.sha }}
           MANIFEST_WORKFLOW_REF: ${{ github.ref }}
-          MANIFEST_PUBLICATION_TIMESTAMP: ${{ github.run_started_at }}
         run: |
           set -euo pipefail
+          MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          export MANIFEST_PUBLICATION_TIMESTAMP
           test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
           python3 "$MANIFEST_HELPER_PATH" \
             --platform "$MANIFEST_PLATFORM" --app-name rustdesk-bridge --version "$RQS_VERSION" \

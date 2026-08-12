@@ -42,7 +42,7 @@ RustDesk приветствует вклад каждого. Ознакомьт�
 
 Для ПК-версии используются библиотеки Flutter или Sciter (устаревшее) для графического интерфейса. Данное руководство подразумевает работу с Sciter, так как он более простой в использовании и с ним легче начать работу. Текущий справочник сборки клиента в этом fork — [Windows workflow](../.github/workflows/rustqs-windows-min-test.yml); это ссылка на исходный файл, а не заявление о релизе или поддержке.
 
-Загрузите динамическую библиотеку Flutter самостоятельно.
+Загрузите динамическую библиотеку Sciter самостоятельно.
 
 [Windows](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll) |
 [Linux](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so) |

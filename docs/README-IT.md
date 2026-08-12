@@ -33,7 +33,7 @@ RustDesk accoglie il contributo di tutti. Per ulteriori informazioni su come ini
 
 ## Dipendenze
 
-Le versioni desktop utilizzano Flutter o Sciter (deprecato) per l'interfaccia utente, questo tutorial è solo per Sciter, poiché è più facile per iniziare. Per il riferimento attuale alla compilazione del client in questo fork, consulta il [workflow Windows](../.github/workflows/rustqs-windows-min-test.yml); il file è solo un riferimento al sorgente, non una dichiarazione di rilascio o supporto.
+Le versioni desktop utilizzano Flutter o Sciter (deprecato) per l'interfaccia utente, questo tutorial è solo per Sciter, poiché è più facile per iniziare. Per il riferimento attuale alla compilazione del client in questo fork, consulta il [workflow Windows](../.github/workflows/rustqs-windows-min-test.yml); il file è solo un riferimento al codice sorgente, non una dichiarazione di rilascio o supporto.
 
 Scarica la libreria dinamica Sciter.
 

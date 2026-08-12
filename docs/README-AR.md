@@ -162,6 +162,7 @@ RustDesk يرجى التأكد من أنك تنفذ هذه الأوامر من �
 - **[flutter](https://github.com/rustdesk/rustdesk/tree/master/flutter)**: رمز الهاتف المحمول
 - **[flutter/web/js](https://github.com/rustdesk/rustdesk/tree/master/flutter/web/js)**:Flutter  لعميل الويب الخاص ب Javascript
 
+<a id="screenshots"></a>
 ## لقطات
 
 ![image](https://user-images.githubusercontent.com/71636191/113112362-ae4deb80-923b-11eb-957d-ff88daad4f06.png)

@@ -36,17 +36,6 @@ bridge_files = (
 )
 
 
-def run_blocks(document):
-    if isinstance(document, dict):
-        for key, value in document.items():
-            if key == "run" and isinstance(value, str):
-                yield value
-            yield from run_blocks(value)
-    elif isinstance(document, list):
-        for value in document:
-            yield from run_blocks(value)
-
-
 def run_blocks_with_shell(document):
     if isinstance(document, dict):
         if isinstance(document.get("run"), str):
@@ -72,8 +61,9 @@ def uses_values(document):
 def bash_contract(workflow):
     text = workflow.read_text()
     parsed = yaml.safe_load(text)
-    blocks = list(run_blocks(parsed))
+    blocks = []
     for index, (block, shell) in enumerate(run_blocks_with_shell(parsed)):
+        blocks.append(block)
         if shell and "bash" not in str(shell):
             continue
         if not shell and workflow.name == "rustqs-windows-min-test.yml":
@@ -175,6 +165,16 @@ for name in workflow_names:
     ):
         if marker not in contract_text:
             raise AssertionError(f"{name}: authenticated/reproducible payload marker {marker!r} is missing")
+    manifest_timestamp_producers = re.findall(
+        r"MANIFEST_PUBLICATION_TIMESTAMP=\$\(date -u '\+%Y-%m-%dT%H:%M:%SZ'\)", text
+    )
+    if len(manifest_timestamp_producers) != 1:
+        raise AssertionError(
+            f"{name}: expected exactly one runtime publication timestamp producer, "
+            f"found {len(manifest_timestamp_producers)}"
+        )
+    if "github.run_started_at" in text:
+        raise AssertionError(f"{name}: unsupported github.run_started_at publication timestamp remains")
     if '"verification_result": "verified"' in text:
         raise AssertionError(f"{name}: producer self-report must not be labelled verified")
     if ".github/scripts/write_artifact_manifest.py" not in text:
@@ -291,7 +291,7 @@ def execute_payload_contract(block, encoded, key):
         input=script,
         text=True,
         capture_output=True,
-        env={**dict(__import__("os").environ), "ENC": encoded, "PAYLOAD_KEY": key},
+        env={**os.environ, "ENC": encoded, "PAYLOAD_KEY": key},
     )
 
 
@@ -307,7 +307,7 @@ for name in workflow_names:
 
     cases = (("version", "1.2.3\r"),)
     if name != "bridge.yml":
-        cases = (("key", "public\nkey"), ("key", "public-key"), ("app_name", "../rustqs"), ("version", "../../etc"), ("version", "1.2"), ("version", "1.2.3-01"), ("version", "1.2.3+build"), ("version", "1.2.3\r"))
+        cases = (("key", "public\nkey"), ("key", "public-key"), ("app_name", "../rustqs"), ("app_name", "@rustqs"), ("app_name", "?rustqs"), ("version", "../../etc"), ("version", "1.2"), ("version", "1.2.3-01"), ("version", "1.2.3+build"), ("version", "1.2.3\r"))
     for field, value in cases:
         app = value if field == "app_name" else "rustqs"
         key = value if field == "key" else "public/key+=="
@@ -374,7 +374,8 @@ for marker in (
 for marker in (
     'RQS_ANDROID_APP_ID=$(printf',
     'validate_android_app_id() {',
-    'android_app_id must be a lowercase Java package identifier',
+     'android_app_id must be a lowercase Java package identifier',
+     'app_name must not start with @ or ?',
     'write_github_env RQS_ANDROID_APP_ID "$RQS_ANDROID_APP_ID"',
     "Apply Android identity",
     'package="com.carriez.flutter_hbb"',
@@ -409,10 +410,15 @@ if source_guard > build_call:
 if "L2 payload: place custom_.txt into bundle" in linux_text:
     raise AssertionError("Linux workflow must not stage custom_.txt after Debian package creation")
 flutter_build = build_py.index("flutter build linux --release")
-stage_custom = build_py.index("stage_custom_txt_for_linux_bundle()", flutter_build)
+stage_custom = build_py.index("stage_custom_txt_for_linux_bundle(", flutter_build)
 bundle_copy = build_py.index("cp -r {flutter_build_dir}/*", stage_custom)
 if not flutter_build < stage_custom < bundle_copy:
     raise AssertionError("build.py must stage custom_.txt between Flutter build and Debian bundle copy")
+package_flow = build_py.index("def build_deb_from_folder")
+package_stage = build_py.index("stage_custom_txt_for_linux_bundle(", package_flow)
+package_copy = build_py.index("cp -r ../{binary_folder}/*", package_stage)
+if not package_stage < package_copy:
+    raise AssertionError("build.py --package must stage custom_.txt before copying the binary folder")
 deb_assertion = linux_text.index('dpkg-deb -c "$deb_source"')
 deb_copy = linux_text.index('cp -- "$deb_source" "$deb_output"')
 if deb_assertion > deb_copy:
@@ -510,6 +516,29 @@ def verify_bridge_artifact(output, source_sha="a" * 40, workflow_sha="b" * 40, w
     return 0
 
 
+def verify_bridge_artifact_with_cli(output):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(root / ".github" / "scripts" / "write_artifact_manifest.py"),
+            "--verify-bridge",
+            "--output",
+            str(output),
+            "--expected-source-sha",
+            "a" * 40,
+            "--expected-version",
+            "1.2.3",
+            "--workflow-sha",
+            "b" * 40,
+            "--workflow-ref",
+            "rustqs/min-test",
+        ],
+        cwd=root,
+        text=True,
+        capture_output=True,
+    )
+
+
 with tempfile.TemporaryDirectory() as output_dir:
     output = Path(output_dir)
     (output / "rustqs.exe").write_bytes(b"safe")
@@ -544,22 +573,22 @@ with tempfile.TemporaryDirectory() as output_dir:
     outside = output.parent / "outside.exe"
     outside.write_bytes(b"outside")
     (output / "rustqs.exe").symlink_to(outside)
-    result = run_manifest_writer(output)
-    if result.returncode == 0 or (output / "manifest.txt").exists():
+    result = run_manifest_writer_with_mocked_provenance(output)
+    if result == 0 or (output / "manifest.txt").exists():
         raise AssertionError("manifest writer accepted an escaping symlink or wrote before rejecting it")
 
 with tempfile.TemporaryDirectory() as output_dir:
     output = Path(output_dir)
     os.mkfifo(output / "rustqs.exe")
-    result = run_manifest_writer(output)
-    if result.returncode == 0 or (output / "manifest.txt").exists():
+    result = run_manifest_writer_with_mocked_provenance(output)
+    if result == 0 or (output / "manifest.txt").exists():
         raise AssertionError("manifest writer accepted a special file or wrote before rejecting it")
 
 with tempfile.TemporaryDirectory() as output_dir:
     output = Path(output_dir)
     (output / "rustqs.exe").write_bytes(b"safe")
-    result = run_manifest_writer(output, "../escape")
-    if result.returncode == 0 or (output / "manifest.txt").exists():
+    result = run_manifest_writer_with_mocked_provenance(output, app_name="../escape")
+    if result == 0 or (output / "manifest.txt").exists():
         raise AssertionError("manifest writer accepted an output path escaping the artifact directory")
 
 with tempfile.TemporaryDirectory() as output_dir:
@@ -574,7 +603,7 @@ with tempfile.TemporaryDirectory() as output_dir:
     manifest = json.loads((output / "manifest.txt").read_text())
     if manifest["platform"] != "bridge" or manifest["output_filenames"] != sorted(bridge_files):
         raise AssertionError(f"bridge manifest output contract is invalid: {manifest}")
-    if verify_bridge_artifact(output) != 0:
+    if verify_bridge_artifact_with_cli(output).returncode != 0:
         raise AssertionError("bridge manifest verifier rejected valid identity and hashes")
     (output / bridge_files[0]).write_bytes(b"tampered")
     if verify_bridge_artifact(output) == 0:
