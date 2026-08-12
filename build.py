@@ -316,12 +316,26 @@ def ffi_bindgen_function_refactor():
         'sed -i "s/ffi.NativeFunction<ffi.Bool Function(DartPort/ffi.NativeFunction<ffi.Uint8 Function(DartPort/g" flutter/lib/generated_bridge.dart')
 
 
+def stage_custom_txt_for_linux_bundle():
+    """Stage the private client config before Debian/RPM package creation."""
+    source = os.environ.get("RQS_CUSTOM_TXT_FILE", "")
+    if not source:
+        return
+    source_path = Path(source)
+    if not source_path.is_file():
+        raise RuntimeError("RQS_CUSTOM_TXT_FILE does not point to a regular file")
+    destination = Path(flutter_build_dir) / "custom_.txt"
+    shutil.copy2(source_path, destination)
+    destination.chmod(0o600)
+
+
 def build_flutter_deb(version, features):
     if not skip_cargo:
         system2(f'cargo build --locked --features {features} --lib --release')
         ffi_bindgen_function_refactor()
     os.chdir('flutter')
     system2('flutter build linux --release')
+    stage_custom_txt_for_linux_bundle()
     system2('mkdir -p tmpdeb/usr/bin/')
     system2('mkdir -p tmpdeb/usr/share/rustdesk')
     system2('mkdir -p tmpdeb/etc/rustdesk/')

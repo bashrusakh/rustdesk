@@ -1,4 +1,4 @@
-﻿name: build RustDeskTempTopMostWindow
+name: build RustDeskTempTopMostWindow
 
 on:
   workflow_call:
@@ -27,6 +27,8 @@ on:
             type: string
             default: 'Windows10'
 
+permissions: {}
+
 env:
   project_path: WindowInjection/WindowInjection.vcxproj
 
@@ -54,6 +56,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ inputs.upload-artifact }}
         with:
-            name: topmostwindow-artifacts-${{ inputs.platform }}
-            path: |
-              ./${{ env.build_output_dir }}/WindowInjection.dll
+          name: topmostwindow-artifacts-${{ inputs.platform }}
+          path: |
+            ./${{ env.build_output_dir }}/WindowInjection.dll
+          retention-days: 7
+          if-no-files-found: error

@@ -4,7 +4,7 @@
   <a href="#raw-steps-to-build">Build</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
   <a href="#file-structure">Structure</a> •
-  <a href="#snapshot">Snapshot</a><br>
+  <a href="#screenshots">Snapshot</a><br>
   [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FA.md">فارسی</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-NL.md">Nederlands</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-DA.md">Dansk</a>] | [<a href="README-GR.md">Ελληνικά</a>] | [<a href="README-TR.md">Türkçe</a>]<br>
   <b>READMEや<a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a>、 <a href="https://github.com/rustdesk/doc.rustdesk.com">RustDesk Doc</a>の翻訳者を歓迎します！</b>
 </p>
@@ -32,7 +32,7 @@ RustDeskは皆さんの貢献を歓迎します。
 
 ## 依存関係
 
-デスクトップ版ではGUIにFlutterまたはSciter(非推奨)を使用しますが、チュートリアルでは分かりやすく、簡単なSciterのみを対象に解説しています。Flutterでのビルド方法については[CI](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml)をご覧ください。
+デスクトップ版ではGUIにFlutterまたはSciter(非推奨)を使用しますが、チュートリアルでは分かりやすく、簡単なSciterのみを対象に解説しています。この fork の現在のクライアントビルド参照は [Windows workflow](../.github/workflows/rustqs-windows-min-test.yml) です。これはソース参照であり、リリースやサポートの主張ではありません。
 
 Sciter dynamic libraryを事前にダウンロードしてください。
 

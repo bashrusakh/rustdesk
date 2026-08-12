@@ -5,7 +5,8 @@ import optparse
 import subprocess
 from hashlib import md5
 import brotli
-import datetime
+from datetime import datetime, timezone
+import time
 
 # 4GB maximum
 length_count = 4
@@ -19,14 +20,16 @@ def generate_md5_table(folder: str, level) -> dict:
     res: dict = dict()
     curdir = os.curdir
     os.chdir(folder)
-    for root, _, files in os.walk('.'):
+    for root, directories, files in os.walk('.'):
+        directories.sort()
+        files.sort()
         # remove ./
         for f in files:
             md5_generator = md5()
             full_path = os.path.join(root, f)
             print(f"Processing {full_path}...")
-            f = open(full_path, "rb")
-            content = f.read()
+            with open(full_path, "rb") as file_handle:
+                content = file_handle.read()
             content_compressed = brotli.compress(
                 content, quality=level)
             md5_generator.update(content)
@@ -40,7 +43,7 @@ def write_package_metadata(md5_table: dict, output_folder: str, exe: str):
     output_path = os.path.join(output_folder, "data.bin")
     with open(output_path, "wb") as f:
         f.write("rustdesk".encode(encoding=encoding))
-        for path in md5_table.keys():
+        for path in sorted(md5_table):
             (compressed_data, md5_code) = md5_table[path]
             data_length = len(compressed_data)
             path = path.encode(encoding=encoding)
@@ -59,10 +62,41 @@ def write_package_metadata(md5_table: dict, output_folder: str, exe: str):
         f.write(exe.encode(encoding='utf-8'))
     print(f"Metadata has been written to {output_path}")
 
+def app_metadata_timestamp_ms() -> int:
+    """Return the reproducible timestamp used by the portable packer.
+
+    SOURCE_DATE_EPOCH is Unix time in seconds and is converted directly to
+    milliseconds so the existing app_metadata.toml schema is unchanged. A
+    missing epoch is deterministic by default; wall-clock metadata is only
+    available for explicitly non-reproducible local debug builds.
+    """
+    source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if source_date_epoch is not None:
+        if (not source_date_epoch or
+                not source_date_epoch.lstrip("+-").isdigit()):
+            raise ValueError(
+                "SOURCE_DATE_EPOCH must be a signed Unix timestamp")
+        epoch_seconds = int(source_date_epoch)
+        if epoch_seconds < 0:
+            raise ValueError(
+                "SOURCE_DATE_EPOCH must be non-negative for app metadata")
+        try:
+            datetime.fromtimestamp(epoch_seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError(
+                "SOURCE_DATE_EPOCH is outside the supported timestamp range"
+            ) from exc
+        return epoch_seconds * 1000
+
+    if os.environ.get("RUSTDESK_NON_REPRODUCIBLE_DEBUG") == "1":
+        return max(0, time.time_ns() // 1_000_000)
+    return 0
+
+
 def write_app_metadata(output_folder: str):
     output_path = os.path.join(output_folder, "app_metadata.toml")
     with open(output_path, "w") as f:
-        f.write(f"timestamp = {int(datetime.datetime.now().timestamp() * 1000)}\n")
+        f.write(f"timestamp = {app_metadata_timestamp_ms()}\n")
     print(f"App metadata has been written to {output_path}")
 
 def build_portable(output_folder: str, target: str):
