@@ -310,7 +310,36 @@ Cargo metadata, and available external vendor input. Approved but unavailable
   not been executed. The committed relative full registry `vendor/` tree is
   intentionally absent. The external vendor directory/archive verification
   above is available-input evidence, not a claim of CI success or full offline
-  independence.
+   independence.
+
+### Vendor provenance newline repair (follow-up)
+
+The copied-root comparison was re-run at follow-up HEAD `18507d6fd` and
+correctly failed in both external-input modes at `kcp-sys/kcp/.gitignore`.
+The complete mismatch set was:
+
+- `third_party/kcp-sys/kcp/.gitignore`
+- `third_party/kcp-sys/kcp/.travis.yml`
+- `third_party/kcp-sys/kcp/README.en.md`
+- `third_party/kcp-sys/kcp/README.md`
+- `third_party/kcp-sys/kcp/ikcp.c`
+- `third_party/kcp-sys/kcp/ikcp.h`
+- `third_party/kcp-sys/kcp/protocol.txt`
+- `third_party/kcp-sys/kcp/test.cpp`
+- `third_party/kcp-sys/kcp/test.h`
+- `third_party/sysinfo/md_doc/sid.md`
+- `third_party/sysinfo/src/windows/sid.rs`
+- `third_party/tao/.changes/readme.md`
+
+Each local file was the exact LF-normalized form of the corresponding file in
+both the approved external vendor directory and archive; the external evidence
+matched byte-for-byte and retained CRLF. The repository's root `.gitattributes`
+rule (`* text=auto`) had normalized the copied source to LF, so this was a local
+copied-source representation mismatch, not a content or manifest rewrite. The
+follow-up preserves the approved external bytes and adds exact `-text`
+attributes for only these 12 paths. The verifier remains fail-closed and
+unchanged. No vendor archive/tree digest or count changed, because the external
+evidence did not change; no manifest rewrite or ownership record changed.
 
 ### Final migration acceptance (future phases)
 
