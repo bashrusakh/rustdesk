@@ -3,7 +3,7 @@
   <a href="../README.md#raw-steps-to-build">Construire</a> •
   <a href="../README.md#how-to-build-with-docker">Docker</a> •
   <a href="../README.md#file-structure">Structură</a> •
-  <a href="../README.md#snapshot">Capturi</a><br>
+  <a href="../README.md#screenshots">Capturi</a><br>
   [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FA.md">فارسی</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-NL.md">Nederlands</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-DA.md">Dansk</a>] | [<a href="README-GR.md">Ελληνικά</a>] | [<a href="README-TR.md">Türkçe</a>] | [<a href="README-NO.md">Norsk</a>] | [<a href="README-RO.md">Română</a>]<br>
   <b>Avem nevoie de ajutorul tău pentru a traduce acest README, <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a> și <a href="https://github.com/rustdesk/doc.rustdesk.com">RustDesk Doc</a> în limba ta maternă</b>
 </p>
@@ -38,7 +38,7 @@ RustDesk primește contribuții de la oricine. Vezi [CONTRIBUTING.md](../docs/CO
 
 ## Dependențe
 
-Versiunile desktop folosesc Flutter sau Sciter (depreciat) pentru interfață; acest ghid este pentru Sciter doar, deoarece este mai ușor și mai prietenos pentru început. Vezi [CI](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml) pentru construire cu Flutter.
+Versiunile desktop folosesc Flutter sau Sciter (depreciat) pentru interfață; acest ghid este pentru Sciter doar, deoarece este mai ușor și mai prietenos pentru început. Vezi [workflow-ul Windows al fork-ului](../.github/workflows/rustqs-windows-min-test.yml) ca referință actuală pentru compilarea clientului; fișierul este doar o referință la sursă, nu o declarație de lansare sau suport.
 
 Te rugăm să descarci singur librăria dinamică Sciter.
 

@@ -7,9 +7,8 @@ name: rustqs linux min test
 # делалось для windows-min-test. Бэкенд уже умеет диспетчить platform=linux сюда и
 # забирать артефакт `rustdesk-min-test-linux`.
 #
-# Контракт параметров идентичен rustqs-windows-min-test:
-#   enc_payload = base64(openssl aes-256-cbc -pbkdf2 -pass pass:$WORKFLOW_PAYLOAD_KEY)
-#                 от JSON {server,key,app_name,custom_txt}; либо открытые inputs (debug).
+# Контракт: единственный build path — authenticated DFP1 enc_payload от API.
+# Direct/manual runs without a valid payload fail closed before checkout/build.
 #
 # Путь в форке: .github/workflows/rustqs-linux.yml на ветке rustqs/min-test.
 # ============================================================================
@@ -18,35 +17,13 @@ on:
   workflow_dispatch:
     inputs:
       enc_payload:
-        description: 'Encrypted payload (base64 openssl aes-256-cbc -pbkdf2). Overrides open inputs below.'
+        description: 'Authenticated DFP1 payload from the API; manual runs without it fail closed.'
         required: false
         type: string
         default: ''
-      server:
-        description: '[Debug] RustDesk server (rendezvous host:port). Ignored if enc_payload set.'
-        required: false
-        type: string
-        default: ''
-      key:
-        description: '[Debug] RustDesk server public key (base64). Ignored if enc_payload set.'
-        required: false
-        type: string
-        default: ''
-      app_name:
-        description: '[Debug] Brand name. Ignored if enc_payload set.'
-        required: false
-        type: string
-        default: ''
-      custom_txt:
-        description: '[Debug] Base64 custom_.txt payload. Ignored if enc_payload set.'
-        required: false
-        type: string
-        default: ''
-      version:
-        description: 'RustDesk version for offline assets (e.g. 1.4.8). Ignored if enc_payload set.'
-        required: false
-        type: string
-        default: '1.4.8'
+
+permissions:
+  contents: read
 
 env:
   RUST_VERSION: "1.75"
@@ -54,11 +31,13 @@ env:
   FLUTTER_VERSION: "3.24.5"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-  VERSION: "${{ inputs.version || '1.4.8' }}"
 
 jobs:
   bridge:
     uses: ./.github/workflows/bridge.yml
+    with:
+      enc_payload: ${{ inputs.enc_payload }}
+    secrets: inherit
 
   build:
     needs: [bridge]
@@ -69,62 +48,297 @@ jobs:
           sudo rm -rf /opt/ghc /usr/local/lib/android /usr/share/dotnet
           df -h
 
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v9
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Checkout source code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      # Разрешение параметров: расшифровать enc_payload (prod) или взять открытые inputs (debug).
-      # Идентично windows-min-test: на выходе env RQS_*, секреты замаскированы.
-      - name: 'Resolve build config (decrypt or pass-through)'
+      # The API is the only source of build values; direct/manual fallback is
+      # intentionally absent and the guard runs before checkout.
+      - name: 'Resolve authenticated build config'
         shell: bash
         env:
           ENC: ${{ inputs.enc_payload }}
           PAYLOAD_KEY: ${{ secrets.WORKFLOW_PAYLOAD_KEY }}
-          IN_SERVER: ${{ inputs.server }}
-          IN_KEY: ${{ inputs.key }}
-          IN_APP: ${{ inputs.app_name }}
-          IN_CT: ${{ inputs.custom_txt }}
-          IN_VERSION: ${{ inputs.version }}
         run: |
-          set -eu
-          if [ -n "${ENC:-}" ]; then
-            if [ -z "${PAYLOAD_KEY:-}" ]; then
+          set -euo pipefail
+          RQS_PAYLOAD_MODE=encrypted
+          if [ -z "${ENC:-}" ]; then
+            echo "::error::manual/direct runs require an authenticated DFP1 payload; no build is permitted"
+            exit 1
+          fi
+          if [ -z "${PAYLOAD_KEY:-}" ]; then
               echo "::error::enc_payload provided but secret WORKFLOW_PAYLOAD_KEY is not set in this repo"
               exit 1
             fi
-            decrypted=$(printf '%s' "$ENC" | base64 -d \
-              | openssl enc -d -aes-256-cbc -pbkdf2 -pass "pass:${PAYLOAD_KEY}")
+            decrypt_payload() {
+              local payload_dir magic material aes_key aes_iv ciphertext
+              payload_dir=$(mktemp -d)
+              magic=$(printf '%s' "$ENC" | base64 -d | dd bs=1 count=4 status=none)
+              if [ "$magic" = "DFP1" ]; then
+                ciphertext="$payload_dir/ciphertext"
+                if ! material=$(PAYLOAD_KEY="$PAYLOAD_KEY" ENC="$ENC" python3 - "$ciphertext" <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import os
+          import pathlib
+          import sys
+
+          raw = base64.b64decode(os.environ["ENC"], validate=True)
+          if len(raw) <= 4 + 16 + 32:
+              raise SystemExit("authenticated payload is truncated")
+          ciphertext = raw[20:-32]
+          if not ciphertext or len(ciphertext) % 16:
+              raise SystemExit("authenticated payload ciphertext is invalid")
+          derived = hashlib.pbkdf2_hmac("sha256", os.environ["PAYLOAD_KEY"].encode(), raw[4:20], 100000, 80)
+          expected = hmac.new(derived[48:], raw[:-32], hashlib.sha256).digest()
+          if not hmac.compare_digest(expected, raw[-32:]):
+              raise SystemExit("authenticated payload integrity check failed")
+          pathlib.Path(sys.argv[1]).write_bytes(ciphertext)
+          print(derived[:32].hex())
+          print(derived[32:48].hex())
+          PY
+                ); then
+                  rm -rf "$payload_dir"
+                  return 1
+                fi
+                aes_key=$(printf '%s\n' "$material" | sed -n '1p')
+                aes_iv=$(printf '%s\n' "$material" | sed -n '2p')
+                if ! openssl enc -d -aes-256-cbc -K "$aes_key" -iv "$aes_iv" -in "$ciphertext"; then
+                  rm -rf "$payload_dir"
+                  return 1
+                fi
+              else
+                echo "::error::enc_payload must use the authenticated DFP1 envelope" >&2
+                rm -rf "$payload_dir"
+                return 1
+              fi
+              rm -rf "$payload_dir"
+            }
+            decrypted=$(decrypt_payload)
             RQS_SERVER=$(printf '%s' "$decrypted" | jq -r '.server // ""')
             RQS_KEY=$(printf '%s' "$decrypted" | jq -r '.key // ""')
             RQS_APP=$(printf '%s' "$decrypted" | jq -r '.app_name // ""')
             RQS_CT=$(printf '%s' "$decrypted" | jq -r '.custom_txt // ""')
             RQS_VERSION=$(printf '%s' "$decrypted" | jq -r '.version // ""')
-          else
-            RQS_SERVER="${IN_SERVER:-}"; RQS_KEY="${IN_KEY:-}"; RQS_APP="${IN_APP:-}"; RQS_CT="${IN_CT:-}"; RQS_VERSION="${IN_VERSION:-}"
+            RQS_SOURCE_SHA=$(printf '%s' "$decrypted" | jq -r '.source_sha // ""')
+            RQS_WORKFLOW_REPO=$(printf '%s' "$decrypted" | jq -r '.workflow_repo // ""')
+            if ! printf '%s' "$decrypted" | jq -e '
+              (.server == null or (.server | type == "string")) and
+              (.key == null or (.key | type == "string")) and
+              (.app_name == null or (.app_name | type == "string")) and
+              (.custom_txt == null or (.custom_txt | type == "string")) and
+              (.version == null or (.version | type == "string")) and
+              (.source_sha == null or (.source_sha | type == "string")) and
+              (.workflow_repo | type == "string")
+            ' >/dev/null; then
+              echo "::error::encrypted payload env-bound fields must be strings"
+              exit 1
+            fi
+          if [ "${RQS_WORKFLOW_REPO,,}" != "${GITHUB_REPOSITORY,,}" ]; then
+            echo "::error::authenticated workflow repository does not match this fork"
+            exit 1
+          fi
+          reject_control_chars() {
+            local field="$1" value="$2"
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]] || LC_ALL=C printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+              echo "::error::$field contains unsafe control characters"
+              exit 1
+            fi
+          }
+          normalize_public_key() {
+            local value="$1"
+            while [[ "$value" == *$'\r' || "$value" == *$'\n' ]]; do
+              value="${value%?}"
+            done
+            printf '%s' "$value"
+          }
+          validate_public_key() {
+            local value="$1"
+            if ! PUBLIC_KEY="$value" python3 - <<'PY'
+          import base64
+          import os
+          import re
+
+          value = os.environ["PUBLIC_KEY"]
+          if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", value):
+              raise SystemExit("public key must be padded standard base64")
+          try:
+              raw = base64.b64decode(value, validate=True)
+          except ValueError as exc:
+              raise SystemExit("public key is not valid standard base64") from exc
+          if len(raw) != 32 or base64.b64encode(raw).decode("ascii") != value:
+              raise SystemExit("public key must encode exactly 32 bytes canonically")
+          PY
+            then
+              echo "::error::RustDesk public key must be canonical padded base64 for 32 bytes"
+              exit 1
+            fi
+          }
+          validate_version() {
+            local value="$1" byte_length
+            byte_length=$(LC_ALL=C printf '%s' "$value" | wc -c)
+            if [ "$byte_length" -gt 32 ] || [[ ! "$value" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$ ]]; then
+              echo "::error::RQS_VERSION must be a strict semantic version"
+              exit 1
+            fi
+          }
+          validate_app_name() {
+            local value="$1" byte_length
+            reject_control_chars app_name "$value"
+            byte_length=$(LC_ALL=C printf '%s' "$value" | wc -c)
+            if [ -z "$value" ] || [ "$value" = "." ] || [ "$value" = ".." ] || [ "$byte_length" -gt 128 ]; then
+              echo "::error::app_name must be a non-empty filename component of at most 128 bytes"
+              exit 1
+            fi
+            if [[ "$value" == */* || "$value" == *\\* || "$value" == *'<'* || "$value" == *'>'* || "$value" == *:* || "$value" == *'"'* || "$value" == *'|'* || "$value" == *'?'* || "$value" == *'*'* ]]; then
+                echo "::error::app_name contains unsafe filename characters"
+                exit 1
+            fi
+            case "$value" in
+              *.|*' ') echo "::error::app_name must not end in a dot or space"; exit 1 ;;
+            esac
+            if is_windows_reserved_device_name "$value"; then
+              echo "::error::app_name uses a reserved Windows device name"
+              exit 1
+            fi
+          }
+          is_windows_reserved_device_name() {
+            local value="$1" base
+            base="${value%%.*}"
+            while [[ "$base" == *" " || "$base" == *"." ]]; do
+              base="${base%?}"
+            done
+            case "${base^^}" in
+              CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          write_github_env() {
+            local name="$1" value="$2"
+            reject_control_chars "$name" "$value"
+            printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+          }
+          if [ -n "$RQS_KEY" ]; then
+            RQS_KEY=$(normalize_public_key "$RQS_KEY")
+          fi
+          for field_value in \
+            "RQS_SERVER=$RQS_SERVER" \
+            "RQS_KEY=$RQS_KEY" \
+            "RQS_CUSTOM_TXT=$RQS_CT" \
+            "RQS_VERSION=$RQS_VERSION" \
+            "RQS_SOURCE_SHA=$RQS_SOURCE_SHA" \
+            "RQS_WORKFLOW_REPO=$RQS_WORKFLOW_REPO"; do
+            field_name=${field_value%%=*}
+            field_value=${field_value#*=}
+            reject_control_chars "$field_name" "$field_value"
+          done
+          validate_app_name "$RQS_APP"
+          if [ -n "$RQS_KEY" ]; then
+            validate_public_key "$RQS_KEY"
+          fi
+          if [ -n "$RQS_VERSION" ]; then
+            validate_version "$RQS_VERSION"
+          fi
+          if ! printf '%s' "$decrypted" | jq -e '.source_sha | type == "string"' >/dev/null; then
+              echo "::error::encrypted payload source_sha must be a string"
+              exit 1
+          fi
+          if [ -z "$RQS_SOURCE_SHA" ]; then
+              echo "::error::encrypted payload is missing source_sha"
+              exit 1
+          fi
+          if ! printf '%s' "$RQS_SOURCE_SHA" | grep -Eq '^[0-9a-fA-F]{40,64}$'; then
+              echo "::error::encrypted payload source_sha must be a hexadecimal commit SHA"
+              exit 1
           fi
           for v in "$RQS_KEY" "$RQS_CT"; do [ -n "$v" ] && echo "::add-mask::$v" || true; done
-          {
-            echo "RQS_SERVER=$RQS_SERVER"
-            echo "RQS_KEY=$RQS_KEY"
-            echo "RQS_APP_NAME=$RQS_APP"
-            echo "RQS_CUSTOM_TXT=$RQS_CT"
-            echo "RQS_VERSION=$RQS_VERSION"
-          } >> "$GITHUB_ENV"
+          write_github_env RQS_PAYLOAD_MODE "$RQS_PAYLOAD_MODE"
+          write_github_env RQS_SERVER "$RQS_SERVER"
+          write_github_env RQS_KEY "$RQS_KEY"
+          write_github_env RQS_APP_NAME "$RQS_APP"
+          # Keep password-bearing custom_.txt content out of GITHUB_ENV. The
+          # exact source_sha checkout/integrity check below is the trusted-source
+          # gate; this restrictive path is shared only to the packaging step.
+           if [ -n "$RQS_CT" ]; then
+             custom_txt_file="${RUNNER_TEMP}/rustdesk-custom-${GITHUB_RUN_ID:-local}.txt"
+             cleanup_custom_txt_on_failure() {
+               status=$?
+               if [ "$status" -ne 0 ]; then rm -f -- "$custom_txt_file"; fi
+               trap - EXIT
+               exit "$status"
+             }
+             trap cleanup_custom_txt_on_failure EXIT
+             (umask 077; printf '%s' "$RQS_CT" > "$custom_txt_file")
+            chmod 600 "$custom_txt_file"
+            write_github_env RQS_CUSTOM_TXT_FILE "$custom_txt_file"
+          else
+            write_github_env RQS_CUSTOM_TXT_FILE ""
+          fi
+          write_github_env RQS_VERSION "$RQS_VERSION"
+          write_github_env RQS_SOURCE_SHA "$RQS_SOURCE_SHA"
+          write_github_env RQS_WORKFLOW_REPO "$RQS_WORKFLOW_REPO"
+          echo "config: mode=$RQS_PAYLOAD_MODE"
+          echo "config: source_sha=SET"
+
+      - name: Checkout source code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Preserve workflow manifest helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_helper=.github/scripts/write_artifact_manifest.py
+          helper_path="${RUNNER_TEMP}/deskforge-write_artifact_manifest.py"
+          test -f "$source_helper" || { echo "::error::workflow-owned manifest helper is missing"; exit 1; }
+          cp -- "$source_helper" "$helper_path"
+          chmod 700 "$helper_path"
+          printf 'MANIFEST_HELPER_PATH=%s\n' "$helper_path" >> "$GITHUB_ENV"
+
+      - name: Checkout source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${RQS_SOURCE_SHA:-}" ]; then
+            echo "::error::authenticated payload source_sha is required"
+            exit 1
+          fi
+          if ! printf '%s' "$RQS_SOURCE_SHA" | grep -Eq '^[0-9a-fA-F]{40,64}$'; then
+            echo "::error::source_sha must be a hexadecimal commit SHA"
+            exit 1
+          fi
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="Authorization: Bearer ${{ github.token }}" \
+            git fetch --no-tags --depth=1 origin "$RQS_SOURCE_SHA"
+          git checkout --detach "$RQS_SOURCE_SHA"
+          git submodule sync --recursive
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="Authorization: Bearer ${{ github.token }}" \
+            git submodule update --init --recursive
+          expected=$(printf '%s' "$RQS_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')
+           actual=$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')
+           [ "$actual" = "$expected" ] || { echo "::error::source checkout SHA mismatch"; exit 1; }
+
+      - name: Set deterministic source timestamp
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || { echo "::error::invalid commit timestamp"; exit 1; }
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
 
       # Override VERSION from encrypted payload (takes precedence over workflow-level default).
       - name: 'Override VERSION from dispatch payload'
         if: env.RQS_VERSION != ''
         shell: bash
         run: |
-          echo "VERSION=$RQS_VERSION" >> "$GITHUB_ENV"
+          if [ "${#RQS_VERSION}" -gt 32 ] || [[ ! "$RQS_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$ ]]; then
+            echo "::error::RQS_VERSION must be a strict semantic version"
+            exit 1
+          fi
+          printf '%s=%s\n' VERSION "$RQS_VERSION" >> "$GITHUB_ENV"
           echo "VERSION overridden from dispatch: $RQS_VERSION"
 
       # L1: вшить сервер+ключ в config.rs (платформо-независимо, идентично windows).
@@ -147,7 +361,7 @@ jobs:
 
       # L2: allowCustom — снять проверку подписи custom.txt (платформо-независимо).
       - name: 'L2 patch: allowCustom'
-        if: env.RQS_CUSTOM_TXT != ''
+        if: env.RQS_CUSTOM_TXT_FILE != ''
         shell: bash
         run: |
           set -eu
@@ -172,7 +386,35 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: bridge-artifact
-          path: ./
+          path: ${{ runner.temp }}/deskforge-bridge-artifact
+
+      - name: Verify and restore bridge files
+        shell: bash
+        env:
+          BRIDGE_ARTIFACT_DIR: ${{ runner.temp }}/deskforge-bridge-artifact
+          BRIDGE_WORKFLOW_SHA: ${{ github.sha }}
+          BRIDGE_WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
+          python3 "$MANIFEST_HELPER_PATH" \
+            --verify-bridge --output "$BRIDGE_ARTIFACT_DIR" \
+            --expected-source-sha "$RQS_SOURCE_SHA" \
+            --expected-version "$RQS_VERSION" \
+            --workflow-sha "$BRIDGE_WORKFLOW_SHA" --workflow-ref "$BRIDGE_WORKFLOW_REF"
+          bridge_files=(
+            flutter/ios/Runner/bridge_generated.h
+            flutter/lib/generated_bridge.dart
+            flutter/lib/generated_bridge.freezed.dart
+            flutter/macos/Runner/bridge_generated.h
+            src/bridge_generated.io.rs
+            src/bridge_generated.rs
+          )
+          for file in "${bridge_files[@]}"; do
+            mkdir -p "$(dirname "$file")"
+            cp -- "$BRIDGE_ARTIFACT_DIR/$file" "$file"
+            test -f "$file" || { echo "::error::restored bridge file is missing from source path: $file"; exit 1; }
+          done
 
       - name: Build dependencies (apt)
         run: |
@@ -198,7 +440,7 @@ jobs:
         with:
           swap-size-gb: 12
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           prefix-key: ubuntu-24.04
 
@@ -208,7 +450,7 @@ jobs:
           sed -i 's/\["cdylib", "staticlib", "rlib"\]/\["cdylib"\]/g' Cargo.toml
 
       - name: Setup vcpkg with Github Actions binary cache
-        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: /opt/artifacts/vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
@@ -232,7 +474,7 @@ jobs:
         shell: bash
 
       - name: Install flutter
-        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
@@ -246,25 +488,20 @@ jobs:
           cd $(dirname $(dirname $(which flutter)))
           git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
 
-      # Двухстадийная сборка (как в upstream flutter-build.yml): сначала cargo lib
-      # со всеми нужными фичами, затем build.py только для Flutter-UI + .deb.
+      # Historical two-stage build shape: first cargo lib with the required features,
+      # then build.py for the Flutter UI and packages. The old upstream flutter-build.yml
+      # reference is not the active workflow source.
       - name: Build rustdesk (Flutter Linux)
         run: |
+          set -euo pipefail
           export VCPKG_ROOT=/opt/artifacts/vcpkg
           export CARGO_INCREMENTAL=0
           export DEB_ARCH=amd64
+          if [ -n "${RQS_CUSTOM_TXT_FILE:-}" ]; then
+            test -f "$RQS_CUSTOM_TXT_FILE" || { echo "FAIL: private custom_.txt source is missing before Debian packaging"; exit 1; }
+          fi
           cargo build --locked --lib --features hwcodec,flutter,unix-file-copy-paste --release
           python3 ./build.py --flutter --skip-cargo
-
-      # L2 payload: положить custom_.txt рядом с бинарём в bundle (читается клиентом).
-      - name: 'L2 payload: place custom_.txt into bundle'
-        if: env.RQS_CUSTOM_TXT != ''
-        shell: bash
-        run: |
-          set -eu
-          dst=flutter/build/linux/x64/release/bundle/custom_.txt
-          printf '%s' "$RQS_CUSTOM_TXT" > "$dst"
-          ls -la "$dst"
 
       - name: Install rpm
         run: |
@@ -277,38 +514,73 @@ jobs:
         env:
           HBB: ${{ github.workspace }}
         run: |
-          set -eu
-          APP_RAW="${RQS_APP_NAME:-rustdesk}"
-          APP="$(printf '%s' "$APP_RAW" | tr -c 'A-Za-z0-9._+-' '-' | sed -e 's/^-*//' -e 's/-*$//')"
-          [ -n "$APP" ] || APP=rustdesk
-          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          mkdir -p ./output
+           set -eu
+           APP="$RQS_APP_NAME"
+           VERSION=$(python3 - <<'PY'
+           import tomllib
 
-          # 1) .deb — создан build.py → build_flutter_deb()
-          for pkg in rustdesk-*.deb; do
-            [ -f "$pkg" ] || continue
-            new_name="$(echo "$pkg" | sed "s/^rustdesk/${APP}/")"
-            cp "$pkg" "./output/${new_name}"
-            echo "::notice::DEB: $pkg → output/${new_name}"
-          done
+           with open("Cargo.toml", "rb") as cargo_file:
+               print(tomllib.load(cargo_file)["package"]["version"])
+           PY
+           )
+           [ -n "$RQS_VERSION" ] || { echo "FAIL: RQS_VERSION is required"; exit 1; }
+           [ "$VERSION" = "$RQS_VERSION" ] || { echo "FAIL: Cargo version $VERSION does not match RQS_VERSION $RQS_VERSION"; exit 1; }
+           mkdir -p ./output
 
-          # 2) .rpm — rpmbuild из того же flutter bundle
-          if [ -d flutter/build/linux/x64/release/bundle ]; then
-            sed -i "s/^Version:.*/Version:    ${VERSION}/" res/rpm-flutter.spec
-            rpmbuild -ba res/rpm-flutter.spec
-            rpm_file=$(find "$HOME/rpmbuild/RPMS" -name 'rustdesk-*.rpm' | head -1)
-            if [ -n "$rpm_file" ]; then
-              new_name="${APP}-${VERSION}-0.x86_64.rpm"
-              cp "$rpm_file" "./output/${new_name}"
-              echo "::notice::RPM: ${new_name}"
-            fi
+           # 1) .deb — build.py deterministically creates rustdesk-${VERSION}.deb.
+           deb_source="rustdesk-${VERSION}.deb"
+           deb_output="./output/${APP}-${VERSION}.deb"
+           test -f "$deb_source" || { echo "FAIL: expected package not found at $deb_source"; exit 1; }
+           if [ -n "${RQS_CUSTOM_TXT_FILE:-}" ]; then
+             test -f flutter/build/linux/x64/release/bundle/custom_.txt || { echo "FAIL: custom_.txt is missing from the Linux bundle"; exit 1; }
+             dpkg-deb -c "$deb_source" | grep -Fq -- "./usr/share/rustdesk/custom_.txt" || { echo "FAIL: custom_.txt is missing from the Debian package"; exit 1; }
+           fi
+           cp -- "$deb_source" "$deb_output"
+           echo "::notice::DEB: $deb_source → $deb_output"
+
+           # 2) .rpm — rpmbuild from the same Flutter bundle.
+           test -d flutter/build/linux/x64/release/bundle || { echo "FAIL: expected Flutter bundle is missing"; exit 1; }
+           sed -i "s/^Version:.*/Version:    ${VERSION}/" res/rpm-flutter.spec
+           rpmbuild -ba res/rpm-flutter.spec
+           rpm_source="$HOME/rpmbuild/RPMS/x86_64/rustdesk-${VERSION}-0.x86_64.rpm"
+           rpm_output="./output/${APP}-${VERSION}-0.x86_64.rpm"
+           test -f "$rpm_source" || { echo "FAIL: expected package not found at $rpm_source"; exit 1; }
+           cp -- "$rpm_source" "$rpm_output"
+           echo "::notice::RPM: $rpm_output"
+
+           ls -lh ./output/
+
+      - name: Assert exact output and write artifact manifest
+        shell: bash
+        env:
+          MANIFEST_PLATFORM: linux
+          MANIFEST_WORKFLOW_SHA: ${{ github.sha }}
+          MANIFEST_WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          export MANIFEST_PUBLICATION_TIMESTAMP
+          if [ -f flutter/build/linux/x64/release/bundle/custom_.txt ]; then
+            cp -- flutter/build/linux/x64/release/bundle/custom_.txt output/custom_.txt
           fi
-
-          ls -lh ./output/
+           test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
+           python3 "$MANIFEST_HELPER_PATH" \
+             --platform "$MANIFEST_PLATFORM" --app-name "$RQS_APP_NAME" --version "$RQS_VERSION" \
+             --output output --workflow-sha "$MANIFEST_WORKFLOW_SHA" --workflow-ref "$MANIFEST_WORKFLOW_REF"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustdesk-min-test-linux
           path: output
+          retention-days: 7
           if-no-files-found: error
+
+      - name: Cleanup sensitive custom_.txt
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${RQS_CUSTOM_TXT_FILE:-}" ]; then
+            rm -f -- "$RQS_CUSTOM_TXT_FILE"
+          fi

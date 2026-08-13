@@ -4,6 +4,15 @@ name: Build flutter-rust-bridge
 
 on:
   workflow_call:
+    inputs:
+      enc_payload:
+        description: 'Authenticated DFP1 provider payload; source identity and release metadata are required.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
 
 env:
   CARGO_EXPAND_VERSION: "1.0.95"
@@ -34,10 +43,172 @@ jobs:
               artifact-name: "bridge-artifact-flutter-3.44",
             }
     steps:
+      - name: Resolve source checkout identity
+        shell: bash
+        env:
+          ENC: ${{ inputs.enc_payload }}
+          PAYLOAD_KEY: ${{ secrets.WORKFLOW_PAYLOAD_KEY }}
+        run: |
+          set -euo pipefail
+          RQS_PAYLOAD_MODE=encrypted
+          if [ -z "${ENC:-}" ]; then
+            echo "::error::manual/direct runs require an authenticated DFP1 payload; no build is permitted"
+            exit 1
+          fi
+          if [ -z "${PAYLOAD_KEY:-}" ]; then
+            echo "::error::enc_payload provided but secret WORKFLOW_PAYLOAD_KEY is not set in this repo"
+            exit 1
+          fi
+            decrypt_payload() {
+              local payload_dir magic material aes_key aes_iv ciphertext
+              payload_dir=$(mktemp -d)
+              magic=$(printf '%s' "$ENC" | base64 -d | dd bs=1 count=4 status=none)
+              if [ "$magic" = "DFP1" ]; then
+                ciphertext="$payload_dir/ciphertext"
+                if ! material=$(PAYLOAD_KEY="$PAYLOAD_KEY" ENC="$ENC" python3 - "$ciphertext" <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import os
+          import pathlib
+          import sys
+
+          raw = base64.b64decode(os.environ["ENC"], validate=True)
+          if len(raw) <= 4 + 16 + 32:
+              raise SystemExit("authenticated payload is truncated")
+          ciphertext = raw[20:-32]
+          if not ciphertext or len(ciphertext) % 16:
+              raise SystemExit("authenticated payload ciphertext is invalid")
+          derived = hashlib.pbkdf2_hmac("sha256", os.environ["PAYLOAD_KEY"].encode(), raw[4:20], 100000, 80)
+          expected = hmac.new(derived[48:], raw[:-32], hashlib.sha256).digest()
+          if not hmac.compare_digest(expected, raw[-32:]):
+              raise SystemExit("authenticated payload integrity check failed")
+          pathlib.Path(sys.argv[1]).write_bytes(ciphertext)
+          print(derived[:32].hex())
+          print(derived[32:48].hex())
+          PY
+                ); then
+                  rm -rf "$payload_dir"
+                  return 1
+                fi
+                aes_key=$(printf '%s\n' "$material" | sed -n '1p')
+                aes_iv=$(printf '%s\n' "$material" | sed -n '2p')
+                if ! openssl enc -d -aes-256-cbc -K "$aes_key" -iv "$aes_iv" -in "$ciphertext"; then
+                  rm -rf "$payload_dir"
+                  return 1
+                fi
+              else
+                echo "::error::enc_payload must use the authenticated DFP1 envelope" >&2
+                rm -rf "$payload_dir"
+                return 1
+              fi
+              rm -rf "$payload_dir"
+            }
+            decrypted=$(decrypt_payload)
+            RQS_VERSION=$(printf '%s' "$decrypted" | jq -r '.version // ""')
+            RQS_SOURCE_SHA=$(printf '%s' "$decrypted" | jq -r '.source_sha // ""')
+            RQS_WORKFLOW_REPO=$(printf '%s' "$decrypted" | jq -r '.workflow_repo // ""')
+            if ! printf '%s' "$decrypted" | jq -e '(.source_sha | type == "string") and (.workflow_repo | type == "string")' >/dev/null; then
+              echo "::error::encrypted payload source identity fields must be strings"
+              exit 1
+            fi
+            if [ -z "$RQS_SOURCE_SHA" ]; then
+              echo "::error::encrypted payload is missing source_sha"
+              exit 1
+            fi
+            if ! printf '%s' "$RQS_SOURCE_SHA" | grep -Eq '^[0-9a-fA-F]{40,64}$'; then
+              echo "::error::encrypted payload source_sha must be a hexadecimal commit SHA"
+              exit 1
+            fi
+            if [ "${RQS_WORKFLOW_REPO,,}" != "${GITHUB_REPOSITORY,,}" ]; then
+              echo "::error::authenticated workflow repository does not match this fork"
+              exit 1
+            fi
+          reject_control_chars() {
+            local field="$1" value="$2"
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]] || LC_ALL=C printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+              echo "::error::$field contains unsafe control characters"
+              exit 1
+            fi
+          }
+          validate_version() {
+            local value="$1" byte_length
+            byte_length=$(LC_ALL=C printf '%s' "$value" | wc -c)
+            if [ "$byte_length" -gt 32 ] || [[ ! "$value" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*)|([0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$ ]]; then
+              echo "::error::RQS_VERSION must be a strict semantic version"
+              exit 1
+            fi
+          }
+          reject_control_chars RQS_VERSION "$RQS_VERSION"
+          if [ -n "$RQS_VERSION" ]; then
+            validate_version "$RQS_VERSION"
+          fi
+          reject_control_chars RQS_SOURCE_SHA "$RQS_SOURCE_SHA"
+          reject_control_chars RQS_WORKFLOW_REPO "$RQS_WORKFLOW_REPO"
+          write_github_env() {
+            local name="$1" value="$2"
+            reject_control_chars "$name" "$value"
+            printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+          }
+          {
+            write_github_env RQS_PAYLOAD_MODE "$RQS_PAYLOAD_MODE"
+            write_github_env RQS_VERSION "$RQS_VERSION"
+            write_github_env RQS_SOURCE_SHA "$RQS_SOURCE_SHA"
+            write_github_env RQS_WORKFLOW_REPO "$RQS_WORKFLOW_REPO"
+          }
+          echo "bridge source checkout: SET"
+
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
+          persist-credentials: false
+
+      - name: Preserve workflow manifest helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_helper=.github/scripts/write_artifact_manifest.py
+          helper_path="${RUNNER_TEMP}/deskforge-write_artifact_manifest.py"
+          test -f "$source_helper" || { echo "::error::workflow-owned manifest helper is missing"; exit 1; }
+          cp -- "$source_helper" "$helper_path"
+          chmod 700 "$helper_path"
+          printf 'MANIFEST_HELPER_PATH=%s\n' "$helper_path" >> "$GITHUB_ENV"
+
+      - name: Checkout source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+           if [ -z "${RQS_SOURCE_SHA:-}" ]; then
+             echo "::error::authenticated payload source_sha is required"
+             exit 1
+           fi
+          if ! printf '%s' "$RQS_SOURCE_SHA" | grep -Eq '^[0-9a-fA-F]{40,64}$'; then
+            echo "::error::source_sha must be a hexadecimal commit SHA"
+            exit 1
+          fi
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.extraheader \
+          GIT_CONFIG_VALUE_0="Authorization: Bearer ${{ github.token }}" \
+            git fetch --no-tags --depth=1 origin "$RQS_SOURCE_SHA"
+           git checkout --detach "$RQS_SOURCE_SHA"
+           git submodule sync --recursive
+           GIT_CONFIG_COUNT=1 \
+           GIT_CONFIG_KEY_0=http.extraheader \
+           GIT_CONFIG_VALUE_0="Authorization: Bearer ${{ github.token }}" \
+             git submodule update --init --recursive
+          expected=$(printf '%s' "$RQS_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')
+           actual=$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')
+           [ "$actual" = "$expected" ] || { echo "::error::source checkout SHA mismatch"; exit 1; }
+
+      - name: Set deterministic source timestamp
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || { echo "::error::invalid commit timestamp"; exit 1; }
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
 
       - name: Install prerequisites
         run: |
@@ -59,25 +230,25 @@ jobs:
             wget
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           prefix-key: bridge-${{ matrix.job.os }}
 
       - name: Cache Bridge
         id: cache-bridge
-        uses: actions/cache@v3
+        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3.5.0
         with:
           path: /tmp/flutter_rust_bridge
           key: bridge-${{ matrix.job.flutter-version }}
 
       - name: Install flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: "stable"
           flutter-version: ${{ matrix.job.flutter-version }}
@@ -100,17 +271,47 @@ jobs:
 
       - name: Run flutter rust bridge
         run: |
-          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
-          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+           ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+           cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Stage generated bridge files
+        shell: bash
+        run: |
+          set -euo pipefail
+          bridge_files=(
+            flutter/ios/Runner/bridge_generated.h
+            flutter/lib/generated_bridge.dart
+            flutter/lib/generated_bridge.freezed.dart
+            flutter/macos/Runner/bridge_generated.h
+            src/bridge_generated.io.rs
+            src/bridge_generated.rs
+          )
+          for file in "${bridge_files[@]}"; do
+            test -f "$file" || { echo "::error::generated bridge file is missing: $file"; exit 1; }
+            mkdir -p "bridge-output/$(dirname "$file")"
+            cp -- "$file" "bridge-output/$file"
+            test -f "bridge-output/$file" || { echo "::error::staged bridge file is missing: $file"; exit 1; }
+          done
+
+      - name: Write deterministic bridge artifact manifest
+        shell: bash
+        env:
+          MANIFEST_PLATFORM: bridge
+          MANIFEST_WORKFLOW_SHA: ${{ github.sha }}
+          MANIFEST_WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          export MANIFEST_PUBLICATION_TIMESTAMP
+          test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
+          python3 "$MANIFEST_HELPER_PATH" \
+            --platform "$MANIFEST_PLATFORM" --app-name rustdesk-bridge --version "$RQS_VERSION" \
+            --output bridge-output --workflow-sha "$MANIFEST_WORKFLOW_SHA" --workflow-ref "$MANIFEST_WORKFLOW_REF"
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.job.artifact-name }}
-          path: |
-            ./src/bridge_generated.rs
-            ./src/bridge_generated.io.rs
-            ./flutter/lib/generated_bridge.dart
-            ./flutter/lib/generated_bridge.freezed.dart
-            ./flutter/macos/Runner/bridge_generated.h
-            ./flutter/ios/Runner/bridge_generated.h
+          path: bridge-output
+          retention-days: 7
+          if-no-files-found: error

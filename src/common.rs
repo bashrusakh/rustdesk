@@ -2179,25 +2179,25 @@ pub fn get_dst_align_rgba() -> usize {
     1
 }
 
-pub fn read_custom_client(config: &str) {
+pub fn read_custom_client(config: &str) -> bool {
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
-        return;
+        return false;
     };
     const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";
     let Some(pk) = get_rs_pk(KEY) else {
         log::error!("Failed to parse public key of custom client");
-        return;
+        return false;
     };
     let Ok(data) = sign::verify(&data, &pk) else {
         log::error!("Failed to dec custom client config");
-        return;
+        return false;
     };
     let Ok(mut data) =
         serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
     else {
         log::error!("Failed to parse custom client config");
-        return;
+        return false;
     };
 
     if let Some(app_name) = data.remove("app-name") {
@@ -2250,6 +2250,7 @@ pub fn read_custom_client(config: &str) {
                 .insert(k, v.to_owned());
         };
     }
+    true
 }
 
 #[inline]

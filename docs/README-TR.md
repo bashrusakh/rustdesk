@@ -5,8 +5,8 @@
   <a href="#raw-steps-to-build">Derleme</a> •
   <a href="#how-to-build-with-docker">Docker ile Derleme</a> •
   <a href="#file-structure">Dosya Yapısı</a> •
-  <a href="#snapshot">Ekran Görüntüleri</a><br>
-  [<a href="docs/README-UA.md">Українська</a>] | [<a href="docs/README-CS.md">česky</a>] | [<a href="docs/README-ZH.md">中文</a>] | [<a href="docs/README-HU.md">Magyar</a>] | [<a href="docs/README-ES.md">Español</a>] | [<a href="docs/README-FA.md">فارسی</a>] | [<a href="docs/README-FR.md">Français</a>] | [<a href="docs/README-DE.md">Deutsch</a>] | [<a href="docs/README-PL.md">Polski</a>] | [<a href="docs/README-ID.md">Indonesian</a>] | [<a href="docs/README-FI.md">Suomi</a>] | [<a href="docs/README-ML.md">മലയാളം</a>] | [<a href="docs/README-JP.md">日本語</a>] | [<a href="docs/README-NL.md">Nederlands</a>] | [<a href="docs/README-IT.md">Italiano</a>] | [<a href="docs/README-RU.md">Русский</a>] | [<a href="docs/README-PTBR.md">Português (Brasil)</a>] | [<a href="docs/README-EO.md">Esperanto</a>] | [<a href="docs/README-KR.md">한국어</a>] | [<a href="docs/README-AR.md">العربي</a>] | [<a href="docs/README-VN.md">Tiếng Việt</a>] | [<a href="docs/README-DA.md">Dansk</a>] | [<a href="docs/README-GR.md">Ελληνικά</a>]<br>
+  <a href="#screenshots">Ekran Görüntüleri</a><br>
+  [<a href="README-UA.md">Українська</a>] | [<a href="README-CS.md">česky</a>] | [<a href="README-ZH.md">中文</a>] | [<a href="README-HU.md">Magyar</a>] | [<a href="README-ES.md">Español</a>] | [<a href="README-FA.md">فارسی</a>] | [<a href="README-FR.md">Français</a>] | [<a href="README-DE.md">Deutsch</a>] | [<a href="README-PL.md">Polski</a>] | [<a href="README-ID.md">Indonesian</a>] | [<a href="README-FI.md">Suomi</a>] | [<a href="README-ML.md">മലയാളം</a>] | [<a href="README-JP.md">日本語</a>] | [<a href="README-NL.md">Nederlands</a>] | [<a href="README-IT.md">Italiano</a>] | [<a href="README-RU.md">Русский</a>] | [<a href="README-PTBR.md">Português (Brasil)</a>] | [<a href="README-EO.md">Esperanto</a>] | [<a href="README-KR.md">한국어</a>] | [<a href="README-AR.md">العربي</a>] | [<a href="README-VN.md">Tiếng Việt</a>] | [<a href="README-DA.md">Dansk</a>] | [<a href="README-GR.md">Ελληνικά</a>]<br>
   <b>README, <a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk UI</a> ve <a href="https://github.com/rustdesk/doc.rustdesk.com">RustDesk Dökümantasyonu</a>'nu ana dilinize çevirmemiz için yardımınıza ihtiyacımız var</b>
 </p>
 
@@ -37,7 +37,7 @@ RustDesk, herkesin katkısına açıktır. Başlamak için [CONTRIBUTING.md](CON
 
 ## Gereksinimler
 
-Masaüstü sürümleri GUI için; [Sciter](https://sciter.com/)(kaldırılacak) veya Flutter kullanır. Sciter daha kolay ve başlamak için daha dostcanlısı, bundan dolayı bu kılavuz sadece Sciter içindir. Flutter sürümünü derlemek için [CI](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml)'ımıza bakın.
+Masaüstü sürümleri GUI için; [Sciter](https://sciter.com/)(kaldırılacak) veya Flutter kullanır. Sciter daha kolay ve başlamak için daha dostcanlısı, bundan dolayı bu kılavuz sadece Sciter içindir. Bu fork'un güncel istemci derleme referansı için [Windows iş akışına](../.github/workflows/rustqs-windows-min-test.yml) bakın; dosya yalnızca kaynak referansıdır, sürüm veya destek iddiası değildir.
 
 Lütfen Sciter dinamik kütüphanesini kendiniz indirin.
 
@@ -169,6 +169,7 @@ Lütfen bu komutları RustDesk reposunun root klasöründe çalıştırdığın�
 - **[flutter/web/js](https://github.com/rustdesk/rustdesk/tree/master/flutter/web/v1/js)**: Flutter web istemcisi için JavaScript
 
 
+<a id="screenshots"></a>
 ## Ekran Görüntüleri
 
 ![image](https://user-images.githubusercontent.com/71636191/113112362-ae4deb80-923b-11eb-957d-ff88daad4f06.png)

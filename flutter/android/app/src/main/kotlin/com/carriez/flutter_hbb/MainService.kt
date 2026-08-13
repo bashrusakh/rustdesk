@@ -43,6 +43,8 @@ import kotlin.concurrent.thread
 import org.json.JSONException
 import org.json.JSONObject
 import java.nio.ByteBuffer
+import java.io.FileNotFoundException
+import java.io.IOException
 import kotlin.math.max
 import kotlin.math.min
 
@@ -223,6 +225,20 @@ class MainService : Service() {
     // audio
     private val audioRecordHandle = AudioRecordHandle(this, { isStart }, { isAudioStart })
 
+    private fun readBundledCustomClientConfig(): String? {
+        return try {
+            // Flutter assets are stored below this prefix in the Android APK.
+            applicationContext.assets.open("flutter_assets/assets/custom_.txt").bufferedReader(Charsets.UTF_8).use {
+                it.readText()
+            }
+        } catch (_: FileNotFoundException) {
+            ""
+        } catch (e: IOException) {
+            Log.e(logTag, "Failed to read bundled custom client config", e)
+            null
+        }
+    }
+
     // notification
     private lateinit var notificationManager: NotificationManager
     private lateinit var notificationChannel: String
@@ -243,7 +259,16 @@ class MainService : Service() {
         // keep the config dir same with flutter
         val prefs = applicationContext.getSharedPreferences(KEY_SHARED_PREFERENCES, FlutterActivity.MODE_PRIVATE)
         val configPath = prefs.getString(KEY_APP_DIR_CONFIG_PATH, "") ?: ""
-        FFI.startServer(configPath, "")
+        val customClientConfig = readBundledCustomClientConfig() ?: run {
+            Log.e(logTag, "Bundled custom client config is unreadable; refusing to start")
+            stopSelf()
+            return
+        }
+        if (!FFI.startServer(configPath, customClientConfig)) {
+            Log.e(logTag, "Bundled custom client config was rejected; refusing to start")
+            stopSelf()
+            return
+        }
 
         createForegroundNotification()
     }

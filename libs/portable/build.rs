@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=app_metadata.toml");
     #[cfg(windows)]
     {
         use std::io::Write;

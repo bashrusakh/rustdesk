@@ -36,7 +36,7 @@ RustDesk agradece la contribución de todo el mundo. Lee [`docs/CONTRIBUTING.md`
 
 ## Dependencias
 
-Las versiones de escritorio utilizan Flutter o Sciter (obsoleto) para GUI, este tutorial es sólo para Sciter, ya que es más fácil y más amigable para empezar. Echa un vistazo a nuestro [CI](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml) para la construcción de la versión Flutter.
+Las versiones de escritorio utilizan Flutter o Sciter (obsoleto) para GUI, este tutorial es sólo para Sciter, ya que es más fácil y más amigable para empezar. Consulta el [workflow de Windows específico del fork](../.github/workflows/rustqs-windows-min-test.yml) como referencia actual de compilación; el archivo es solo una referencia al código fuente, no una declaración de lanzamiento o soporte.
 
 Por favor descarga la librería dinámica de Sciter tú mismo.
 

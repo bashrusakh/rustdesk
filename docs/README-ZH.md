@@ -36,7 +36,7 @@ RustDesk 期待各位的贡献. 如何参与开发? 详情请看 [CONTRIBUTING-Z
 
 ## 依赖
 
-桌面版本使用 Flutter 或 Sciter（已弃用）作为 GUI，本教程仅适用于 Sciter，因为它更简单且更易于上手。查看我们的[CI](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml)以构建 Flutter 版本。
+桌面版本使用 Flutter 或 Sciter（已弃用）作为 GUI，本教程仅适用于 Sciter，因为它更简单且更易于上手。此 fork 的当前客户端构建参考位于[Windows 工作流](../.github/workflows/rustqs-windows-min-test.yml)；该文件是源代码参考，不代表发布或支持声明。
 
 请自行下载Sciter动态库。
 

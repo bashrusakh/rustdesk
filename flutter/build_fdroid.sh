@@ -3,6 +3,11 @@
 #
 # Script to build F-Droid release of RustDesk
 #
+# LEGACY: this F-Droid builder still reads the historical
+# .github/workflows/flutter-build.yml, which is absent from the current fork. It is
+# not part of the active rustqs workflow path; the historical references below are
+# intentionally not treated as current workflow configuration.
+#
 # Copyright (C) 2024, The RustDesk Authors
 #               2024, Vasyl Gello <vasek.gello@gmail.com>
 #

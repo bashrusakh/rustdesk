@@ -31,7 +31,7 @@ RustDesk вітає внесок кожного. Ознайомтеся з [CONT
 
 ## Залежності
 
-Стільничні версії використовують Flutter чи Sciter (застаріле) для графічного інтерфейсу. Ця інструкція лише для Sciter, оскільки він є більш простим та дружнім для початківців. Перегляньте [CI](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml) для збірки версії на Flutter.
+Стільничні версії використовують Flutter чи Sciter (застаріле) для графічного інтерфейсу. Ця інструкція лише для Sciter, оскільки він є більш простим та дружнім для початківців. Перегляньте [Windows workflow цього fork](../.github/workflows/rustqs-windows-min-test.yml) як поточний довідник збірки; це посилання на джерело, а не заява про реліз чи підтримку.
 
 Будь ласка, завантажте динамічну бібліотеку Sciter самостійно.
 
@@ -171,4 +171,3 @@ target/release/rustdesk
 ![Передача файлів](https://github.com/rustdesk/rustdesk/assets/28412477/39511ad3-aa9a-4f8c-8947-1cce286a46ad)
 
 ![Тунелювання TCP](https://github.com/rustdesk/rustdesk/assets/28412477/78e8708f-e87e-4570-8373-1360033ea6c5)
-
