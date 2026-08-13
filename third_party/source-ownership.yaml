@@ -1,0 +1,170 @@
+phase: 3
+scan_policy:
+  # Digest is SHA-256 over sorted records:
+  # relative-path NUL kind NUL content-SHA256 LF. Link records additionally
+  # bind the literal target text: relative-path NUL link NUL target-text NUL
+  # target-content-SHA256 LF. Repository-ignored generated/IDE outputs are
+  # excluded, so additions/removals/changes fail closed.
+  #
+  # Symlink policy is deliberately allowlist-only. These six source-preserved
+  # links are the only links permitted in any declared owned root. Each target
+  # must be a direct, relative link to a regular file inside its same owned
+  # root; absolute, broken, outside-root, directory, reparse-point, and
+  # chain-to-link targets are rejected.
+  allowed_symlinks:
+    third_party/flutter/uni_links/uni_links/LICENSE: ../LICENSE
+    third_party/flutter/uni_links/uni_links/analysis_options.yaml: ../analysis_options.yaml
+    third_party/flutter/uni_links/uni_links_platform_interface/LICENSE: ../LICENSE
+    third_party/flutter/uni_links/uni_links_platform_interface/analysis_options.yaml: ../analysis_options.yaml
+    third_party/flutter/uni_links/uni_links_web/LICENSE: ../LICENSE
+    third_party/flutter/uni_links/uni_links_web/analysis_options.yaml: ../analysis_options.yaml
+  # Only these deterministic suffixes may be skipped as binary contents during
+  # forbidden-URL scanning. Metadata and source text are always decoded/scanned
+  # regardless of suffix; all .gitmodules are scanned separately as UTF-8. The
+  # scanner recognizes Sciter's SAr resource archive by content, not suffix.
+  binary_suffixes:
+    - .a
+    - .bin
+    - .dat
+    - .dll
+    - .dylib
+    - .gif
+    - .gz
+    - .h264
+    - .h265
+    - .ico
+    - .jpeg
+    - .jpg
+    - .kra
+    - .lib
+    - .pdf
+    - .png
+    - .so
+    - .tar
+    - .webp
+    - .zip
+  # These are the only forbidden-organization URLs permitted in owned source.
+  # Each record binds one exact comment line and URL; executable source,
+  # manifests, workflows, and .gitmodules have no reference-URL exceptions.
+  allowed_reference_urls:
+    - path: third_party/flutter/desktop_multi_window/lib/src/window_controller.dart
+      line: 40
+      content: '  // https://github.com/rustdesk-org/window_manager/blob/f19acdb008645366339444a359a45c3257c8b32e/lib/src/window_manager.dart#L470'
+      url: 'https://github.com/rustdesk-org/window_manager/blob/f19acdb008645366339444a359a45c3257c8b32e/lib/src/window_manager.dart#L470'
+      reason: source-preserved documentation only
+    - path: third_party/flutter/desktop_multi_window/lib/src/window_controller.dart
+      line: 102
+      content: '  // https://github.com/rustdesk-org/rustdesk_desktop_multi_window/pull/26'
+      url: 'https://github.com/rustdesk-org/rustdesk_desktop_multi_window/pull/26'
+      reason: source-preserved documentation only
+  integrity_roots:
+    - path: flutter/dash_chat_2
+      file_count: 133
+      byte_count: 407449
+      tree_sha256: 476240e857a870c0007906c48040af5dbcf289d7abb02c762b2569a66560fb3e
+    - path: flutter/desktop_multi_window
+      file_count: 115
+      byte_count: 459783
+      tree_sha256: ab38b6749eebfee37ea7980e4953dc9264da32dc151440dbe04aeaa209d20c62
+    - path: flutter/dynamic_layouts
+      file_count: 145
+      byte_count: 464338
+      tree_sha256: e3f178429a4d5c5f1ab4051665edb96c8872e671ed73962a7f5a16dd7f56d0b3
+    - path: flutter/flutter_gpu_texture_renderer
+      file_count: 49
+      byte_count: 1094561
+      tree_sha256: f969a34c076cd2a82c65383b50fcd54f3f65b9d4be4aba025f7752ec50b10cbf
+    - path: flutter/flutter_texture_rgba_renderer
+      file_count: 98
+      byte_count: 695615
+      tree_sha256: a1c17cff5a7e04211a87ed8c0eb044824467187ed69902bb1e1ac9ba73db5644
+    - path: flutter/uni_links
+      file_count: 111
+      byte_count: 332138
+      tree_sha256: db29545c7b22b6c0892305b8dc17ec5ffc8e1e52ca10c01583645983db11daa3
+    - path: flutter/window_manager
+      file_count: 110
+      byte_count: 681289
+      tree_sha256: a4b6e190e8ab36993006030d958f5da7180cb9f3f613f20019ca2e55bd272b70
+    - path: flutter/window_size
+      file_count: 181
+      byte_count: 797730
+      tree_sha256: da793c4444d02d808ec0ed802e31402bb2521482e27ba3402606dd24736e082e
+    - path: windows/RustDeskTempTopMostWindow
+      file_count: 25
+      byte_count: 265515
+      tree_sha256: 11e8449c64966a98500414b8e275d9ed8658feb95d1106c1d0ba66acb1d9885b
+    - path: hwcodec
+      file_count: 436
+      byte_count: 9010415
+      tree_sha256: cf6bdc186630c1e58beb620594ad6bef1134988fafc3c4a33d1deffa182610c2
+  integrity_exclusions: []
+  active_owned_inputs:
+    - name: hwcodec
+      path: third_party/hwcodec
+      reason: Cargo build.rs consumes the checked-in externals tree for active hardware-codec builds.
+  # Enforced only for workflows directly under the active root .github/workflows
+  # directory; copied inactive workflows under third_party are source-preserved.
+  active_root_workflow_checkout_sha: 3d3c42e5aac5ba805825da76410c181273ba90b1
+  excluded_manifests:
+    - path: third_party/flutter/desktop_multi_window/example/pubspec.yaml
+      reason: Copied upstream example only; it is not a DeskForge build input.
+    - path: third_party/flutter/desktop_multi_window/example/pubspec.lock
+      reason: Lockfile for the copied non-build example; retained with the exact source.
+  nested_gitmodules:
+    - path: third_party/kcp-sys/.gitmodules
+      declarations:
+        - name: kcp
+          path: kcp
+          url: https://github.com/skywind3000/kcp
+          active: true
+          source_present: true
+          reason: Active kcp-sys build input; the exact kcp source is present.
+    - path: third_party/tao/.gitmodules
+      declarations:
+        - name: deps/apk-builder
+          path: deps/apk-builder
+          url: https://github.com/rust-windowing/android-rs-glue
+          active: false
+          source_present: false
+          reason: Inert upstream Android packaging metadata; tao has no active build target here.
+    - path: third_party/webm/.gitmodules
+      declarations:
+        - name: src/sys/libwebm
+          path: src/sys/libwebm
+          url: https://chromium.googlesource.com/webm/libwebm
+          active: false
+          source_present: false
+          reason: Inert copied metadata; owned webm-sys source is a separate complete path input.
+flutter:
+  - package: dash_chat_2
+    path: flutter/dash_chat_2
+    ref: bd6b5b41254e57c5bcece202ebfb234de63e6487
+  - package: desktop_multi_window
+    path: flutter/desktop_multi_window
+    ref: b47e8385e5a75d38319ad706a64b0ead3108b093
+  - package: dynamic_layouts
+    path: flutter/dynamic_layouts
+    ref: 24cb88413fa5181d949ddacbb30a65d5c459e7d9
+  - package: flutter_gpu_texture_renderer
+    path: flutter/flutter_gpu_texture_renderer
+    ref: 08a471bb8ceccdd50483c81cdfa8b81b07b14b87
+  - package: texture_rgba_renderer
+    path: flutter/flutter_texture_rgba_renderer
+    ref: 42797e0f03141dc2b585f76c64a13974508058b4
+  - package: uni_links
+    path: flutter/uni_links
+    package_path: uni_links
+    ref: f416118d843a7e9ed117c7bb7bdc2deda5a9e86f
+  - package: window_manager
+    path: flutter/window_manager
+    ref: 85789bfe6e4cfaf4ecc00c52857467fdb7f26879
+  - package: window_size
+    path: flutter/window_size
+    package_path: plugins/window_size
+    ref: eb3964990cf19629c89ff8cb4a37640c7b3d5601
+windows:
+  - name: RustDeskTempTopMostWindow
+    path: windows/RustDeskTempTopMostWindow
+    project_path: WindowInjection/WindowInjection.vcxproj
+    ref: ecd8d6a139eee76845ea66423fb739af450fda90

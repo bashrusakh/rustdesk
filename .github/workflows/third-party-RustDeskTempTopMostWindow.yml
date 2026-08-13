@@ -38,19 +38,30 @@ jobs:
     strategy:
         fail-fast: false
     env:
-      build_output_dir: RustDeskTempTopMostWindow/WindowInjection/${{ inputs.platform }}/${{ inputs.configuration }}
+      build_output_dir: third_party/windows/RustDeskTempTopMostWindow/WindowInjection/${{ inputs.platform }}/${{ inputs.configuration }}
     steps:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
 
-      - name: Download the source code
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate pinned local source
+        shell: pwsh
         run: |
-          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
+          $expectedCommit = 'ecd8d6a139eee76845ea66423fb739af450fda90'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'third_party/windows/RustDeskTempTopMostWindow'
+          if (-not (Test-Path (Join-Path $sourceRoot 'WindowInjection/WindowInjection.vcxproj'))) {
+            throw "Pinned RustDeskTempTopMostWindow source is missing: $sourceRoot"
+          }
+           python scripts/check-flutter-source-ownership.py --require-window-pin RustDeskTempTopMostWindow $expectedCommit
+           if ($LASTEXITCODE -ne 0) {
+             throw "RustDeskTempTopMostWindow ownership pin validation failed: expected record path and ref"
+           }
 
       - name: Build the project
         run: |
-          cd RustDeskTempTopMostWindow && git checkout ecd8d6a139eee76845ea66423fb739af450fda90
-          msbuild ${{ env.project_path }} -p:Configuration=${{ inputs.configuration }} -p:Platform=${{ inputs.platform }} /p:TargetVersion=${{ inputs.target_version }}
+          msbuild third_party/windows/RustDeskTempTopMostWindow/${{ env.project_path }} -p:Configuration=${{ inputs.configuration }} -p:Platform=${{ inputs.platform }} /p:TargetVersion=${{ inputs.target_version }}
 
       - name: Archive build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

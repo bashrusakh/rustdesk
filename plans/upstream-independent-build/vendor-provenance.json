@@ -1,0 +1,59 @@
+{
+  "cargo_lock_sha256": "5edcd602b2d5392d1b142b375c1240566230eef7cce88090b0bbf34c1edf8228",
+  "cargo_toml_sha256": "04c6faa5f7c1688e267e77933ce9a31aefc8cd032ce97781c408d33b2317ec62",
+  "copied_package_root_count": 44,
+  "copied_root_contract": {
+    "roots": [
+      "android-wakelock", "arboard", "cacao", "cidre", "cidre-macros",
+      "clipboard-master", "confy", "core-foundation-0.9.3",
+      "core-foundation-sys-0.8.6", "core-graphics-0.23.1",
+      "core-graphics-types-0.1.2", "cpal", "default_net", "evdev",
+      "filedescriptor", "hwcodec", "impersonate_system", "kcp-sys",
+      "keepawake", "machine-uid", "magnum-opus", "nokhwa",
+      "nokhwa-bindings-linux", "nokhwa-bindings-macos",
+      "nokhwa-bindings-windows", "nokhwa-core", "pam", "pam-sys",
+      "parity-tokio-ipc", "portable-pty", "rdev", "rust-pulsectl",
+      "sciter-rs", "sysinfo", "tao", "tao-macros", "tfc", "tokio-socks",
+      "tray-icon", "wallpaper", "webm", "webm-sys", "x11-2.19.0",
+      "x11-clipboard-0.8.1"
+    ],
+    "manifest_rewrites": [
+      "cacao", "core-foundation-0.9.3", "core-graphics-0.23.1",
+      "core-graphics-types-0.1.2", "cpal", "hwcodec", "nokhwa", "pam",
+      "tao", "tfc", "webm", "x11-2.19.0"
+    ],
+    "allowed_omissions": {
+      "hwcodec": [
+        ".gitmodules",
+        "dev/vs/AMFTest/AMFTest.vcxproj.user",
+        "dev/vs/MFXTest/MFXTest.vcxproj.user",
+        "dev/vs/ShaderCompileTool/ShaderCompileTool.vcxproj.user",
+        "externals/MediaSDK_22.5.4/api/mfx_dispatch/windows/libmfx_vs2015.vcxproj.user"
+      ],
+      "nokhwa": [
+        ".run/Clippy All.run.xml",
+        ".run/Clippy Main Apple.run.xml",
+        ".run/Clippy Main Windows.run.xml",
+        ".run/JSCam.run.xml",
+        "examples/.DS_Store"
+      ]
+    }
+  },
+  "active_git_source_count": 0,
+  "vendor_archive": {
+    "path": "/home/bash/projects/DeskForge/offline-kit/artifacts/vendor-1.4.8.tar.gz",
+    "path_scope": "local evidence path; not portable provenance",
+    "sha256": "bec49649ff3c0a49fc4cf2f5ff2aff3a459f2f6fb45039cbe8b89a9995d8a4b6",
+    "file_count": 59831,
+    "package_count": 1049,
+    "member_count": 74239
+  },
+  "vendor_tree": {
+    "path": "/home/bash/projects/DeskForge/offline-kit/artifacts/rustdesk-src/vendor",
+    "path_scope": "local evidence path; not portable provenance",
+    "file_count": 59831,
+    "package_count": 1049,
+    "tree_sha256": "7a9fa2515c109273a0ff8643a7140eb19f993fd134aee0fda3417c4c8a7a11cf"
+  },
+  "status": "44 copied package roots locally verified; zero active git sources; registry vendor tree/archive ownership remains outstanding"
+}

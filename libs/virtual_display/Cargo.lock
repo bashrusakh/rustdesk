@@ -118,7 +118,6 @@ dependencies = [
 [[package]]
 name = "confy"
 version = "0.4.0"
-source = "git+https://github.com/open-trade/confy#630cc28a396cb7d01eefdd9f3824486fe4d8554b"
 dependencies = [
  "directories-next",
  "serde",
@@ -1055,7 +1054,6 @@ dependencies = [
 [[package]]
 name = "tokio-socks"
 version = "0.5.1-1"
-source = "git+https://github.com/open-trade/tokio-socks#7034e79263ce25c348be072808d7601d82cd892d"
 dependencies = [
  "bytes",
  "either",
