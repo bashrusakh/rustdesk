@@ -24,10 +24,10 @@
 
 ### Phase 1 verification note
 
-Full `git diff --check` reports inherited trailing whitespace in the copied
-`a920d009` protobuf files. It passes outside `libs/hbb_common`; the source was
-left byte-for-byte unchanged as required. Next gate: Phase 2 review before
-any Cargo git dependency URL or vendor-source changes.
+At the Phase 1 snapshot, full `git diff --check` reported inherited trailing
+whitespace in the copied `a920d009` protobuf files. The source was left
+byte-for-byte unchanged as required. Next gate: Phase 2 review before any Cargo
+git dependency URL or vendor-source changes.
 
 ## Phase 2 — Cargo sources
 
@@ -45,7 +45,10 @@ any Cargo git dependency URL or vendor-source changes.
   each reports 9 workspace members and 1,017 packages.
 - [x] Add and run the active manifest/lock git-source scan; confirm no full
   `vendor/` tree.
-- [x] Run `git diff --check`; record only inherited Phase 1 protobuf whitespace.
+- [x] Confirm current worktree and index `git diff --check` checks are clean;
+  record that a full commit-range check reports inherited/copied third-party
+  whitespace, including the inherited protobuf whitespace and the 12 intentional
+  CRLF vendor files covered by `.gitattributes -text`.
 - [ ] Obtain approved ownership/publication or immutable storage for the full
   registry vendor tree and place it at relative `vendor/`.
 - [ ] Complete registry-vendor verification and the accepted clean offline
@@ -83,8 +86,10 @@ any Cargo git dependency URL or vendor-source changes.
   inputs). The current externals-only inventory is 360 files and 8,382,509
   bytes; the old 361-file figure included one removed per-user output.
 - [x] Run YAML/lock consistency checks, ownership integrity checks, Cargo
-  metadata/source checks, and `git diff --check`; only inherited Phase 1
-  protobuf whitespace remains.
+  metadata/source checks, and current worktree/index `git diff --check` checks;
+  they are clean. The full commit-range check reports inherited/copied
+  third-party whitespace, including the inherited Phase 1 protobuf whitespace
+  and the 12 intentional CRLF vendor files covered by `.gitattributes -text`.
 - [x] Record the two exact source-preserved informational comment URLs in
   `window_controller.dart` (lines 40 and 102) as path/line/content/URL entries
   with reason `source-preserved documentation only`; executable code,
@@ -114,9 +119,13 @@ any Cargo git dependency URL or vendor-source changes.
   `.gitignore` and that symlink/link integrity remains fail-closed.
 - [x] Re-run ownership with the TopMost pin, both external vendor verifiers,
   Cargo source/metadata checks, YAML/workflow checks, the negative forbidden
-  URL test, link-integrity tests, and `git diff --check` excluding only the
-  inherited protobuf whitespace. Exact results and unavailable blockers are
-  recorded in `plan.md` above.
+  URL test, link-integrity tests, and current worktree/index `git diff --check`
+  checks. The full commit-range check reports inherited/copied third-party
+  whitespace, including the inherited protobuf whitespace and the 12 intentional
+  CRLF vendor files covered by `.gitattributes -text`. Exact results and
+  unavailable blockers are recorded in `plan.md` above.
+- [x] Preserve the 12 approved vendor files' CRLF bytes with exact `-text`
+  attributes; both external vendor inputs match those bytes byte-for-byte.
 
 ### Phase 3 review-fix limitations
 

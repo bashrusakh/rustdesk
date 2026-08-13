@@ -189,8 +189,11 @@ reported.
   offline form both pass with 9 workspace members and 1,017 resolved metadata
   packages.
 - `scripts/check-cargo-git-sources.py` passes across 54 manifests and 9
-  lockfiles. `git diff --check` passes outside inherited Phase 1 whitespace in
-  `libs/hbb_common/protos/message.proto` and `rendezvous.proto`.
+  lockfiles. The current worktree and index `git diff --check` checks are clean.
+  A full commit-range check over the migration history reports inherited/copied
+  third-party whitespace, including the Phase 1 whitespace in
+  `libs/hbb_common/protos/message.proto` and `rendezvous.proto` and the 12
+  intentional CRLF vendor files covered by `.gitattributes -text`.
 - No DeskForge/PR #4 worktree was modified; no commit, push, fork, release, or
   publication was performed.
 
@@ -242,9 +245,11 @@ clean offline build matrix; Phase 2 does not claim registry independence.
 - Existing Cargo metadata and source checks remain green: locked no-deps
   metadata reports 9 workspace members; `scripts/check-cargo-git-sources.py`
   passes for 54 Cargo manifests and 9 lockfiles.
-- `git diff --check` reports only inherited Phase 1 trailing whitespace in
-  `libs/hbb_common/protos/message.proto` and `rendezvous.proto`; the Phase 3
-  files introduce no whitespace errors.
+- The current worktree and index `git diff --check` checks are clean. A full
+  commit-range check reports inherited/copied third-party whitespace, including
+  the Phase 1 trailing whitespace in `libs/hbb_common/protos/message.proto` and
+  `rendezvous.proto` and the 12 intentional CRLF vendor files covered by
+  `.gitattributes -text`; the Phase 3 files introduce no new whitespace errors.
 - No other worktree was modified; no commit, push, fork, release, or
   publication was performed. Mutable non-checkout actions remain out of scope;
    this phase does not broaden action pinning beyond the documented checkout-only
@@ -300,8 +305,10 @@ Cargo metadata, and available external vendor input. Approved but unavailable
   with 9 workspace members (`--no-deps`) and 9 members/1,017 packages (offline
   locked metadata). YAML parsing passed for 37 files; workflow checks passed
   for 5 workflow files and 5 full-SHA checkout refs.
-- `git diff --check` passed when excluding only inherited whitespace in
-  `libs/hbb_common/protos/message.proto` and `rendezvous.proto`. No copied
+- The current worktree and index `git diff --check` checks are clean. A full
+  commit-range check reports inherited/copied third-party whitespace, including
+  `libs/hbb_common/protos/message.proto`, `rendezvous.proto`, and the 12
+  intentional CRLF vendor files covered by `.gitattributes -text`. No copied
   source contents were changed, and no commit, push, or publication occurred.
 - Local Flutter/Dart tooling was not used because it is not required for this
   migration. Flutter dependency/build validation remains deferred to the
@@ -339,7 +346,15 @@ copied-source representation mismatch, not a content or manifest rewrite. The
 follow-up preserves the approved external bytes and adds exact `-text`
 attributes for only these 12 paths. The verifier remains fail-closed and
 unchanged. No vendor archive/tree digest or count changed, because the external
-evidence did not change; no manifest rewrite or ownership record changed.
+  evidence did not change; no manifest rewrite or ownership record changed.
+
+The 12-file line-ending provenance repair is byte-for-byte matched by the
+approved external vendor directory and archive. After the repair, the current
+worktree and index `git diff --check` checks are clean. A full commit-range
+`git diff --check` still reports inherited/copied third-party whitespace from
+earlier migration commits, including these intentional CRLF vendor files and
+the inherited protobuf whitespace; it is not accurate to report that only the
+protobuf whitespace remains.
 
 ### Final migration acceptance (future phases)
 
