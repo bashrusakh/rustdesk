@@ -64,8 +64,8 @@ scan_policy:
       tree_sha256: 476240e857a870c0007906c48040af5dbcf289d7abb02c762b2569a66560fb3e
     - path: flutter/desktop_multi_window
       file_count: 115
-      byte_count: 459783
-      tree_sha256: ab38b6749eebfee37ea7980e4953dc9264da32dc151440dbe04aeaa209d20c62
+      byte_count: 459058
+      tree_sha256: ef200e085a482a94053ce3600048547bff19ac888bf989de889bb647d3317209
     - path: flutter/dynamic_layouts
       file_count: 145
       byte_count: 464338
@@ -84,16 +84,16 @@ scan_policy:
       tree_sha256: db29545c7b22b6c0892305b8dc17ec5ffc8e1e52ca10c01583645983db11daa3
     - path: flutter/window_manager
       file_count: 110
-      byte_count: 681289
-      tree_sha256: a4b6e190e8ab36993006030d958f5da7180cb9f3f613f20019ca2e55bd272b70
+      byte_count: 679690
+      tree_sha256: 64da790209f6184ddca7380a057039152bcb7853804cc695aadeeffa76282c0b
     - path: flutter/window_size
       file_count: 181
-      byte_count: 797730
-      tree_sha256: da793c4444d02d808ec0ed802e31402bb2521482e27ba3402606dd24736e082e
+      byte_count: 797361
+      tree_sha256: 20e179647b9a27111df63af28054f37ad084307bf03f5622b03658b417942c1a
     - path: windows/RustDeskTempTopMostWindow
       file_count: 25
-      byte_count: 265515
-      tree_sha256: 11e8449c64966a98500414b8e275d9ed8658feb95d1106c1d0ba66acb1d9885b
+      byte_count: 261926
+      tree_sha256: 999ee530fe6eed13469d75175392bc8c3086e55238ef2616ee90ddb1d36b7ec4
     - path: hwcodec
       file_count: 436
       byte_count: 9010415
