@@ -38,7 +38,7 @@ RustDesk welcomes contribution from everyone. See [CONTRIBUTING.md](docs/CONTRIB
 
 ## Dependencies
 
-Desktop versions use Flutter or Sciter (deprecated) for GUI, this tutorial is for Sciter only, since it is easier and more friendly to start. For this fork's current client-build reference, see the [fork-specific Windows workflow](.github/workflows/rustqs-windows-min-test.yml). The workflow file is a source reference; it is not a release or support claim.
+Desktop versions use Flutter or Sciter (deprecated) for GUI, this tutorial is for Sciter only, since it is easier and more friendly to start. For this fork's current client-build reference, see the [fork-specific Windows workflow](.github/workflows/rustqs-windows.yml). The workflow file is a source reference; it is not a release or support claim.
 
 Please download Sciter dynamic library yourself.
 

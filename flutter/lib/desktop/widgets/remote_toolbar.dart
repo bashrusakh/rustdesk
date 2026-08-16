@@ -10,8 +10,6 @@ import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
-import 'package:flutter_hbb/plugin/widgets/desc_ui.dart';
-import 'package:flutter_hbb/plugin/common.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
@@ -1478,20 +1476,11 @@ class _DisplayMenu extends StatefulWidget {
   final FFI ffi;
   final ToolbarState state;
   final Function(bool) setFullscreen;
-  final Widget pluginItem;
-  _DisplayMenu(
-      {Key? key,
-      required this.id,
+  const _DisplayMenu(
+      {required this.id,
       required this.ffi,
       required this.state,
-      required this.setFullscreen})
-      : pluginItem = LocationItem.createLocationItem(
-          id,
-          ffi,
-          kLocationClientRemoteToolbarDisplay,
-          true,
-        ),
-        super(key: key);
+      required this.setFullscreen});
 
   @override
   State<_DisplayMenu> createState() => _DisplayMenuState();
@@ -1581,9 +1570,6 @@ class _DisplayMenuState extends State<_DisplayMenu> {
                     .toList()),
           ]);
         }
-      }
-      if (ffi.connType == ConnType.defaultConn) {
-        menuChildren.add(widget.pluginItem);
       }
       return menuChildren;
     }
@@ -2484,6 +2470,8 @@ class _KeyboardMenu extends StatelessWidget {
             ? (v) async {
                 if (v != null) {
                   await stateGlobal.setInputSource(ffi.sessionId, v);
+                  // Release native input; see the macOS trade-offs in RemotePage.
+                  if (isMacOS) ffi.inputModel.enterOrLeave(false);
                   await ffi.ffiModel.checkDesktopKeyboardMode();
                   await ffi.inputModel.updateKeyboardMode();
                 }
@@ -2740,7 +2728,9 @@ class _RecordMenu extends StatelessWidget {
   Widget build(BuildContext context) {
     var ffi = Provider.of<FfiModel>(context);
     var recordingModel = Provider.of<RecordingModel>(context);
-    final visible =
+    final hideRecordingButton =
+        bind.mainGetLocalOption(key: kOptionHideRecordingButton) == 'Y';
+    final visible = !hideRecordingButton &&
         (recordingModel.start || ffi.permissions['recording'] != false);
     if (!visible) return Offstage();
     return _IconMenuButton(

@@ -1,15 +1,15 @@
 name: rustqs windows min test
-# Минимальный workflow сборки rustqs.exe (Flutter Windows) в форке rustdesk.
+# Workflow сборки rustqs.exe (Flutter Windows) в форке rustdesk.
 # Historical source note: the steps were adapted from build-for-windows-flutter@1.4.7.
-# The current fork source/ref is 1.4.8; active dispatch uses authenticated DFP1 only.
+# The current fork source/ref is 1.4.9; active dispatch uses authenticated DFP1 only.
 # (L1 config.rs server+key, L2 allowCustom+custom_.txt, L3 brand+rename exe).
 #
 # Единственный build path: enc_payload — authenticated DFP1 AES-CBC + HMAC
 # envelope from the API. Direct/manual runs without a valid payload fail closed.
 #
 # Запуск из gh:
-#   gh api repos/$REPO/actions/workflows/rustqs-windows-min-test.yml/dispatches -X POST \
-#     -f ref=rustqs/min-test -f inputs[enc_payload]=$BLOB
+#   gh api repos/$REPO/actions/workflows/rustqs-windows.yml/dispatches -X POST \
+#     -f ref=rustqs/workflows -f inputs[enc_payload]=$BLOB
 
 on:
   workflow_dispatch:
@@ -39,6 +39,7 @@ jobs:
 
   topmost:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    needs: bridge
     with:
       upload-artifact: true
       target: windows-2022
@@ -700,9 +701,6 @@ jobs:
           set -euo pipefail
           MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           export MANIFEST_PUBLICATION_TIMESTAMP
-          if [ -f flutter/build/windows/x64/runner/Release/custom_.txt ]; then
-            cp -- flutter/build/windows/x64/runner/Release/custom_.txt output/custom_.txt
-          fi
            test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
            python3 "$MANIFEST_HELPER_PATH" \
              --platform "$MANIFEST_PLATFORM" --app-name "$RQS_APP_NAME" --version "$RQS_VERSION" \
@@ -711,7 +709,7 @@ jobs:
       - name: Upload unsigned
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-min-test-windows
+          name: rustqs-windows
           path: output
           retention-days: 7
           if-no-files-found: error

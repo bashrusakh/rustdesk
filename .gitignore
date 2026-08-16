@@ -76,3 +76,5 @@ third_party/**/.gradle/
 third_party/**/.generated/
 third_party/**/.idea/
 third_party/**/*.vcxproj.user
+# libdrmtap is cloned at build time by build.py (not a submodule)
+/third_party/libdrmtap/

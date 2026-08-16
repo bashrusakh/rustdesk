@@ -291,13 +291,12 @@ def main() -> None:
         raise SystemExit("manifest production requires platform, app name, and version")
     output = output_root(args.output)
     names = expected_names(args.platform, args.app_name, args.version)
+    private_path = output / PRIVATE_FILENAME
+    if private_path.exists() or private_path.is_symlink():
+        raise SystemExit("public manifest output must not contain custom_.txt")
     validate_output_tree(output, set(names))
     paths = [safe_output_file(output, name) for name in names]
     private_filenames: list[str] = []
-    private_path = output / PRIVATE_FILENAME
-    if private_path.exists() or private_path.is_symlink():
-        safe_output_file(output, PRIVATE_FILENAME)
-        private_filenames.append(PRIVATE_FILENAME)
     file_records: list[dict[str, str | int]] = []
     for name, path in zip(names, paths, strict=True):
         before = path.lstat()

@@ -32,7 +32,7 @@ RustDeskは皆さんの貢献を歓迎します。
 
 ## 依存関係
 
-デスクトップ版ではGUIにFlutterまたはSciter(非推奨)を使用しますが、チュートリアルでは分かりやすく、簡単なSciterのみを対象に解説しています。この fork の現在のクライアントビルド参照は [Windows workflow](../.github/workflows/rustqs-windows-min-test.yml) です。これはソース参照であり、リリースやサポートの主張ではありません。
+デスクトップ版ではGUIにFlutterまたはSciter(非推奨)を使用しますが、チュートリアルでは分かりやすく、簡単なSciterのみを対象に解説しています。この fork の現在のクライアントビルド参照は [Windows workflow](../.github/workflows/rustqs-windows.yml) です。これはソース参照であり、リリースやサポートの主張ではありません。
 
 Sciter dynamic libraryを事前にダウンロードしてください。
 

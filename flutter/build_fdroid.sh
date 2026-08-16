@@ -3,10 +3,7 @@
 #
 # Script to build F-Droid release of RustDesk
 #
-# LEGACY: this F-Droid builder still reads the historical
-# .github/workflows/flutter-build.yml, which is absent from the current fork. It is
-# not part of the active rustqs workflow path; the historical references below are
-# intentionally not treated as current workflow configuration.
+# This F-Droid builder reads version settings from the active rustqs Android workflow.
 #
 # Copyright (C) 2024, The RustDesk Authors
 #               2024, Vasyl Gello <vasek.gello@gmail.com>
@@ -133,23 +130,23 @@ prebuild)
 
 	#
 	# Extract required versions for NDK, Rust, Flutter from
-	# '.github/workflows/flutter-build.yml'
+	# '.github/workflows/rustqs-android.yml'
 	#
 
 	CARGO_NDK_VERSION="$(yq -r \
 		.env.CARGO_NDK_VERSION \
-		.github/workflows/flutter-build.yml)"
+		.github/workflows/rustqs-android.yml)"
 
 	# Flutter used to compile main Rustdesk library
 
 	FLUTTER_VERSION="$(yq -r \
-		.env.ANDROID_FLUTTER_VERSION \
-		.github/workflows/flutter-build.yml)"
+		'.env.ANDROID_FLUTTER_VERSION // ""' \
+		.github/workflows/rustqs-android.yml)"
 
 	if [ -z "${FLUTTER_VERSION}" ]; then
 		FLUTTER_VERSION="$(yq -r \
 			.env.FLUTTER_VERSION \
-			.github/workflows/flutter-build.yml)"
+			.github/workflows/rustqs-android.yml)"
 	fi
 
 	# Flutter used to compile Flutter<->Rust bridge files
@@ -168,15 +165,15 @@ prebuild)
 
 	NDK_VERSION="$(yq -r \
 		.env.NDK_VERSION \
-		.github/workflows/flutter-build.yml)"
+		.github/workflows/rustqs-android.yml)"
 
 	RUST_VERSION="$(yq -r \
 		.env.RUST_VERSION \
-		.github/workflows/flutter-build.yml)"
+		.github/workflows/rustqs-android.yml)"
 
 	VCPKG_COMMIT_ID="$(yq -r \
 		.env.VCPKG_COMMIT_ID \
-		.github/workflows/flutter-build.yml)"
+		.github/workflows/rustqs-android.yml)"
 
 	if [ -z "${CARGO_NDK_VERSION}" ] || [ -z "${FLUTTER_VERSION}" ] ||
 		[ -z "${FLUTTER_BRIDGE_VERSION}" ] ||
@@ -409,24 +406,24 @@ build)
 
 	#
 	# Extract required versions for NDK, Rust, Flutter from
-	# '.github/workflows/flutter-build.yml'
+	# '.github/workflows/rustqs-android.yml'
 	#
 
 	# Flutter used to compile main Rustdesk library
 
 	FLUTTER_VERSION="$(yq -r \
-		.env.ANDROID_FLUTTER_VERSION \
-		.github/workflows/flutter-build.yml)"
+		'.env.ANDROID_FLUTTER_VERSION // ""' \
+		.github/workflows/rustqs-android.yml)"
 
 	if [ -z "${FLUTTER_VERSION}" ]; then
 		FLUTTER_VERSION="$(yq -r \
 			.env.FLUTTER_VERSION \
-			.github/workflows/flutter-build.yml)"
+			.github/workflows/rustqs-android.yml)"
 	fi
 
 	NDK_VERSION="$(yq -r \
 		.env.NDK_VERSION \
-		.github/workflows/flutter-build.yml)"
+		.github/workflows/rustqs-android.yml)"
 
 	# Map NDK version to revision
 	NDK_VERSION="$(curl https://gitlab.com/fdroid/android-sdk-transparency-log/-/raw/master/signed/checksums.json |

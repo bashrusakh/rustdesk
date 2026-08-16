@@ -22,7 +22,7 @@ root = Path(sys.argv[1])
 manifest_writer = (root / ".github" / "scripts" / "write_artifact_manifest.py").read_text()
 workflow_names = [
     "bridge.yml",
-    "rustqs-windows-min-test.yml",
+    "rustqs-windows.yml",
     "rustqs-linux.yml",
     "rustqs-android.yml",
 ]
@@ -66,7 +66,7 @@ def bash_contract(workflow):
         blocks.append(block)
         if shell and "bash" not in str(shell):
             continue
-        if not shell and workflow.name == "rustqs-windows-min-test.yml":
+        if not shell and workflow.name == "rustqs-windows.yml":
             continue
         normalized = re.sub(r"\$\{\{.*?\}\}", "placeholder", block)
         check = subprocess.run(
@@ -114,8 +114,8 @@ for name in workflow_names:
             raise AssertionError(f"{name}: custom_.txt content must not be persisted in GITHUB_ENV")
         if "RQS_CUSTOM_TXT_FILE" not in text:
             raise AssertionError(f"{name}: restrictive custom_.txt file handoff is missing")
-        if "cp --" not in text or "output/custom_.txt" not in text:
-            raise AssertionError(f"{name}: private custom_.txt is not copied beside public output for manifest declaration")
+        if "output/custom_.txt" in text:
+            raise AssertionError(f"{name}: private custom_.txt must not be published beside public output")
         created_at = text.index("custom_txt_file=")
         trap_at = text.index("trap cleanup_custom_txt_on_failure EXIT", created_at)
         written_at = text.index('printf \'%s\' "$RQS_CT" > "$custom_txt_file"', trap_at)
@@ -219,6 +219,10 @@ for name in workflow_names[1:]:
         raise AssertionError(f"{name}: bridge artifact is not verified from a temporary directory")
     if "--verify-bridge" not in restore_contract or "--expected-version" not in restore_contract or 'cp -- "$BRIDGE_ARTIFACT_DIR/$file" "$file"' not in restore_contract:
         raise AssertionError(f"{name}: bridge manifest verification must precede source restoration")
+
+windows_jobs = yaml.safe_load((root / ".github" / "workflows" / "rustqs-windows.yml").read_text())["jobs"]
+if windows_jobs["topmost"].get("needs") != "bridge":
+    raise AssertionError("rustqs-windows.yml: topmost must depend on bridge")
 
 bridge_text = (root / ".github" / "workflows" / "bridge.yml").read_text()
 stage_start = bridge_text.index("- name: Stage generated bridge files")
@@ -423,7 +427,7 @@ deb_assertion = linux_text.index('dpkg-deb -c "$deb_source"')
 deb_copy = linux_text.index('cp -- "$deb_source" "$deb_output"')
 if deb_assertion > deb_copy:
     raise AssertionError("Linux workflow must assert custom_.txt membership before publishing the Debian artifact")
-for marker in ("rpmbuild -ba res/rpm-flutter.spec", "output/custom_.txt", "Cleanup sensitive custom_.txt"):
+for marker in ("rpmbuild -ba res/rpm-flutter.spec", "Cleanup sensitive custom_.txt"):
     if marker not in linux_text:
         raise AssertionError(f"Linux RPM/private-manifest contract is missing {marker!r}")
 
@@ -449,7 +453,7 @@ def run_manifest_writer(output, app_name="rustqs", platform="windows"):
             "--workflow-sha",
             "b" * 40,
             "--workflow-ref",
-            "rustqs/min-test",
+            "rustqs/workflows",
         ],
         cwd=root,
         env=environment,
@@ -482,7 +486,7 @@ def run_manifest_writer_with_mocked_provenance(output, platform="windows", app_n
         "--workflow-sha",
         "b" * 40,
         "--workflow-ref",
-        "rustqs/min-test",
+        "rustqs/workflows",
     ]
     os.environ["RQS_SOURCE_SHA"] = "a" * 40
     os.environ["MANIFEST_PUBLICATION_TIMESTAMP"] = "2026-08-10T12:00:00Z"
@@ -503,7 +507,7 @@ def run_manifest_writer_with_mocked_provenance(output, platform="windows", app_n
     return 0
 
 
-def verify_bridge_artifact(output, source_sha="a" * 40, workflow_sha="b" * 40, workflow_ref="rustqs/min-test", version="1.2.3"):
+def verify_bridge_artifact(output, source_sha="a" * 40, workflow_sha="b" * 40, workflow_ref="rustqs/workflows", version="1.2.3"):
     module_path = root / ".github" / "scripts" / "write_artifact_manifest.py"
     spec = importlib.util.spec_from_file_location("deskforge_bridge_verifier", module_path)
     module = importlib.util.module_from_spec(spec)
@@ -531,7 +535,7 @@ def verify_bridge_artifact_with_cli(output):
             "--workflow-sha",
             "b" * 40,
             "--workflow-ref",
-            "rustqs/min-test",
+            "rustqs/workflows",
         ],
         cwd=root,
         text=True,
@@ -554,11 +558,8 @@ with tempfile.TemporaryDirectory() as output_dir:
     (output / "rustqs.exe").write_bytes(b"safe")
     (output / "custom_.txt").write_bytes(b"private settings")
     result = run_manifest_writer_with_mocked_provenance(output)
-    if result != 0:
-        raise AssertionError(f"manifest writer rejected declared private custom_.txt: {result}")
-    manifest = json.loads((output / "manifest.txt").read_text())
-    if manifest["private_filenames"] != ["custom_.txt"] or any(file["name"] == "custom_.txt" for file in manifest["files"]):
-        raise AssertionError(f"private custom_.txt was not separated from public files: {manifest}")
+    if result == 0 or (output / "manifest.txt").exists():
+        raise AssertionError("manifest writer accepted a private custom_.txt sidecar")
 
 with tempfile.TemporaryDirectory() as output_dir:
     output = Path(output_dir)
@@ -620,11 +621,8 @@ for platform, app_name, names in (
             (output / name).write_bytes(name.encode())
         (output / "custom_.txt").write_bytes(b"private settings")
         result = run_manifest_writer_with_mocked_provenance(output, platform, app_name)
-        if result != 0:
-            raise AssertionError(f"{platform}: manifest writer rejected public/private compatibility set: {result}")
-        manifest = json.loads((output / "manifest.txt").read_text())
-        if manifest["output_filenames"] != names or manifest["private_filenames"] != ["custom_.txt"]:
-            raise AssertionError(f"{platform}: manifest file separation is invalid: {manifest}")
+        if result == 0 or (output / "manifest.txt").exists():
+            raise AssertionError(f"{platform}: manifest writer accepted a private custom_.txt sidecar")
 
 with tempfile.TemporaryDirectory() as output_dir:
     output = Path(output_dir)

@@ -13,7 +13,7 @@ name: rustqs android min test
 # Android custom_.txt is packaged as a Flutter asset and handed to the native
 # server from MainService before the server thread starts.
 #
-# Путь в форке: .github/workflows/rustqs-android.yml на ветке rustqs/min-test.
+# Путь в форке: .github/workflows/rustqs-android.yml на ветке rustqs/workflows.
 # ============================================================================
 
 on:
@@ -681,9 +681,6 @@ jobs:
           set -euo pipefail
           MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           export MANIFEST_PUBLICATION_TIMESTAMP
-          if [ -f flutter/assets/custom_.txt ]; then
-            cp -- flutter/assets/custom_.txt output/custom_.txt
-          fi
            test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
            python3 "$MANIFEST_HELPER_PATH" \
              --platform "$MANIFEST_PLATFORM" --app-name "$RQS_APP_NAME" --version "$RQS_VERSION" \
