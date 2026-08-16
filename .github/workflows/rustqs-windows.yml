@@ -1,7 +1,7 @@
 name: rustqs windows min test
 # Workflow сборки rustqs.exe (Flutter Windows) в форке rustdesk.
 # Historical source note: the steps were adapted from build-for-windows-flutter@1.4.7.
-# The current fork source/ref is 1.4.8; active dispatch uses authenticated DFP1 only.
+# The current fork source/ref is 1.4.9; active dispatch uses authenticated DFP1 only.
 # (L1 config.rs server+key, L2 allowCustom+custom_.txt, L3 brand+rename exe).
 #
 # Единственный build path: enc_payload — authenticated DFP1 AES-CBC + HMAC
@@ -39,6 +39,7 @@ jobs:
 
   topmost:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    needs: bridge
     with:
       upload-artifact: true
       target: windows-2022
@@ -700,9 +701,6 @@ jobs:
           set -euo pipefail
           MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           export MANIFEST_PUBLICATION_TIMESTAMP
-          if [ -f flutter/build/windows/x64/runner/Release/custom_.txt ]; then
-            cp -- flutter/build/windows/x64/runner/Release/custom_.txt output/custom_.txt
-          fi
            test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
            python3 "$MANIFEST_HELPER_PATH" \
              --platform "$MANIFEST_PLATFORM" --app-name "$RQS_APP_NAME" --version "$RQS_VERSION" \

@@ -34,7 +34,7 @@ RustDesk er velkommen for bidrag fra alle. Se [CONTRIBUTING.md](CONTRIBUTING-NO.
 
 ## Avhengigheter
 
-Desktop versjoner bruker Flutter eller Sciter (avviklet) for GUI, denne veiledningen er bare for Sciter, grunnet at det er lettere og en mer vennlig start. Se forkets [Windows-arbeidsflyt](../.github/workflows/rustqs-windows-min-test.yml) som gjeldende byggereferanse; filen er bare en kildekodereferanse, ikke en lanserings- eller støtteerklæring.
+Desktop versjoner bruker Flutter eller Sciter (avviklet) for GUI, denne veiledningen er bare for Sciter, grunnet at det er lettere og en mer vennlig start. Se forkets [Windows-arbeidsflyt](../.github/workflows/rustqs-windows.yml) som gjeldende byggereferanse; filen er bare en kildekodereferanse, ikke en lanserings- eller støtteerklæring.
 
 Venligst last ned Sciters dynamiske bibliotek selv.
 

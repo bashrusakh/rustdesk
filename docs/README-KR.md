@@ -38,7 +38,7 @@ RustDesk는 모든 분들의 기여를 환영합니다. 시작하는 데 도움�
 
 ## 종속성
 
-데스크톱 버전은 GUI로 Flutter 또는 Sciter (더 이상 지원되지 않음)를 사용하며, 이 자습서는 시작하기 더 쉽고 친숙한 Sciter 전용입니다. 이 fork의 현재 클라이언트 빌드 참조는 [Windows workflow](../.github/workflows/rustqs-windows-min-test.yml)입니다. 이 파일은 소스 참조일 뿐 릴리스 또는 지원을 의미하지 않습니다.
+데스크톱 버전은 GUI로 Flutter 또는 Sciter (더 이상 지원되지 않음)를 사용하며, 이 자습서는 시작하기 더 쉽고 친숙한 Sciter 전용입니다. 이 fork의 현재 클라이언트 빌드 참조는 [Windows workflow](../.github/workflows/rustqs-windows.yml)입니다. 이 파일은 소스 참조일 뿐 릴리스 또는 지원을 의미하지 않습니다.
 
 Sciter 동적 라이브러리를 직접 다운로드하세요.
 

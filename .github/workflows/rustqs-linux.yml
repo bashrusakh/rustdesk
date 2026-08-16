@@ -10,7 +10,7 @@ name: rustqs linux min test
 # Контракт: единственный build path — authenticated DFP1 enc_payload от API.
 # Direct/manual runs without a valid payload fail closed before checkout/build.
 #
-# Путь в форке: .github/workflows/rustqs-linux.yml на ветке rustqs/min-test.
+# Путь в форке: .github/workflows/rustqs-linux.yml на ветке rustqs/workflows.
 # ============================================================================
 
 on:
@@ -489,7 +489,7 @@ jobs:
           git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
 
       # Historical two-stage build shape: first cargo lib with the required features,
-      # then build.py for the Flutter UI and packages. The old upstream flutter-build.yml
+      # then build.py for the Flutter UI and packages. The former upstream workflow
       # reference is not the active workflow source.
       - name: Build rustdesk (Flutter Linux)
         run: |
@@ -560,9 +560,6 @@ jobs:
           set -euo pipefail
           MANIFEST_PUBLICATION_TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           export MANIFEST_PUBLICATION_TIMESTAMP
-          if [ -f flutter/build/linux/x64/release/bundle/custom_.txt ]; then
-            cp -- flutter/build/linux/x64/release/bundle/custom_.txt output/custom_.txt
-          fi
            test -f "${MANIFEST_HELPER_PATH:-}" || { echo "::error::preserved manifest helper is unavailable"; exit 1; }
            python3 "$MANIFEST_HELPER_PATH" \
              --platform "$MANIFEST_PLATFORM" --app-name "$RQS_APP_NAME" --version "$RQS_VERSION" \
