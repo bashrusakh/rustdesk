@@ -28,6 +28,7 @@ message PunchHoleRequest {
   bool force_relay = 8;
   int32 upnp_port = 9;
   bytes socket_addr_v6 = 10;
+  string switch_code = 11;
 }
 
 message ControlPermissions {
@@ -152,6 +153,7 @@ message RequestRelay {
   string token = 8;
   ControlPermissions control_permissions = 9;
   ControlledContext controlled_context = 10;
+  string switch_code = 11;
 }
 
 message RelayResponse {
