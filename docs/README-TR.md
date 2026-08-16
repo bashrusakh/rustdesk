@@ -37,7 +37,7 @@ RustDesk, herkesin katkısına açıktır. Başlamak için [CONTRIBUTING.md](CON
 
 ## Gereksinimler
 
-Masaüstü sürümleri GUI için; [Sciter](https://sciter.com/)(kaldırılacak) veya Flutter kullanır. Sciter daha kolay ve başlamak için daha dostcanlısı, bundan dolayı bu kılavuz sadece Sciter içindir. Bu fork'un güncel istemci derleme referansı için [Windows iş akışına](../.github/workflows/rustqs-windows-min-test.yml) bakın; dosya yalnızca kaynak referansıdır, sürüm veya destek iddiası değildir.
+Masaüstü sürümleri GUI için; [Sciter](https://sciter.com/)(kaldırılacak) veya Flutter kullanır. Sciter daha kolay ve başlamak için daha dostcanlısı, bundan dolayı bu kılavuz sadece Sciter içindir. Bu fork'un güncel istemci derleme referansı için [Windows iş akışına](../.github/workflows/rustqs-windows.yml) bakın; dosya yalnızca kaynak referansıdır, sürüm veya destek iddiası değildir.
 
 Lütfen Sciter dinamik kütüphanesini kendiniz indirin.
 

@@ -38,7 +38,7 @@ O RustDesk acolhe a contribuição de todos. Veja [CONTRIBUTING.md](CONTRIBUTING
 
 ## Dependências
 
-As versões de desktop usam Flutter ou Sciter (descontinuado) para a interface gráfica (GUI). Este tutorial é apenas para o Sciter, por ser mais fácil e amigável para começar. Consulte o [workflow Windows específico do fork](../.github/workflows/rustqs-windows-min-test.yml) como referência atual de compilação; o arquivo é apenas uma referência de código-fonte, não uma declaração de lançamento ou suporte.
+As versões de desktop usam Flutter ou Sciter (descontinuado) para a interface gráfica (GUI). Este tutorial é apenas para o Sciter, por ser mais fácil e amigável para começar. Consulte o [workflow Windows específico do fork](../.github/workflows/rustqs-windows.yml) como referência atual de compilação; o arquivo é apenas uma referência de código-fonte, não uma declaração de lançamento ou suporte.
 
 Por favor, faça o download da biblioteca dinâmica do Sciter por conta própria.
 

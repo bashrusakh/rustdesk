@@ -31,7 +31,7 @@ RustDesk là một phần mềm điểu khiển máy tính từ xa mã nguồn m
 
 ## Dependencies
 
-Phiên bản máy tính sử dụng __Flutter__ hoặc __Sciter__ (đã lỗi thời) cho giao diện người dùng (GUI). Hướng dẫn này chỉ áp dụng cho phiên bản Sciter, vì nó thân thiện và dễ bắt đầu hơn. Tham khảo [workflow Windows của fork](../.github/workflows/rustqs-windows-min-test.yml) để xem quy trình xây dựng hiện tại; tệp này chỉ là tham chiếu nguồn, không phải tuyên bố phát hành hay hỗ trợ.
+Phiên bản máy tính sử dụng __Flutter__ hoặc __Sciter__ (đã lỗi thời) cho giao diện người dùng (GUI). Hướng dẫn này chỉ áp dụng cho phiên bản Sciter, vì nó thân thiện và dễ bắt đầu hơn. Tham khảo [workflow Windows của fork](../.github/workflows/rustqs-windows.yml) để xem quy trình xây dựng hiện tại; tệp này chỉ là tham chiếu nguồn, không phải tuyên bố phát hành hay hỗ trợ.
 
 Vui lòng tự tải thư viện `Sciter` về máy theo hướng dẫn cho từng hệ điều hành.
 

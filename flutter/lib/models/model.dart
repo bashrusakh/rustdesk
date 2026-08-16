@@ -25,9 +25,6 @@ import 'package:flutter_hbb/models/user_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/models/desktop_render_texture.dart';
 import 'package:flutter_hbb/models/terminal_model.dart';
-import 'package:flutter_hbb/plugin/event.dart';
-import 'package:flutter_hbb/plugin/manager.dart';
-import 'package:flutter_hbb/plugin/widgets/desc_ui.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/http_service.dart' as http;
@@ -112,6 +109,9 @@ class CachedPeerData {
 class FfiModel with ChangeNotifier {
   CachedPeerData cachedPeerData = CachedPeerData();
   PeerInfo _pi = PeerInfo();
+  int? lastUserDisplay;
+  int? pendingMonitorRestore;
+  Timer? _pendingRestoreTimer;
   Rect? _rect;
 
   var _inputBlocked = false;
@@ -248,6 +248,8 @@ class FfiModel with ChangeNotifier {
 
   clear() {
     _pi = PeerInfo();
+    lastUserDisplay = null;
+    _cancelPendingMonitorRestore();
     _secure = null;
     _direct = null;
     _inputBlocked = false;
@@ -432,15 +434,6 @@ class FfiModel with ChangeNotifier {
         parent.target?.serverModel.updateVoiceCallState(evt);
       } else if (name == 'fingerprint') {
         FingerprintState.find(peerId).value = evt['fingerprint'] ?? '';
-      } else if (name == 'plugin_manager') {
-        pluginManager.handleEvent(evt);
-      } else if (name == 'plugin_event') {
-        handlePluginEvent(evt,
-            (Map<String, dynamic> e) => handleMsgBox(e, sessionId, peerId));
-      } else if (name == 'plugin_reload') {
-        handleReloading(evt);
-      } else if (name == 'plugin_option') {
-        handleOption(evt);
       } else if (name == "sync_peer_hash_password_to_personal_ab") {
         if (desktopType == DesktopType.main || isWeb || isMobile) {
           final id = evt['id'];
@@ -932,6 +925,7 @@ class FfiModel with ChangeNotifier {
       // frame briefly, then shows the Connecting overlay.
       if (_restartReconnectDelayTimer == null) {
         parent.target?.inputModel.setRelativeMouseMode(false);
+        _cancelPendingMonitorRestore();
         bind.sessionReconnect(sessionId: sessionId, forceRelay: false);
         clearPermissions();
         // Retry once more after the silent window so restart reconnect attempts
@@ -1084,10 +1078,22 @@ class FfiModel with ChangeNotifier {
     }
   }
 
+  void _cancelPendingMonitorRestore() {
+    _pendingRestoreTimer?.cancel();
+    _pendingRestoreTimer = null;
+    pendingMonitorRestore = null;
+  }
+
+  void cancelPendingRestoreTimer() {
+    _pendingRestoreTimer?.cancel();
+    _pendingRestoreTimer = null;
+  }
+
   void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
       bool forceRelay) {
     // Disable relative mouse mode before reconnecting to ensure cursor is released.
     parent.target?.inputModel.setRelativeMouseMode(false);
+    _cancelPendingMonitorRestore();
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
     dialogManager.dismissAll();
@@ -1400,6 +1406,25 @@ class FfiModel with ChangeNotifier {
       if (_pi.currentDisplay < _pi.displays.length) {
         // now replaced to _updateCurDisplay
         updateCurDisplay(sessionId);
+      }
+      // After reconnecting, restore the last selected monitor once the canvas is ready.
+      // Switching earlier can offset the view if the monitor sizes differ.
+      final last = lastUserDisplay;
+      pendingMonitorRestore = (!isCache &&
+              last != null &&
+              last != currentDisplay &&
+              bind.sessionGetUseAllMyDisplaysForTheRemoteSession(
+                      sessionId: sessionId) !=
+                  'Y' &&
+              ((last == kAllDisplayValue && _pi.displays.isNotEmpty) ||
+                  (last >= 0 && last < _pi.displays.length)))
+          ? last
+          : null;
+      // Fallback if the first image event never reaches this tab (multi-UI).
+      _pendingRestoreTimer?.cancel();
+      if (pendingMonitorRestore != null) {
+        _pendingRestoreTimer = Timer(const Duration(milliseconds: 1500),
+            () => parent.target?._applyPendingMonitorRestore());
       }
       if (displays.isNotEmpty) {
         _reconnects = 1;
@@ -1915,6 +1940,12 @@ class ImageModel with ChangeNotifier {
     platformFFI.nextRgba(sessionId, display);
   }
 
+  // web only: image already created from a decoded WebCodecs frame
+  Future<void> onImage(
+      int display, ui.Image image, bool Function() isCurrentSession) async {
+    await update(image, isCurrentSession: isCurrentSession);
+  }
+
   decodeAndUpdate(int display, Uint8List rgba) async {
     final pid = parent.target?.id;
     final rect = parent.target?.ffiModel.pi.getDisplayRect(display);
@@ -1926,11 +1957,16 @@ class ImageModel with ChangeNotifier {
           ? ui.PixelFormat.rgba8888
           : ui.PixelFormat.bgra8888,
     );
-    if (parent.target?.id != pid) return;
+    if (parent.target?.id != pid) {
+      image?.dispose();
+      return;
+    }
     await update(image);
   }
 
-  update(ui.Image? image) async {
+  Future<void> update(ui.Image? image,
+      {bool Function()? isCurrentSession}) async {
+    if (_disposeIfStale(image, isCurrentSession)) return;
     if (_image == null && image != null) {
       if (isDesktop || isWebDesktop) {
         await parent.target?.canvasModel.updateViewStyle();
@@ -1941,9 +1977,17 @@ class ImageModel with ChangeNotifier {
         await initializeCursorAndCanvas(parent.target!);
       }
     }
+    if (_disposeIfStale(image, isCurrentSession)) return;
     _image?.dispose();
     _image = image;
     if (image != null) notifyListeners();
+  }
+
+  bool _disposeIfStale(ui.Image? image, bool Function()? isCurrentSession) {
+    if (image == null || isCurrentSession == null) return false;
+    if (isCurrentSession()) return false;
+    image.dispose();
+    return true;
   }
 
   // mobile only
@@ -3816,6 +3860,15 @@ class FFI {
         onEvent2UIRgba();
         imageModel.onRgba(display, data);
       });
+      platformFFI.setVideoFrameCallback((int display, ui.Image image,
+          bool Function() isCurrentSession) async {
+        if (!isCurrentSession()) {
+          image.dispose();
+          return;
+        }
+        await onEvent2UIRgba();
+        await imageModel.onImage(display, image, isCurrentSession);
+      });
       this.id = id;
       return;
     }
@@ -3903,7 +3956,7 @@ class FFI {
     this.id = id;
   }
 
-  void onEvent2UIRgba() async {
+  Future<void> onEvent2UIRgba() async {
     if (ffiModel.waitForImageDialogShow.isTrue) {
       ffiModel.waitForImageDialogShow.value = false;
       ffiModel.waitForImageTimer?.cancel();
@@ -3911,14 +3964,32 @@ class FFI {
     }
     if (ffiModel.waitForFirstImage.value == true) {
       ffiModel.waitForFirstImage.value = false;
+      ffiModel.cancelPendingRestoreTimer();
       ffiModel.resetRestartReconnectState();
       dialogManager.dismissAll();
-      await canvasModel.updateViewStyle();
-      await canvasModel.updateScrollStyle();
-      await canvasModel.initializeEdgeScrollEdgeThickness();
-      for (final cb in imageModel.callbacksOnFirstImage) {
-        cb(id);
+      try {
+        await canvasModel.updateViewStyle();
+        await canvasModel.updateScrollStyle();
+        await canvasModel.initializeEdgeScrollEdgeThickness();
+        for (final cb in imageModel.callbacksOnFirstImage) {
+          cb(id);
+        }
+      } finally {
+        _applyPendingMonitorRestore();
       }
+    }
+  }
+
+  void _applyPendingMonitorRestore() {
+    final restore = ffiModel.pendingMonitorRestore;
+    ffiModel._cancelPendingMonitorRestore();
+    if (restore == null || closed) return;
+    // The display list may have changed since the restore was queued.
+    final displays = ffiModel.pi.displays;
+    if ((restore == kAllDisplayValue && displays.isNotEmpty) ||
+        (restore >= 0 && restore < displays.length)) {
+      openMonitorInTheSameTab(restore, this, ffiModel.pi,
+          recordSelection: false, updateCursorPos: false);
     }
   }
 
@@ -3941,6 +4012,9 @@ class FFI {
   /// Close the remote session.
   Future<void> close({bool closeSession = true}) async {
     closed = true;
+    if (isWeb) {
+      platformFFI.clearVideoFrameCallback();
+    }
     chatModel.close();
     // Close all terminal models
     for (final model in _terminalModels.values) {

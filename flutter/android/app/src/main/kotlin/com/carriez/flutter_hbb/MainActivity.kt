@@ -106,6 +106,16 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         Log.e(logTag, "onDestroy")
+        // The process can outlive the UI whenever something keeps it alive:
+        // MainService, or the accessibility InputService on its own. Only the
+        // former gets onTaskRemoved, so close outgoing sessions here too,
+        // otherwise a session survives with no UI left to close it.
+        // `isFinishing` distinguishes the user really leaving from a destroy
+        // for recreation (configuration change, "don't keep activities"),
+        // which must not tear down a live session.
+        if (isFinishing) {
+            FFI.closeAllSessions()
+        }
         mainService?.let {
             unbindService(serviceConnection)
         }
@@ -200,12 +210,13 @@ class MainActivity : FlutterActivity() {
                 "stop_input" -> {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                         InputService.ctx?.disableSelf()
+                    } else {
+                        InputService.ctx = null
+                        Companion.flutterMethodChannel?.invokeMethod(
+                            "on_state_changed",
+                            mapOf("name" to "input", "value" to InputService.isOpen.toString())
+                        )
                     }
-                    InputService.ctx = null
-                    Companion.flutterMethodChannel?.invokeMethod(
-                        "on_state_changed",
-                        mapOf("name" to "input", "value" to InputService.isOpen.toString())
-                    )
                     result.success(true)
                 }
                 "cancel_notification" -> {

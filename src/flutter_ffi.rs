@@ -12,9 +12,6 @@ use crate::{
     ui_interface::{self, *},
 };
 use flutter_rust_bridge::{StreamSink, SyncReturn};
-#[cfg(feature = "plugin_framework")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use hbb_common::allow_err;
 use hbb_common::{
     config::{self, LocalConfig, PeerConfig, PeerInfoSerde},
     fs, lazy_static, log,
@@ -1026,7 +1023,7 @@ pub fn main_set_option(key: String, value: String) {
         set_option(key, value.clone());
         #[cfg(target_os = "android")]
         crate::rendezvous_mediator::RendezvousMediator::restart();
-        #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::common::test_rendezvous_server();
     } else {
         set_option(key, value.clone());
@@ -1224,9 +1221,14 @@ pub fn main_set_local_option(key: String, value: String) {
     let is_texture_render_key = key.eq(config::keys::OPTION_TEXTURE_RENDER);
     let is_d3d_render_key = key.eq(config::keys::OPTION_ALLOW_D3D_RENDER);
     set_local_option(key, value.clone());
+    let is_render_target =
+        |session: &crate::flutter::FlutterSession| session.is_default() || session.is_view_camera();
     if is_texture_render_key {
         let session_event = [("v", &value)];
         for session in sessions::get_sessions() {
+            if !is_render_target(&session) {
+                continue;
+            }
             session.push_event("use_texture_render", &session_event, &[]);
             session.use_texture_render_changed();
             session.ui_handler.update_use_texture_render();
@@ -1234,6 +1236,9 @@ pub fn main_set_local_option(key: String, value: String) {
     }
     if is_d3d_render_key {
         for session in sessions::get_sessions() {
+            if !is_render_target(&session) {
+                continue;
+            }
             session.update_supported_decodings();
         }
     }
@@ -2514,180 +2519,6 @@ pub fn send_url_scheme(_url: String) {
     std::thread::spawn(move || crate::handle_url_scheme(_url));
 }
 
-#[inline]
-pub fn plugin_event(_id: String, _peer: String, _event: Vec<u8>) {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        allow_err!(crate::plugin::handle_ui_event(&_id, &_peer, &_event));
-    }
-}
-
-pub fn plugin_register_event_stream(_id: String, _event2ui: StreamSink<EventToUI>) {
-    #[cfg(feature = "plugin_framework")]
-    {
-        crate::plugin::native_handlers::session::session_register_event_stream(_id, _event2ui);
-    }
-}
-
-#[inline]
-pub fn plugin_get_session_option(
-    _id: String,
-    _peer: String,
-    _key: String,
-) -> SyncReturn<Option<String>> {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        SyncReturn(crate::plugin::PeerConfig::get(&_id, &_peer, &_key))
-    }
-    #[cfg(any(
-        not(feature = "plugin_framework"),
-        target_os = "android",
-        target_os = "ios"
-    ))]
-    {
-        SyncReturn(None)
-    }
-}
-
-#[inline]
-pub fn plugin_set_session_option(_id: String, _peer: String, _key: String, _value: String) {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        let _res = crate::plugin::PeerConfig::set(&_id, &_peer, &_key, &_value);
-    }
-}
-
-#[inline]
-pub fn plugin_get_shared_option(_id: String, _key: String) -> SyncReturn<Option<String>> {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        SyncReturn(crate::plugin::ipc::get_config(&_id, &_key).unwrap_or(None))
-    }
-    #[cfg(any(
-        not(feature = "plugin_framework"),
-        target_os = "android",
-        target_os = "ios"
-    ))]
-    {
-        SyncReturn(None)
-    }
-}
-
-#[inline]
-pub fn plugin_set_shared_option(_id: String, _key: String, _value: String) {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        allow_err!(crate::plugin::ipc::set_config(&_id, &_key, _value));
-    }
-}
-
-#[inline]
-pub fn plugin_reload(_id: String) {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        allow_err!(crate::plugin::ipc::reload_plugin(&_id,));
-        allow_err!(crate::plugin::reload_plugin(&_id));
-    }
-}
-
-#[inline]
-pub fn plugin_enable(_id: String, _v: bool) -> SyncReturn<()> {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        allow_err!(crate::plugin::ipc::set_manager_plugin_config(
-            &_id,
-            "enabled",
-            _v.to_string()
-        ));
-        if _v {
-            allow_err!(crate::plugin::load_plugin(&_id));
-        } else {
-            crate::plugin::unload_plugin(&_id);
-        }
-    }
-    SyncReturn(())
-}
-
-pub fn plugin_is_enabled(_id: String) -> SyncReturn<bool> {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        SyncReturn(
-            match crate::plugin::ipc::get_manager_plugin_config(&_id, "enabled") {
-                Ok(Some(enabled)) => bool::from_str(&enabled).unwrap_or(false),
-                _ => false,
-            },
-        )
-    }
-    #[cfg(any(
-        not(feature = "plugin_framework"),
-        target_os = "android",
-        target_os = "ios"
-    ))]
-    {
-        SyncReturn(false)
-    }
-}
-
-pub fn plugin_feature_is_enabled() -> SyncReturn<bool> {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        #[cfg(debug_assertions)]
-        let enabled = true;
-        #[cfg(not(debug_assertions))]
-        let enabled = is_installed();
-        SyncReturn(enabled)
-    }
-    #[cfg(any(
-        not(feature = "plugin_framework"),
-        target_os = "android",
-        target_os = "ios"
-    ))]
-    {
-        SyncReturn(false)
-    }
-}
-
-pub fn plugin_sync_ui(_sync_to: String) {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        if plugin_feature_is_enabled().0 {
-            crate::plugin::sync_ui(_sync_to);
-        }
-    }
-}
-
-pub fn plugin_list_reload() {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        crate::plugin::load_plugin_list();
-    }
-}
-
-pub fn plugin_install(_id: String, _b: bool) {
-    #[cfg(feature = "plugin_framework")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        if _b {
-            if let Err(e) = crate::plugin::install_plugin(&_id) {
-                log::error!("Failed to install plugin '{}': {}", _id, e);
-            }
-        } else {
-            crate::plugin::uninstall_plugin(&_id, true);
-        }
-    }
-}
-
 pub fn is_support_multi_ui_session(version: String) -> SyncReturn<bool> {
     SyncReturn(crate::common::is_support_multi_ui_session(&version))
 }
@@ -3020,6 +2851,16 @@ pub fn main_set_common(_key: String, _value: String) {
     }
 }
 
+pub fn session_set_common(session_id: SessionID, key: String, value: String) {
+    if let Some(s) = sessions::get_session_by_session_id(&session_id) {
+        if key == "continue-insecure-connection"
+        {
+            s.continue_insecure_connection(value == "Y");
+            return;
+        }
+    }
+}
+
 pub fn session_get_common_sync(
     session_id: SessionID,
     key: String,
@@ -3114,6 +2955,16 @@ pub mod server_side {
     #[no_mangle]
     pub unsafe extern "system" fn Java_ffi_FFI_refreshScreen(_env: JNIEnv, _class: JClass) {
         crate::server::video_service::refresh()
+    }
+
+    /// Close outgoing sessions when the UI goes away but the process may not,
+    /// so a session cannot outlive the UI that is able to close it.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_ffi_FFI_closeAllSessions(_env: JNIEnv, _class: JClass) {
+        let closed = crate::flutter::sessions::close_all_sessions();
+        if closed > 0 {
+            log::info!("closed {} outgoing session(s)", closed);
+        }
     }
 
     #[no_mangle]

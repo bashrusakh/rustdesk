@@ -38,7 +38,7 @@ RustDesk primește contribuții de la oricine. Vezi [CONTRIBUTING.md](../docs/CO
 
 ## Dependențe
 
-Versiunile desktop folosesc Flutter sau Sciter (depreciat) pentru interfață; acest ghid este pentru Sciter doar, deoarece este mai ușor și mai prietenos pentru început. Vezi [workflow-ul Windows al fork-ului](../.github/workflows/rustqs-windows-min-test.yml) ca referință actuală pentru compilarea clientului; fișierul este doar o referință la sursă, nu o declarație de lansare sau suport.
+Versiunile desktop folosesc Flutter sau Sciter (depreciat) pentru interfață; acest ghid este pentru Sciter doar, deoarece este mai ușor și mai prietenos pentru început. Vezi [workflow-ul Windows al fork-ului](../.github/workflows/rustqs-windows.yml) ca referință actuală pentru compilarea clientului; fișierul este doar o referință la sursă, nu o declarație de lansare sau suport.
 
 Te rugăm să descarci singur librăria dinamică Sciter.
 
