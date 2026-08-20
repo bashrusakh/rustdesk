@@ -1,4 +1,5 @@
 name: rustqs windows min test
+# deskforge-workflow-identity-guard: v1
 # Workflow сборки rustqs.exe (Flutter Windows) в форке rustdesk.
 # Historical source note: the steps were adapted from build-for-windows-flutter@1.4.7.
 # The current fork source/ref is 1.4.9; active dispatch uses a provider-derived
@@ -10,8 +11,9 @@ name: rustqs windows min test
 # without valid identities fail closed.
 #
 # Запуск из gh:
+# Rollout prerequisite: dispatch only from a verified immutable protected workflow tag; GitHub dispatch ref selection is not atomically SHA-bound.
 #   gh api repos/$REPO/actions/workflows/rustqs-windows.yml/dispatches -X POST \
-#     -f ref=rustqs/workflows -f inputs[workflow_sha]=$SHA -f inputs[enc_payload]=$BLOB
+#     -f 'ref=<verified-immutable-protected-workflow-tag>' -f inputs[workflow_sha]=$SHA -f inputs[enc_payload]=$BLOB
 
 on:
   workflow_dispatch:

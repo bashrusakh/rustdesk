@@ -4,8 +4,9 @@ name: rustqs android min test
 # Historical generator-android.yml reference adapted to the fork contract (enc_payload
 # + L1/L2/L3); local github-build files are reference material only. Сборка одной
 # ABI (arm64-v8a) для min-test. Build-шаги (NDK/cargo-ndk/flutter build apk/пути)
-# требуют доводки на реальных прогонах. Бэкенд диспетчит platform=android сюда и
-# забирает артефакт `rustdesk-min-test-android`.
+# требуют доводки на реальных прогонах. Draft/unavailable: DeskForge does not
+# currently dispatch this workflow; its no-secret `unsupported` gate stops manual
+# execution before secret-bearing jobs.
 #
 # Контракт: единственный build path — authenticated DFP1 enc_payload от API.
 # Direct/manual runs without a valid payload fail closed before checkout/build.
@@ -37,14 +38,26 @@ env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
+  unsupported:
+    permissions: {}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Report unavailable platform
+        shell: bash
+        run: |
+          echo "::error::Android builds are unavailable in DeskForge; only Windows is currently a production capability."
+          exit 1
+
   bridge:
+    needs: unsupported
     uses: ./.github/workflows/bridge.yml
     with:
       enc_payload: ${{ inputs.enc_payload }}
+      workflow_sha: ${{ github.sha }}
     secrets: inherit
 
   build:
-    needs: [bridge]
+    needs: [unsupported, bridge]
     runs-on: ubuntu-24.04
     steps:
       - name: Free Disk Space (Ubuntu)
