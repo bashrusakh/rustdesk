@@ -4,8 +4,9 @@ name: rustqs linux min test
 # Перенос generator-linux.yml в контракт форка (enc_payload + L1/L2/L3), по образцу
 # github-build/rustqs-windows-min-test.yml. Build-шаги Flutter-Linux требуют доводки
 # на реальных прогонах (vcpkg, движок, build.py, упаковка, пути артефактов) — как это
-# делалось для windows-min-test. Бэкенд уже умеет диспетчить platform=linux сюда и
-# забирать артефакт `rustdesk-min-test-linux`.
+# делалось для windows-min-test. Draft/unavailable: DeskForge does not currently
+# dispatch this workflow; its no-secret `unsupported` gate stops manual execution
+# before secret-bearing jobs.
 #
 # Контракт: единственный build path — authenticated DFP1 enc_payload от API.
 # Direct/manual runs without a valid payload fail closed before checkout/build.
@@ -33,14 +34,26 @@ env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
+  unsupported:
+    permissions: {}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Report unavailable platform
+        shell: bash
+        run: |
+          echo "::error::Linux builds are unavailable in DeskForge; only Windows is currently a production capability."
+          exit 1
+
   bridge:
+    needs: unsupported
     uses: ./.github/workflows/bridge.yml
     with:
       enc_payload: ${{ inputs.enc_payload }}
+      workflow_sha: ${{ github.sha }}
     secrets: inherit
 
   build:
-    needs: [bridge]
+    needs: [unsupported, bridge]
     runs-on: ubuntu-24.04
     steps:
       - name: Maximize build space

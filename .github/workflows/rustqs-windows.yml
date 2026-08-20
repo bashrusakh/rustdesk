@@ -1,21 +1,30 @@
 name: rustqs windows min test
+# deskforge-workflow-identity-guard: v1
 # Workflow сборки rustqs.exe (Flutter Windows) в форке rustdesk.
 # Historical source note: the steps were adapted from build-for-windows-flutter@1.4.7.
-# The current fork source/ref is 1.4.9; active dispatch uses authenticated DFP1 only.
+# The current fork source/ref is 1.4.9; active dispatch uses a provider-derived
+# outer workflow SHA and authenticated DFP1 only.
 # (L1 config.rs server+key, L2 allowCustom+custom_.txt, L3 brand+rename exe).
 #
-# Единственный build path: enc_payload — authenticated DFP1 AES-CBC + HMAC
-# envelope from the API. Direct/manual runs without a valid payload fail closed.
+# Единственный build path: provider-derived workflow_sha plus enc_payload —
+# authenticated DFP1 AES-CBC + HMAC envelope from the API. Direct/manual runs
+# without valid identities fail closed.
 #
 # Запуск из gh:
+# Rollout prerequisite: dispatch only from a verified immutable protected workflow tag; GitHub dispatch ref selection is not atomically SHA-bound.
 #   gh api repos/$REPO/actions/workflows/rustqs-windows.yml/dispatches -X POST \
-#     -f ref=rustqs/workflows -f inputs[enc_payload]=$BLOB
+#     -f 'ref=<verified-immutable-protected-workflow-tag>' -f inputs[workflow_sha]=$SHA -f inputs[enc_payload]=$BLOB
 
 on:
   workflow_dispatch:
     inputs:
       enc_payload:
         description: 'Authenticated DFP1 payload from the API; manual runs without it fail closed.'
+        required: false
+        type: string
+        default: ''
+      workflow_sha:
+        description: 'Provider-derived workflow execution SHA; DeskForge sets this internal guard input.'
         required: false
         type: string
         default: ''
@@ -31,10 +40,32 @@ env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
+  verify_workflow_identity:
+    permissions: {}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Verify outer workflow identity
+        shell: bash
+        env:
+          OUTER_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
+          EXECUTION_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$OUTER_WORKFLOW_SHA" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+            echo "::error::outer workflow_sha must be a 40-64 character hexadecimal SHA"
+            exit 1
+          fi
+          if [ "$OUTER_WORKFLOW_SHA" != "$EXECUTION_WORKFLOW_SHA" ]; then
+            echo "::error::outer workflow_sha does not match github.sha"
+            exit 1
+          fi
+
   bridge:
+    needs: verify_workflow_identity
     uses: ./.github/workflows/bridge.yml
     with:
       enc_payload: ${{ inputs.enc_payload }}
+      workflow_sha: ${{ inputs.workflow_sha }}
     secrets: inherit
 
   topmost:
@@ -48,7 +79,7 @@ jobs:
       target_version: Windows10
 
   build:
-    needs: [bridge, topmost]
+    needs: [verify_workflow_identity, bridge, topmost]
     runs-on: windows-2022
     steps:
       # Resolve the authenticated DFP1 build config. The former open-input debug
@@ -58,6 +89,8 @@ jobs:
         env:
           ENC: ${{ inputs.enc_payload }}
           PAYLOAD_KEY: ${{ secrets.WORKFLOW_PAYLOAD_KEY }}
+          OUTER_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
+          EXECUTION_WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
@@ -118,7 +151,24 @@ jobs:
               fi
               rm -rf "$payload_dir"
             }
+            validate_authenticated_workflow_identity() {
+              local decrypted="$1" inner_workflow_sha
+              if ! printf '%s' "$decrypted" | jq -e 'type == "object" and (.workflow_sha | type == "string")' >/dev/null; then
+                echo "::error::authenticated workflow_sha must be a string"
+                exit 1
+              fi
+              inner_workflow_sha=$(printf '%s' "$decrypted" | jq -r '.workflow_sha')
+              if [[ ! "$inner_workflow_sha" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+                echo "::error::authenticated workflow_sha must be a 40-64 character hexadecimal SHA"
+                exit 1
+              fi
+              if [ "$inner_workflow_sha" != "$OUTER_WORKFLOW_SHA" ] || [ "$inner_workflow_sha" != "$EXECUTION_WORKFLOW_SHA" ]; then
+                echo "::error::authenticated workflow_sha does not match outer workflow_sha and github.sha"
+                exit 1
+              fi
+            }
             decrypted=$(decrypt_payload)
+            validate_authenticated_workflow_identity "$decrypted"
             RQS_SERVER=$(printf '%s' "$decrypted" | jq -r '.server // ""')
             RQS_KEY=$(printf '%s' "$decrypted" | jq -r '.key // ""')
             RQS_APP=$(printf '%s' "$decrypted" | jq -r '.app_name // ""')
