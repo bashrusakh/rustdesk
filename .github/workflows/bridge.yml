@@ -10,6 +10,11 @@ on:
         required: false
         type: string
         default: ''
+      workflow_sha:
+        description: 'Provider-derived outer workflow execution SHA from the Windows dispatch guard.'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -48,6 +53,8 @@ jobs:
         env:
           ENC: ${{ inputs.enc_payload }}
           PAYLOAD_KEY: ${{ secrets.WORKFLOW_PAYLOAD_KEY }}
+          OUTER_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
+          EXECUTION_WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           RQS_PAYLOAD_MODE=encrypted
@@ -104,7 +111,44 @@ jobs:
               fi
               rm -rf "$payload_dir"
             }
+            validate_authenticated_workflow_identity() {
+              local decrypted="$1" inner_workflow_sha
+              if ! printf '%s' "$decrypted" | jq -e 'type == "object"' >/dev/null; then
+                echo "::error::authenticated payload must be an object"
+                exit 1
+              fi
+              # Legacy Linux/Android callers are production-disabled; Windows must supply this guard.
+              if [ -z "$OUTER_WORKFLOW_SHA" ]; then
+                if printf '%s' "$decrypted" | jq -e 'has("workflow_sha")' >/dev/null; then
+                  echo "::error::authenticated workflow_sha requires an outer workflow_sha"
+                  exit 1
+                fi
+                return
+              fi
+              if [[ ! "$OUTER_WORKFLOW_SHA" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+                echo "::error::outer workflow_sha must be a 40-64 character hexadecimal SHA"
+                exit 1
+              fi
+              if [ "$OUTER_WORKFLOW_SHA" != "$EXECUTION_WORKFLOW_SHA" ]; then
+                echo "::error::outer workflow_sha does not match github.sha"
+                exit 1
+              fi
+              if ! printf '%s' "$decrypted" | jq -e 'has("workflow_sha") and (.workflow_sha | type == "string")' >/dev/null; then
+                echo "::error::authenticated workflow_sha must be a string"
+                exit 1
+              fi
+              inner_workflow_sha=$(printf '%s' "$decrypted" | jq -r '.workflow_sha')
+              if [[ ! "$inner_workflow_sha" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+                echo "::error::authenticated workflow_sha must be a 40-64 character hexadecimal SHA"
+                exit 1
+              fi
+              if [ "$inner_workflow_sha" != "$OUTER_WORKFLOW_SHA" ] || [ "$inner_workflow_sha" != "$EXECUTION_WORKFLOW_SHA" ]; then
+                echo "::error::authenticated workflow_sha does not match outer workflow_sha and github.sha"
+                exit 1
+              fi
+            }
             decrypted=$(decrypt_payload)
+            validate_authenticated_workflow_identity "$decrypted"
             RQS_VERSION=$(printf '%s' "$decrypted" | jq -r '.version // ""')
             RQS_SOURCE_SHA=$(printf '%s' "$decrypted" | jq -r '.source_sha // ""')
             RQS_WORKFLOW_REPO=$(printf '%s' "$decrypted" | jq -r '.workflow_repo // ""')

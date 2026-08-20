@@ -26,6 +26,7 @@ workflow_names = [
     "rustqs-linux.yml",
     "rustqs-android.yml",
 ]
+workflow_sha_input_workflow_names = {"bridge.yml", "rustqs-windows.yml"}
 bridge_files = (
     "flutter/ios/Runner/bridge_generated.h",
     "flutter/lib/generated_bridge.dart",
@@ -56,6 +57,20 @@ def uses_values(document):
     elif isinstance(document, list):
         for value in document:
             yield from uses_values(value)
+
+
+def local_bridge_callers():
+    callers = []
+    workflows = root / ".github" / "workflows"
+    for workflow in sorted(
+        path for path in workflows.rglob("*")
+        if path.is_file() and path.suffix in {".yml", ".yaml"}
+    ):
+        parsed = yaml.safe_load(workflow.read_text())
+        for job_name, job in (parsed.get("jobs") or {}).items():
+            if isinstance(job, dict) and job.get("uses") == "./.github/workflows/bridge.yml":
+                callers.append((workflow, job_name, job))
+    return callers
 
 
 def bash_contract(workflow):
@@ -89,8 +104,13 @@ for name in workflow_names:
     parsed = yaml.safe_load(text)
     trigger = parsed.get("on", parsed.get(True, {}))
     inputs = trigger.get("workflow_dispatch", trigger.get("workflow_call", {})).get("inputs", {})
-    if set(inputs) != {"enc_payload"}:
-        raise AssertionError(f"{name}: only authenticated enc_payload may be a workflow input, got {set(inputs)!r}")
+    expected_inputs = {"enc_payload", "workflow_sha"} if name in workflow_sha_input_workflow_names else {"enc_payload"}
+    if set(inputs) != expected_inputs:
+        raise AssertionError(f"{name}: unexpected workflow inputs {set(inputs)!r}, want {expected_inputs!r}")
+    if name in workflow_sha_input_workflow_names:
+        workflow_sha_input = inputs["workflow_sha"]
+        if workflow_sha_input.get("type") != "string" or workflow_sha_input.get("default") != "":
+            raise AssertionError(f"{name}: provider-derived outer workflow_sha must be a public string guard input")
     if "Salted__" in text or "RQS_PAYLOAD_MODE=open" in text or "event SHA fallback" in text:
         raise AssertionError(f"{name}: legacy/open/manual fallback remains in active workflow")
     if "manual/direct runs require an authenticated DFP1 payload" not in text:
@@ -220,9 +240,142 @@ for name in workflow_names[1:]:
     if "--verify-bridge" not in restore_contract or "--expected-version" not in restore_contract or 'cp -- "$BRIDGE_ARTIFACT_DIR/$file" "$file"' not in restore_contract:
         raise AssertionError(f"{name}: bridge manifest verification must precede source restoration")
 
+bridge_callers = local_bridge_callers()
+expected_bridge_caller_names = {
+    "rustqs-windows.yml",
+    "rustqs-linux.yml",
+    "rustqs-android.yml",
+}
+discovered_bridge_caller_names = {workflow.name for workflow, _, _ in bridge_callers}
+if discovered_bridge_caller_names != expected_bridge_caller_names:
+    raise AssertionError(
+        "bridge.yml callers changed without an explicit SHA contract: "
+        f"found {discovered_bridge_caller_names!r}, want {expected_bridge_caller_names!r}"
+    )
+for workflow, job_name, job in bridge_callers:
+    call_inputs = job.get("with")
+    if not isinstance(call_inputs, dict) or call_inputs.get("enc_payload") != "${{ inputs.enc_payload }}":
+        raise AssertionError(f"{workflow.name}:{job_name}: bridge must receive the authenticated payload")
+    if workflow.name == "rustqs-windows.yml":
+        if call_inputs.get("workflow_sha") != "${{ inputs.workflow_sha }}":
+            raise AssertionError("rustqs-windows.yml: bridge must receive the outer workflow_sha guard")
+    elif "workflow_sha" in call_inputs:
+        raise AssertionError(f"{workflow.name}:{job_name}: legacy bridge caller must not supply workflow_sha")
+
+if sum(workflow.name == "rustqs-windows.yml" for workflow, _, _ in bridge_callers) != 1:
+    raise AssertionError("rustqs-windows.yml: expected exactly one local bridge caller")
+
+
 windows_jobs = yaml.safe_load((root / ".github" / "workflows" / "rustqs-windows.yml").read_text())["jobs"]
+if next(iter(windows_jobs)) != "verify_workflow_identity":
+    raise AssertionError("rustqs-windows.yml: no-secret workflow identity guard must be the first job")
+verify_workflow_identity = windows_jobs.get("verify_workflow_identity")
+if not isinstance(verify_workflow_identity, dict):
+    raise AssertionError("rustqs-windows.yml: no-secret workflow identity guard is missing")
+if verify_workflow_identity.get("permissions") != {}:
+    raise AssertionError("rustqs-windows.yml: no-secret workflow identity guard must use permissions: {}")
+verify_workflow_identity_text = json.dumps(verify_workflow_identity)
+for forbidden in ("enc_payload", "secrets", "decrypt_payload", "actions/checkout", "checkout"):
+    if forbidden in verify_workflow_identity_text:
+        raise AssertionError(f"rustqs-windows.yml: outer guard must not access {forbidden!r}")
+verify_steps = verify_workflow_identity.get("steps")
+if not isinstance(verify_steps, list) or len(verify_steps) != 1 or not isinstance(verify_steps[0].get("run"), str):
+    raise AssertionError("rustqs-windows.yml: outer guard must be a single shell-only step")
+outer_guard_block = verify_steps[0]["run"]
+if verify_steps[0].get("env") != {
+    "OUTER_WORKFLOW_SHA": "${{ inputs.workflow_sha }}",
+    "EXECUTION_WORKFLOW_SHA": "${{ github.sha }}",
+}:
+    raise AssertionError("rustqs-windows.yml: outer guard must compare inputs.workflow_sha with github.sha")
+for marker in (
+    "^[0-9a-fA-F]{40,64}$",
+    '[ "$OUTER_WORKFLOW_SHA" != "$EXECUTION_WORKFLOW_SHA" ]',
+):
+    if marker not in outer_guard_block:
+        raise AssertionError(f"rustqs-windows.yml: outer guard is missing {marker!r}")
+
+
+def needs_job(job, required):
+    needs = job.get("needs")
+    return needs == required or (isinstance(needs, list) and required in needs)
+
+
+if not needs_job(windows_jobs["bridge"], "verify_workflow_identity"):
+    raise AssertionError("rustqs-windows.yml: secret-bearing bridge must depend on the outer guard")
+if not needs_job(windows_jobs["build"], "verify_workflow_identity"):
+    raise AssertionError("rustqs-windows.yml: secret-bearing build must depend on the outer guard")
 if windows_jobs["topmost"].get("needs") != "bridge":
     raise AssertionError("rustqs-windows.yml: topmost must depend on bridge")
+
+
+def execute_outer_guard(outer_sha, execution_sha):
+    return subprocess.run(
+        ["bash", "-s"],
+        input=outer_guard_block,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "OUTER_WORKFLOW_SHA": outer_sha,
+            "EXECUTION_WORKFLOW_SHA": execution_sha,
+        },
+    )
+
+
+valid_workflow_sha = "a" * 40
+if execute_outer_guard(valid_workflow_sha, valid_workflow_sha).returncode != 0:
+    raise AssertionError("rustqs-windows.yml: matching outer workflow SHA was rejected")
+if execute_outer_guard("b" * 40, valid_workflow_sha).returncode == 0:
+    raise AssertionError("rustqs-windows.yml: outer SHA mismatch reached secret-bearing jobs")
+if execute_outer_guard("not-a-sha", valid_workflow_sha).returncode == 0:
+    raise AssertionError("rustqs-windows.yml: malformed outer SHA was accepted")
+
+
+def resolve_identity_block(workflow):
+    parsed = yaml.safe_load(workflow.read_text())
+    for block, _ in run_blocks_with_shell(parsed):
+        if "validate_authenticated_workflow_identity() {" in block:
+            return block
+    raise AssertionError(f"{workflow.name}: authenticated inner workflow SHA guard is missing")
+
+
+identity_blocks = {}
+for name in workflow_sha_input_workflow_names:
+    workflow = root / ".github" / "workflows" / name
+    text = workflow.read_text()
+    block = resolve_identity_block(workflow)
+    identity_blocks[name] = block
+    decrypt_at = text.index("decrypted=$(decrypt_payload)")
+    validate_at = text.index('validate_authenticated_workflow_identity "$decrypted"', decrypt_at)
+    payload_value_at = min(
+        text.index(marker, validate_at)
+        for marker in ('RQS_SERVER=$(printf', 'RQS_VERSION=$(printf')
+        if marker in text[validate_at:]
+    )
+    for marker in ('>> "$GITHUB_ENV"', "actions/checkout", "git fetch"):
+        if validate_at >= text.index(marker, validate_at):
+            raise AssertionError(f"{name}: inner SHA guard must precede {marker}")
+    if not decrypt_at < validate_at < payload_value_at:
+        raise AssertionError(f"{name}: inner SHA guard must run immediately after decrypt before payload reads")
+    for marker in (
+        "OUTER_WORKFLOW_SHA: ${{ inputs.workflow_sha }}",
+        "EXECUTION_WORKFLOW_SHA: ${{ github.sha }}",
+        'type == "object"',
+        "^[0-9a-fA-F]{40,64}$",
+        '[ "$inner_workflow_sha" != "$OUTER_WORKFLOW_SHA" ]',
+        '[ "$inner_workflow_sha" != "$EXECUTION_WORKFLOW_SHA" ]',
+    ):
+        if marker not in text:
+            raise AssertionError(f"{name}: authenticated inner SHA guard is missing {marker!r}")
+    if name == "bridge.yml":
+        for marker in (
+            '# Legacy Linux/Android callers are production-disabled; Windows must supply this guard.',
+            'if [ -z "$OUTER_WORKFLOW_SHA" ]; then',
+            'has("workflow_sha")',
+            '[ "$OUTER_WORKFLOW_SHA" != "$EXECUTION_WORKFLOW_SHA" ]',
+        ):
+            if marker not in text:
+                raise AssertionError(f"bridge.yml: scoped SHA compatibility guard is missing {marker!r}")
 
 bridge_text = (root / ".github" / "workflows" / "bridge.yml").read_text()
 stage_start = bridge_text.index("- name: Stage generated bridge files")
@@ -299,6 +452,31 @@ def execute_payload_contract(block, encoded, key):
     )
 
 
+def execute_authenticated_inner_sha_guard(block, encoded, key, outer_sha, execution_sha):
+    decrypt_start = block.index("decrypt_payload() {")
+    identity_start = block.index("validate_authenticated_workflow_identity() {", decrypt_start)
+    identity_end = block.index("decrypted=$(decrypt_payload)", identity_start)
+    script = (
+        "set -euo pipefail\n"
+        + block[decrypt_start:identity_start]
+        + block[identity_start:identity_end]
+        + 'decrypted=$(decrypt_payload)\nvalidate_authenticated_workflow_identity "$decrypted"\n'
+    )
+    return subprocess.run(
+        ["bash", "-s"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "ENC": encoded,
+            "PAYLOAD_KEY": key,
+            "OUTER_WORKFLOW_SHA": outer_sha,
+            "EXECUTION_WORKFLOW_SHA": execution_sha,
+        },
+    )
+
+
 for name in workflow_names:
     block = bash_contract(root / ".github" / "workflows" / name)
     valid_key = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM="
@@ -355,6 +533,75 @@ for name in workflow_names:
     legacy_result = execute_payload_contract(block, legacy, payload_key)
     if legacy_result.returncode == 0:
         raise AssertionError(f"{name}: legacy unauthenticated payload was accepted")
+
+
+payload_key = "workflow-contract-key"
+inner_sha = "a" * 40
+
+
+def encrypted_inner_payload(payload):
+    envelope = make_authenticated_payload(payload_key, json.dumps(payload, separators=(",", ":")).encode())
+    return base64.b64encode(envelope).decode()
+
+
+matching = execute_authenticated_inner_sha_guard(
+    identity_blocks["rustqs-windows.yml"],
+    encrypted_inner_payload({"workflow_sha": inner_sha}),
+    payload_key,
+    inner_sha,
+    inner_sha,
+)
+if matching.returncode != 0:
+    raise AssertionError(f"rustqs-windows.yml: matching authenticated inner workflow SHA was rejected: {matching.stderr}")
+for case, payload, outer_sha, execution_sha in (
+    ("missing", {}, inner_sha, inner_sha),
+    ("malformed", {"workflow_sha": "not-a-sha"}, inner_sha, inner_sha),
+    ("outer mismatch", {"workflow_sha": "b" * 40}, inner_sha, inner_sha),
+    ("execution mismatch", {"workflow_sha": inner_sha}, inner_sha, "b" * 40),
+):
+    result = execute_authenticated_inner_sha_guard(
+        identity_blocks["rustqs-windows.yml"],
+        encrypted_inner_payload(payload),
+        payload_key,
+        outer_sha,
+        execution_sha,
+    )
+    if result.returncode == 0:
+        raise AssertionError(f"rustqs-windows.yml: {case} authenticated inner workflow SHA was accepted")
+
+
+legacy_bridge = execute_authenticated_inner_sha_guard(
+    identity_blocks["bridge.yml"], encrypted_inner_payload({}), payload_key, "", inner_sha
+)
+if legacy_bridge.returncode != 0:
+    raise AssertionError(f"bridge.yml: legacy no-SHA caller was rejected: {legacy_bridge.stderr}")
+matching_bridge = execute_authenticated_inner_sha_guard(
+    identity_blocks["bridge.yml"],
+    encrypted_inner_payload({"workflow_sha": inner_sha}),
+    payload_key,
+    inner_sha,
+    inner_sha,
+)
+if matching_bridge.returncode != 0:
+    raise AssertionError(f"bridge.yml: matching authenticated inner workflow SHA was rejected: {matching_bridge.stderr}")
+for case, payload, outer_sha, execution_sha in (
+    ("outer SHA without inner SHA", {}, inner_sha, inner_sha),
+    ("inner SHA without outer SHA", {"workflow_sha": inner_sha}, "", inner_sha),
+    ("malformed outer SHA", {"workflow_sha": inner_sha}, "not-a-sha", inner_sha),
+    ("malformed inner SHA", {"workflow_sha": "not-a-sha"}, inner_sha, inner_sha),
+    ("non-string inner SHA", {"workflow_sha": 1}, inner_sha, inner_sha),
+    ("inner/outer SHA mismatch", {"workflow_sha": "b" * 40}, inner_sha, inner_sha),
+    ("outer/github SHA mismatch", {"workflow_sha": inner_sha}, inner_sha, "b" * 40),
+):
+    result = execute_authenticated_inner_sha_guard(
+        identity_blocks["bridge.yml"],
+        encrypted_inner_payload(payload),
+        payload_key,
+        outer_sha,
+        execution_sha,
+    )
+    if result.returncode == 0:
+        raise AssertionError(f"bridge.yml: {case} was accepted")
 
 
 android_workflow = root / ".github" / "workflows" / "rustqs-android.yml"
