@@ -1,1 +1,16 @@
 * text=auto
+
+# Preserve approved vendor bytes for copied roots whose canonical evidence uses
+# CRLF line endings.
+/third_party/kcp-sys/kcp/.gitignore -text
+/third_party/kcp-sys/kcp/.travis.yml -text
+/third_party/kcp-sys/kcp/README.en.md -text
+/third_party/kcp-sys/kcp/README.md -text
+/third_party/kcp-sys/kcp/ikcp.c -text
+/third_party/kcp-sys/kcp/ikcp.h -text
+/third_party/kcp-sys/kcp/protocol.txt -text
+/third_party/kcp-sys/kcp/test.cpp -text
+/third_party/kcp-sys/kcp/test.h -text
+/third_party/sysinfo/md_doc/sid.md -text
+/third_party/sysinfo/src/windows/sid.rs -text
+/third_party/tao/.changes/readme.md -text
