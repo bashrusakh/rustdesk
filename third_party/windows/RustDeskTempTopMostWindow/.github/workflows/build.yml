@@ -1,0 +1,106 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+        target:
+            description: 'Target'
+            required: true
+            type: string
+            default: 'windows-2022'
+        configuration:
+            description: 'Configuration'
+            required: true
+            type: string
+            default: 'Release'
+        platform:
+            description: 'Platform'
+            required: true
+            type: string
+            default: 'x64'
+        target_version:
+            description: 'TargetVersion'
+            required: true
+            type: string
+            default: 'Windows10'
+
+env:
+  solution_path: TempTopMostWindow.sln
+
+jobs:
+  build:
+    runs-on: ${{ inputs.target }}
+    strategy:
+        fail-fast: false
+    env:
+      dist_dir: TempTopMostWindow_${{ inputs.platform }}
+      dist_file: TempTopMostWindow_${{ inputs.platform }}.zip
+      build_output_dir: ${{ inputs.platform }}/${{ inputs.configuration }}
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build the solution
+        run: |
+          msbuild ${{ env.solution_path }} -p:Configuration=${{ inputs.configuration }} -p:Platform=${{ inputs.platform }} /p:TargetVersion=${{ inputs.target_version }}
+
+      - name: Zip files
+        run: |
+          mkdir -p ${{ env.dist_dir }}
+          mv ./${{ env.build_output_dir }}/Img2Mem.exe ${{ env.dist_dir }}
+          mv ./${{ env.build_output_dir }}/TestApp.exe ${{ env.dist_dir }}
+          mv ./${{ env.build_output_dir }}/TestAppDebug.exe ${{ env.dist_dir }}
+          mv ./${{ env.build_output_dir }}/WindowInjection.dll ${{ env.dist_dir }}
+          mv ./README.md ${{ env.dist_dir }}
+
+          $vswherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswherePath)) {
+            Write-Error "vswhere.exe not found at $vswherePath"
+            exit 1
+          }
+
+          if ("${{ inputs.platform }}" -eq "ARM64") {
+            $runtimeDirs = @(
+              "VC\Tools\**\bin\HostARM64\ARM64",
+              "VC\Tools\**\bin\Hostx64\arm64",
+              "VC\Tools\**\bin\HostX64\arm64"
+            )
+          } else {
+            $runtimeDirs = @(
+              "VC\Tools\**\bin\HostX64\x64",
+              "VC\Tools\**\bin\Hostx64\x64"
+            )
+          }
+
+          function Find-RuntimeDll([string]$dllName) {
+            foreach ($runtimeDir in $runtimeDirs) {
+              $matches = @(& $vswherePath -latest -requires Microsoft.Component.MSBuild -find "$runtimeDir\$dllName")
+              if ($matches.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($matches[-1])) {
+                return $matches[-1]
+              }
+            }
+
+            Write-Error "Unable to locate $dllName for platform ${{ inputs.platform }}. Tried: $($runtimeDirs -join ', ')"
+            exit 1
+          }
+
+          copy (Find-RuntimeDll "msvcp140.dll") ${{ env.dist_dir }}
+          copy (Find-RuntimeDll "vcruntime140.dll") ${{ env.dist_dir }}
+          copy (Find-RuntimeDll "vcruntime140_1.dll") ${{ env.dist_dir }}
+
+          Get-ChildItem ${{ env.dist_dir }} -Recurse -File | ForEach-Object {$filePath = $_.FullName; Write-Output "$($(Get-FileHash -Algorithm SHA256 -Path $filePath).Hash) $filePath" }
+          Compress-Archive -Path ${{ env.dist_dir }}/* -Destination ${{ env.dist_file }}
+          md5sum ${{ env.dist_file }} | tee ${{ env.dist_file }}.checksum_md5
+          sha256sum ${{ env.dist_file }} | tee  ${{ env.dist_file }}.checksum_sha256
+
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+            name: topmostwindow-artifacts-${{ inputs.platform }}
+            path: |
+                ${{ env.dist_file }}
+                ${{ env.dist_file }}.checksum_md5
+                ${{ env.dist_file }}.checksum_sha256

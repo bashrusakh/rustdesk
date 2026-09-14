@@ -1,0 +1,65 @@
+name: release
+
+on:
+  workflow_call:
+    inputs:
+        target:
+            description: 'Target'
+            required: true
+            type: string
+            default: 'windows-2022'
+        configuration:
+            description: 'Configuration'
+            required: true
+            type: string
+            default: 'Release'
+        platform:
+            description: 'Platform'
+            required: true
+            type: string
+            default: 'x64'
+        target_version:
+            description: 'TargetVersion'
+            required: true
+            type: string
+            default: 'Windows10'
+
+concurrency:
+  group: topmostwindow-release-${{ inputs.platform }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      target: ${{ inputs.target }}
+      configuration: ${{ inputs.configuration }}
+      platform: ${{ inputs.platform }}
+      target_version: ${{ inputs.target_version }}
+    strategy:
+        fail-fast: false
+
+  publish:
+    needs: [build]
+    runs-on: ${{ inputs.target }}
+    strategy:
+        fail-fast: false
+    env:
+      dist_file: TempTopMostWindow_${{ inputs.platform }}.zip
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: topmostwindow-artifacts-${{ inputs.platform }}
+          path: .
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v1
+        if: always()
+        with:
+          prerelease: true
+          tag_name: build_github_ci
+          files: |
+            ${{ env.dist_file }}
+            ${{ env.dist_file }}.checksum_md5
+            ${{ env.dist_file }}.checksum_sha256

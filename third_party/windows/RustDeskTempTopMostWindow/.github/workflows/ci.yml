@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_publish:
+    uses: ./.github/workflows/publish.yml
+    with:
+      platform: ${{ matrix.job.platform }}
+      target: ${{ matrix.job.runner }}
+      configuration: ${{ matrix.job.configuration }}
+      target_version: ${{ matrix.job.target_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              runner: windows-2022,
+              platform: x64,
+              configuration: Release,
+              target_version: Windows10,
+            }
+          - {
+              runner: windows-11-arm,
+              platform: ARM64,
+              configuration: Release,
+              target_version: Windows10,
+            }

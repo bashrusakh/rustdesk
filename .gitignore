@@ -56,5 +56,25 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+
+# Phase 3 exact owned sources, including package assets and licenses.
+!third_party/
+!third_party/**
+# Owned third-party source must not re-include generated or local artifacts.
+third_party/**/.DS_Store
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/Pods/
+**/ephemeral/
+third_party/**/.dart_tool/
+third_party/**/.run/
+third_party/**/__pycache__/
+third_party/**/target/
+third_party/**/build/
+third_party/**/.gradle/
+third_party/**/.generated/
+third_party/**/.idea/
+third_party/**/*.vcxproj.user
 # libdrmtap is cloned at build time by build.py (not a submodule)
 /third_party/libdrmtap/

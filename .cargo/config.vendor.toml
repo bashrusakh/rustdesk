@@ -1,0 +1,12 @@
+# Phase 2 Cargo contract: registry crates are resolved from the future local
+# vendor source; git-backed packages are owned as path dependencies in
+# third_party/ and therefore do not need source replacement entries here.
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+
+[net]
+offline = true
