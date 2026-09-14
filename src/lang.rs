@@ -2,6 +2,7 @@ use hbb_common::regex::Regex;
 use std::ops::Deref;
 
 mod ar;
+mod az;
 mod be;
 mod bg;
 mod ca;
@@ -45,11 +46,13 @@ mod th;
 mod tr;
 mod tw;
 mod uk;
+mod ur;
 mod vi;
 mod ta;
 mod ge;
 mod fi;
 mod ml;
+mod gl;
 
 pub const LANGS: &[(&str, &str)] = &[
     ("en", "English"),
@@ -80,8 +83,10 @@ pub const LANGS: &[(&str, &str)] = &[
     ("ko", "한국어"),
     ("kz", "Қазақ"),
     ("uk", "Українська"),
+    ("ur", "اردو"),
     ("fa", "فارسی"),
     ("ca", "Català"),
+    ("gl", "Galego"),
     ("el", "Ελληνικά"),
     ("sv", "Svenska"),
     ("sq", "Shqip"),
@@ -101,6 +106,7 @@ pub const LANGS: &[(&str, &str)] = &[
     ("ml", "മലയാളം"),
     ("hi", "हिंदी"),
     ("gu", "ગુજરાતી"),
+    ("az", "Azərbaycan dili"),
 ];
 
 pub(crate) fn cjk_ui_unavailable() -> bool {
@@ -208,12 +214,15 @@ pub fn translate_locale(name: String, locale: &str) -> String {
         "be" => be::T.deref(),
         "he" => he::T.deref(),
         "hr" => hr::T.deref(),
+        "ur" => ur::T.deref(),
         "sc" => sc::T.deref(),
         "ta" => ta::T.deref(),
         "ge" => ge::T.deref(),
         "ml" => ml::T.deref(),
         "hi" => hi::T.deref(),
         "gu" => gu::T.deref(),
+        "gl" => gl::T.deref(),
+        "az" => az::T.deref(),
         _ => en::T.deref(),
     };
     let (name, placeholder_value) = extract_placeholder(&name);
