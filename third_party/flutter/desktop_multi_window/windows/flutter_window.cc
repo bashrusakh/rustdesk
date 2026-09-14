@@ -11,6 +11,7 @@
 #include "resource.h"
 
 #include <iostream>
+#include <string>
 #include <utility>
 
 #include "include/desktop_multi_window/desktop_multi_window_plugin.h"
@@ -56,6 +57,44 @@ bool IsWindows11OrGreater() {
 }
 
 namespace {
+
+// If the window is resized between the creation of the Flutter surface and the
+// present of the first frame - which is what the PowerToys FancyZones option
+// "Move newly created windows to their last known zone" does - the embedder's
+// resize synchronization enters kResizeStarted and from then on only presents
+// frames that match the new size. A frame already generated for the old size
+// is rejected, nothing schedules a matching one, and the window stays white
+// until a real resize re-enters OnWindowSizeChanged, which resets the resize
+// target and resends the window metrics. That is why minimize/restore heals
+// it; ForceChildRefresh() does the same programmatically.
+// https://github.com/rustdesk/rustdesk/issues/6756
+// https://github.com/flutter/flutter/issues/159630
+//
+// The timer below drives that recovery. Two subtleties, verified against the
+// embedder sources (identical in 3.24.5 and 3.44.0):
+// - FlutterViewController::ForceRedraw() only schedules a frame when NO resize
+//   is pending (resize_status_ == kDone), so it cannot heal the wedge above.
+//   It is kept as a cheap first kick for the case it was designed for: a
+//   window created hidden and shown later, with nothing scheduling a frame.
+// - The SetNextFrameCallback used to detect the first frame fires when a frame
+//   is GENERATED (raster thread), even if the resize gate then rejects its
+//   present. So it must not be the only stop condition: one final
+//   ForceChildRefresh() is issued to guarantee a present at the current size.
+//   Note this premise is not load-bearing, and the redundancy is deliberate:
+//   if the callback in fact only fired on a successful present, then
+//   first_frame_rendered_ would stay false and the timer below would keep
+//   nudging until it healed.
+// This also relies on HandleTopLevelWindowProc not consuming WM_TIMER (no
+// plugin registers a delegate for it today).
+constexpr UINT_PTR kForceRedrawTimerId = 0xFB15;
+constexpr UINT kForceRedrawIntervalMs = 200;
+// Give up eventually (with a log), so a genuinely stuck engine doesn't keep a
+// timer alive forever. 25 * 200ms covers slow starts comfortably.
+constexpr UINT kForceRedrawMaxTries = 25;
+// The first ticks use the cheap ForceRedraw(); later ticks use
+// ForceChildRefresh(), which may block the platform thread for up to 2x100ms
+// per call (each nudge re-enters the 100ms resize wait).
+constexpr UINT kForceRedrawCheapTries = 2;
 
 WindowCreatedCallback _g_window_created_callback = nullptr;
 
@@ -160,6 +199,11 @@ FlutterWindow::FlutterWindow(
     _g_window_created_callback(flutter_controller_.get());
   }
 
+  // See the comment on kForceRedrawTimerId above.
+  flutter_controller_->engine()->SetNextFrameCallback(
+      [this]() { first_frame_rendered_ = true; });
+  SetTimer(window_handle, kForceRedrawTimerId, kForceRedrawIntervalMs, nullptr);
+
   // hide the window when created.
   ShowWindow(window_handle, SW_HIDE);
 }
@@ -248,6 +292,15 @@ LRESULT FlutterWindow::MessageHandler(HWND hwnd, UINT message, WPARAM wparam, LP
     }
     case WM_SHOWWINDOW: {
       if (wparam == TRUE) {
+        // The window is created hidden and shown by the Dart side later, which
+        // may be long after the creation-time force-redraw timer has given up,
+        // and FancyZones moves windows exactly when they are shown. Re-arm the
+        // protection on every show because a frame generated while hidden may
+        // not have been presented (see kForceRedrawTimerId).
+        if (flutter_controller_) {
+          force_redraw_tries_ = 0;
+          SetTimer(hwnd, kForceRedrawTimerId, kForceRedrawIntervalMs, nullptr);
+        }
         EmitEvent("show");
       } else {
         EmitEvent("hide");
@@ -256,6 +309,41 @@ LRESULT FlutterWindow::MessageHandler(HWND hwnd, UINT message, WPARAM wparam, LP
     }
     case WM_FONTCHANGE: {
       flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+    }
+    case WM_TIMER: {
+      if (wparam == kForceRedrawTimerId) {
+        if (!flutter_controller_) {
+          KillTimer(hwnd, kForceRedrawTimerId);
+        } else if (first_frame_rendered_) {
+          // A frame was generated, which does not mean it was presented: if a
+          // resize was pending, the gate rejected it (see the comment on
+          // kForceRedrawTimerId). One child refresh guarantees a present at the
+          // current size. Unconditional because gating it bought nothing: the
+          // WM_SIZE that CreateWindow() sends already arrives before the first
+          // frame, so the flag this used to check was always set by the time we
+          // got here. Doing it unconditionally is safe either way - at worst it
+          // is one extra nudge, and it is cheap once the engine is running.
+          ForceChildRefresh();
+          KillTimer(hwnd, kForceRedrawTimerId);
+        } else if (++force_redraw_tries_ > kForceRedrawMaxTries) {
+          // Not std::cerr: the host process only has a console when started
+          // from one or under a debugger, and this fires on end-user machines.
+          // OutputDebugString is readable with DebugView there.
+          // log_message, not message: that would shadow the MessageHandler
+          // parameter, which MSVC flags as C4457 and /WX makes fatal.
+          const std::string log_message =
+              "rustdesk: Flutter window " + std::to_string(id_) +
+              " did not render its first frame, giving up.\n";
+          OutputDebugStringA(log_message.c_str());
+          KillTimer(hwnd, kForceRedrawTimerId);
+        } else if (force_redraw_tries_ <= kForceRedrawCheapTries) {
+          flutter_controller_->ForceRedraw();
+        } else {
+          ForceChildRefresh();
+        }
+        return 0;
+      }
       break;
     }
     case WM_DESTROY:
@@ -399,6 +487,9 @@ void FlutterWindow::EmitEvent(const char* eventName)
 }
 
 void FlutterWindow::Destroy() {
+  if (window_handle_) {
+    KillTimer(window_handle_, kForceRedrawTimerId);
+  }
   tryInvokeChannelOnDestroy();
   if (window_channel_) {
     window_channel_ = nullptr;

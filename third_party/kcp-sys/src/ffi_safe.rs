@@ -1,7 +1,7 @@
 use crate::{error::Error, ffi::*};
 use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 
 const MTU_SIZE: i32 = 1200;
 
@@ -53,7 +53,7 @@ pub struct Kcp {
     kcp: *mut ikcpcb,
     config: KcpConfig,
     now: Instant,
-    output_cb: Option<Box<dyn Fn(u32, BytesMut) -> Result<(), Error>>>,
+    output_cb: Option<OutputCb>,
 
     _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
 }
@@ -66,9 +66,18 @@ unsafe extern "C" fn ikcp_output(
     kcp: *mut ikcpcb,
     this: *mut ::std::os::raw::c_void,
 ) -> i32 {
-    // convert this to KcpConnection
-    let kcp_connection = &mut *(this as *mut Kcp);
-    assert_eq!(kcp_connection.kcp, kcp);
+    // convert this to KcpConnection. A shared reborrow, not `&mut`: the flush()/update()
+    // caller already holds `&mut Kcp` through the mutex guard, so a second live `&mut`
+    // to the same object would be aliasing UB; `handle_output_callback` only needs `&self`.
+    let kcp_connection = &*(this as *const Kcp);
+    if kcp_connection.kcp != kcp {
+        // Defensive: a mismatched callback context means the packet cannot be routed;
+        // drop it instead of aborting the process (panic = abort in release builds).
+        // Throttled: this runs per packet from inside ikcp_flush, so if the invariant
+        // ever did break it would write a line per outgoing datagram.
+        crate::log_throttle::throttled_log!(error, "kcp output callback context mismatch");
+        return 0;
+    }
 
     let buf = BytesMut::from(std::slice::from_raw_parts(buf as *const u8, len as usize));
 
@@ -104,7 +113,7 @@ impl Kcp {
 
             ret.apply_config()?;
 
-            return Ok(ret);
+            Ok(ret)
         }
     }
 
@@ -112,12 +121,41 @@ impl Kcp {
         self.output_cb = Some(output_cb);
     }
 
+    /// Installs a KCP 2.0 congestion control implementation.
+    ///
+    /// # Safety
+    ///
+    /// KCP stores the provided operations pointer and calls it from C. The caller must ensure the
+    /// `IKCPOPS` value outlives every `Kcp` using it, and that its callbacks preserve KCP's aliasing
+    /// and thread-safety requirements.
+    pub unsafe fn set_congestion_control(
+        &mut self,
+        ops: Option<&'static IKCPOPS>,
+    ) -> Result<(), Error> {
+        let ops = ops.map_or(std::ptr::null(), |ops| ops as *const IKCPOPS);
+        let ret = unsafe { ikcp_setcc(self.kcp, ops) };
+        if ret < 0 {
+            Err(anyhow::anyhow!("setcc failed, return: {}", ret).into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn reset_congestion_control(&mut self) -> Result<(), Error> {
+        let ret = unsafe { ikcp_setcc(self.kcp, std::ptr::null()) };
+        if ret < 0 {
+            Err(anyhow::anyhow!("reset setcc failed, return: {}", ret).into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn handle_input(&mut self, data: &[u8]) -> Result<(), Error> {
         let ret = unsafe { ikcp_input(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
-            return Err(anyhow::anyhow!("input failed, return: {}", ret).into());
+            Err(anyhow::anyhow!("input failed, return: {}", ret).into())
         } else {
-            return Ok(());
+            Ok(())
         }
     }
 
@@ -130,15 +168,19 @@ impl Kcp {
     pub fn next_update_delay_ms(&mut self) -> IUINT32 {
         let current = self.now.elapsed().as_millis() as IUINT32;
         let next = unsafe { ikcp_check(self.kcp, current) };
-        next - current
+        // KCP timestamps are modular u32; ikcp_check returns `current + minimal`, which wraps
+        // below `current` once elapsed-ms crosses the u32 boundary (~49.7 days uptime). A plain
+        // subtraction would panic there under overflow checks; wrapping_sub yields the correct
+        // delay in every build mode.
+        next.wrapping_sub(current)
     }
 
     pub fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
         let ret = unsafe { ikcp_send(self.kcp, data.as_ptr() as *const _, data.len() as _) };
         if ret < 0 {
-            return Err(anyhow::anyhow!("send failed, return: {}", ret).into());
+            Err(anyhow::anyhow!("send failed, return: {}", ret).into())
         } else {
-            return Ok(ret as usize);
+            Ok(ret as usize)
         }
     }
 
@@ -155,12 +197,12 @@ impl Kcp {
     pub fn recv(&mut self, buf: &mut BytesMut) -> Result<(), Error> {
         let ret = unsafe { ikcp_recv(self.kcp, buf.as_mut_ptr() as *mut _, buf.capacity() as _) };
         if ret < 0 {
-            return Err(anyhow::anyhow!("recv failed, return: {}", ret).into());
+            Err(anyhow::anyhow!("recv failed, return: {}", ret).into())
         } else {
             unsafe {
                 buf.set_len(ret as usize);
             }
-            return Ok(());
+            Ok(())
         }
     }
 
@@ -169,8 +211,12 @@ impl Kcp {
     }
 
     pub fn sendwnd(&self) -> i32 {
-        // see IKCP_WND_SND
-        self.config.sndwnd.unwrap_or(32)
+        // KCP's actual window (IKCP_WND_SND = 32 when unset), not the raw config
+        // value: ikcp_wndsize silently ignores non-positive values and keeps its
+        // default, so echoing the config would let sndwnd Some(-1)/Some(0) make
+        // the flow-control comparison `waitsnd() > 2 * sendwnd()` permanently
+        // true and stall sending forever.
+        unsafe { (*self.kcp).snd_wnd as i32 }
     }
 
     fn handle_output_callback(&self, buf: BytesMut) -> Result<(), Error> {
@@ -228,7 +274,7 @@ impl Kcp {
             }
         }
 
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -237,5 +283,49 @@ impl Drop for Kcp {
         unsafe {
             ikcp_release(self.kcp);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_congestion_control_uses_builtin_algorithm() {
+        let mut kcp = Kcp::new(KcpConfig::new(1)).unwrap();
+
+        kcp.reset_congestion_control().unwrap();
+    }
+
+    #[test]
+    fn sendwnd_reports_the_effective_window() {
+        // ikcp_wndsize accepts non-positive values as "keep the default", so a
+        // factory config of Some(-1)/Some(0) passes apply_config while KCP runs
+        // on IKCP_WND_SND = 32. sendwnd() must report what KCP actually uses:
+        // echoing the raw config made `waitsnd() > 2 * sendwnd()` permanently
+        // true and stalled sending forever.
+        for bad in [Some(-1), Some(0), None] {
+            let mut config = KcpConfig::new_turbo(1);
+            config.sndwnd = bad;
+            let kcp = Kcp::new(config).expect("non-positive sndwnd is accepted");
+            assert_eq!(kcp.sendwnd(), 32, "effective default for {bad:?}");
+            assert!(
+                kcp.waitsnd() <= 2 * kcp.sendwnd(),
+                "flow control must be satisfiable on an idle conn ({bad:?})"
+            );
+        }
+
+        let mut config = KcpConfig::new_turbo(1);
+        config.sndwnd = Some(1024);
+        assert_eq!(Kcp::new(config).unwrap().sendwnd(), 1024);
+
+        // Extreme factory value: ikcp_wndsize accepts it, and the flow-control
+        // comparison must still be satisfiable - `2 * sendwnd()` would wrap
+        // negative (or panic under overflow checks) without saturation.
+        let mut config = KcpConfig::new_turbo(1);
+        config.sndwnd = Some(i32::MAX);
+        let kcp = Kcp::new(config).unwrap();
+        assert_eq!(kcp.sendwnd(), i32::MAX);
+        assert!(kcp.waitsnd() <= kcp.sendwnd().saturating_mul(2));
     }
 }

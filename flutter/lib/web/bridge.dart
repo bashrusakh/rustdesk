@@ -762,10 +762,6 @@ class RustdeskImpl {
     throw UnimplementedError("mainGetError");
   }
 
-  bool mainShowOption({required String key, dynamic hint}) {
-    throw UnimplementedError("mainShowOption");
-  }
-
   Future<void> mainSetOption(
       {required String key, required String value, dynamic hint}) {
     js.context.callMethod('setByName', [
@@ -1375,6 +1371,10 @@ class RustdeskImpl {
   Future<void> cmLoginRes(
       {required int connId, required bool res, dynamic hint}) {
     throw UnimplementedError("cmLoginRes");
+  }
+
+  Future<void> cmCloseConnectionWindow({required int connId, dynamic hint}) {
+    throw UnimplementedError("cmCloseConnectionWindow");
   }
 
   Future<void> cmCloseConnection({required int connId, dynamic hint}) {

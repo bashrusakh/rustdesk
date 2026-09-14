@@ -25,6 +25,7 @@ log = "0.4"
 rdev = { path = "../../third_party/rdev" }
 tfc = { path = "../../third_party/tfc" }
 hbb_common = { path = "../hbb_common" }
+base = { path = "../base" }
 
 [features]
 with_serde = ["serde", "serde_derive"]

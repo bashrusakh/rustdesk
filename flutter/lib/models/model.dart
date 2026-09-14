@@ -124,6 +124,8 @@ class FfiModel with ChangeNotifier {
   Timer? _restartReconnectDelayTimer;
   var _reconnects = 1;
   DateTime? _offlineReconnectStartTime;
+  bool _androidDocumentPickerActive = false;
+  bool _androidDocumentPickerInterruptedConnection = false;
   bool _viewOnly = false;
   bool _showMyCursor = false;
   WeakReference<FFI> parent;
@@ -255,6 +257,8 @@ class FfiModel with ChangeNotifier {
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
+    _androidDocumentPickerActive = false;
+    _androidDocumentPickerInterruptedConnection = false;
     resetRestartReconnectState();
     clearPermissions();
     waitForImageTimer?.cancel();
@@ -892,6 +896,17 @@ class FfiModel with ChangeNotifier {
     final text = evt['text'];
     final link = evt['link'];
 
+    // The peer-gone detector reconnects under `restarting-show` rather than an error title, so
+    // it needs naming here too. By its own title, not the type: an explicitly restarted remote
+    // device reaches the same type from a path this change does not touch.
+    if (isAndroid &&
+        _androidDocumentPickerActive &&
+        (title == 'Connection Error' ||
+            (type == 'restarting-show' && title == 'Connecting...'))) {
+      _androidDocumentPickerInterruptedConnection = true;
+      return;
+    }
+
     // Disable relative mouse mode on any error-type message to ensure cursor is released.
     // This includes connection errors, session-ending messages, elevation errors, etc.
     // Safety: releasing pointer lock on errors prevents the user from being stuck.
@@ -908,17 +923,12 @@ class FfiModel with ChangeNotifier {
       enter2FaDialog(sessionId, dialogManager);
     } else if (type == 'input-password') {
       enterPasswordDialog(sessionId, dialogManager);
-    } else if (type == 'session-login' || type == 'session-re-login') {
-      enterUserLoginDialog(sessionId, dialogManager, 'login_linux_tip', true);
-    } else if (type == 'session-login-password') {
-      enterUserLoginAndPasswordDialog(
-          sessionId, dialogManager, 'login_linux_tip', true);
     } else if (type == 'terminal-admin-login') {
       enterUserLoginDialog(
-          sessionId, dialogManager, 'terminal-admin-login-tip', false);
+          sessionId, dialogManager, 'terminal-admin-login-tip');
     } else if (type == 'terminal-admin-login-password') {
       enterUserLoginAndPasswordDialog(
-          sessionId, dialogManager, 'terminal-admin-login-tip', false);
+          sessionId, dialogManager, 'terminal-admin-login-tip');
     } else if (type == 'restarting') {
       // Treat restart messages as reconnect control events. Rust still sends
       // title/text for legacy UI and translation reuse; Flutter keeps the last
@@ -971,6 +981,23 @@ class FfiModel with ChangeNotifier {
   void resetRestartReconnectState() {
     _restartReconnectDelayTimer?.cancel();
     _restartReconnectDelayTimer = null;
+  }
+
+  void beginAndroidDocumentPicker() {
+    if (!isAndroid) return;
+    _androidDocumentPickerActive = true;
+    _androidDocumentPickerInterruptedConnection = false;
+  }
+
+  void endAndroidDocumentPicker() {
+    if (!isAndroid) return;
+    _androidDocumentPickerActive = false;
+    if (!_androidDocumentPickerInterruptedConnection ||
+        parent.target?.closed == true) {
+      return;
+    }
+    _androidDocumentPickerInterruptedConnection = false;
+    reconnect(parent.target!.dialogManager, sessionId, false);
   }
 
   /// Auto-retry check for "Remote desktop is offline" error.
@@ -2213,6 +2240,7 @@ class CanvasModel with ChangeNotifier {
   double _y = 0;
   // image scale
   double _scale = 1.0;
+  bool _locked = false;
   double _devicePixelRatio = 1.0;
   Size _size = Size.zero;
   // the tabbar over the image
@@ -2261,11 +2289,18 @@ class CanvasModel with ChangeNotifier {
   double get x => _x;
   double get y => _y;
   double get scale => _scale;
+  bool get locked => _locked;
   double get devicePixelRatio => _devicePixelRatio;
   Size get size => _size;
   ScrollStyle get scrollStyle => _scrollStyle;
   ViewStyle get viewStyle => _lastViewStyle;
   RxBool get imageOverflow => _imageOverflow;
+
+  void setLocked(bool value) {
+    if (_locked == value) return;
+    _locked = value;
+    notifyListeners();
+  }
 
   _resetScroll() => setScrollPercent(0.0, 0.0);
 
@@ -2495,6 +2530,7 @@ class CanvasModel with ChangeNotifier {
   }
 
   void updateLocalCursor(double x, double y) {
+    if (parent.target?.ffiModel.viewOnly == true) return;
     // If keyboard is not permitted, do not move cursor when mouse is moving.
     if (parent.target != null && parent.target!.ffiModel.keyboard) {
       // Draw cursor if is not desktop.
@@ -2727,6 +2763,7 @@ class CanvasModel with ChangeNotifier {
     _x = 0;
     _y = 0;
     _scale = 1.0;
+    _locked = false;
     _lastViewStyle = ViewStyle.defaultViewStyle();
     _timerMobileFocusCanvasCursor?.cancel();
     _timerMobileRestoreCanvasOffset?.cancel();
@@ -2838,7 +2875,7 @@ class CursorData {
     required this.width,
     required this.height,
   })  : hotx = hotxOrigin * scale,
-        hoty = hotxOrigin * scale;
+        hoty = hotyOrigin * scale;
 
   int _doubleToInt(double v) => (v * 10e6).round().toInt();
 
@@ -3564,6 +3601,18 @@ class QualityMonitorModel with ChangeNotifier {
   bool get show => _show;
   QualityMonitorData get data => _data;
 
+  // Only a WebRTC session on the web names its transport here: web has no
+  // session tab to show it on (the desktop tab's tooltip already does), and
+  // WebRTC is the one path that can be direct or TURN.
+  String? get webrtcTransport {
+    if (!isWeb) return null;
+    final ffiModel = parent.target?.ffiModel;
+    if (ffiModel == null) return null;
+    final streamType = ffiModel.cachedPeerData.streamType;
+    if (!streamType.startsWith('WebRTC')) return null;
+    return ffiModel.direct == false ? '$streamType (TURN)' : streamType;
+  }
+
   checkShowQualityMonitor(SessionID sessionId) async {
     final show = await bind.sessionGetToggleOption(
             sessionId: sessionId, arg: 'show-quality-monitor') ==
@@ -4055,6 +4104,11 @@ class FFI {
     return await platformFFI.invokeMethod(method, arguments);
   }
 
+  Future<T?> invokeMethodWithResult<T>(String method,
+      [dynamic arguments]) async {
+    return await platformFFI.invokeMethodWithResult<T>(method, arguments);
+  }
+
   // Terminal model management
   void registerTerminalModel(int terminalId, TerminalModel model) {
     debugPrint('[FFI] Registering terminal model for terminal $terminalId');
@@ -4159,7 +4213,6 @@ class PeerInfo with ChangeNotifier {
   RxBool isSet = false.obs;
 
   bool get isWayland => platformAdditions[kPlatformAdditionsIsWayland] == true;
-  bool get isHeadless => platformAdditions[kPlatformAdditionsHeadless] == true;
   bool get isInstalled =>
       platform != kPeerPlatformWindows ||
       platformAdditions[kPlatformAdditionsIsInstalled] == true;
