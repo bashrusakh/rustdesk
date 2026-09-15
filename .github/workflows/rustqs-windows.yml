@@ -735,8 +735,12 @@ jobs:
              -e ../../flutter/build/windows/x64/runner/Release/rustdesk.exe
            popd
            mkdir -p ./output
-           src="./libs/portable/target/release/rustdesk-portable-packer.exe"
-           test -f "$src" || { echo "FAIL: expected portable-packer.exe not found at $src"; exit 1; }
+          src="./target/release/rustdesk-portable-packer.exe"
+          if [ ! -f "$src" ]; then
+            # libs/portable is a root-workspace member: cargo writes to the root target/
+            src="./libs/portable/target/release/rustdesk-portable-packer.exe"
+          fi
+          test -f "$src" || { echo "FAIL: portable-packer.exe not found"; find . -name "rustdesk-portable-packer.exe" 2>/dev/null; exit 1; }
            cp "$src" "./output/${APP}.exe"
            ls -lh "./output/"
            echo "L4: ${APP}.exe size = $(stat -c%s "./output/${APP}.exe" 2>/dev/null || wc -c < "./output/${APP}.exe")"
