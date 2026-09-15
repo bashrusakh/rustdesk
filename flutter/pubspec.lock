@@ -400,14 +400,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "12.0.1"
-  external_path:
-    dependency: "direct main"
-    description:
-      name: external_path
-      sha256: "2095c626fbbefe70d5a4afc9b1137172a68ee2c276e51c3c1283394485bea8f4"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.3"
   ffi:
     dependency: "direct main"
     description:
@@ -520,11 +512,9 @@ packages:
   flutter_custom_cursor:
     dependency: "direct main"
     description:
-      name: flutter_custom_cursor
-      sha256: "3850a32ac6de351ccc5e4286b6d94ff70c10abecd44479ea6c5aaea17264285d"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.0.4"
+      path: "../third_party/flutter/flutter_custom_cursor"
+    source: path
+    version: "0.0.3"
   flutter_gpu_texture_renderer:
     dependency: "direct main"
     description:

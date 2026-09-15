@@ -64,12 +64,16 @@ scan_policy:
       tree_sha256: 476240e857a870c0007906c48040af5dbcf289d7abb02c762b2569a66560fb3e
     - path: flutter/desktop_multi_window
       file_count: 115
-      byte_count: 459058
-      tree_sha256: ef200e085a482a94053ce3600048547bff19ac888bf989de889bb647d3317209
+      byte_count: 464526
+      tree_sha256: f77799fe00250019962305a69c528ccbf058250652dcfef3b13b4befa86cbb1d
     - path: flutter/dynamic_layouts
       file_count: 145
       byte_count: 464338
       tree_sha256: e3f178429a4d5c5f1ab4051665edb96c8872e671ed73962a7f5a16dd7f56d0b3
+    - path: flutter/flutter_custom_cursor
+      file_count: 93
+      byte_count: 442745
+      tree_sha256: 5268a96cae5118d4e47a704238a90a8326620d0146955bfa87943d17e071edfb
     - path: flutter/flutter_gpu_texture_renderer
       file_count: 49
       byte_count: 1094561
@@ -84,12 +88,12 @@ scan_policy:
       tree_sha256: db29545c7b22b6c0892305b8dc17ec5ffc8e1e52ca10c01583645983db11daa3
     - path: flutter/window_manager
       file_count: 110
-      byte_count: 679690
-      tree_sha256: 64da790209f6184ddca7380a057039152bcb7853804cc695aadeeffa76282c0b
+      byte_count: 682233
+      tree_sha256: 1bbc460885d2ba1aeb76730c3ab301c0a10788c320c78803c0b6d435de75c9d4
     - path: flutter/window_size
       file_count: 181
-      byte_count: 797361
-      tree_sha256: 20e179647b9a27111df63af28054f37ad084307bf03f5622b03658b417942c1a
+      byte_count: 797943
+      tree_sha256: 5e2b091acc2f526c6d725fa1d4865b6db069aea2596581519eaeceb47875a68e
     - path: windows/RustDeskTempTopMostWindow
       file_count: 25
       byte_count: 261926
@@ -142,10 +146,13 @@ flutter:
     ref: bd6b5b41254e57c5bcece202ebfb234de63e6487
   - package: desktop_multi_window
     path: flutter/desktop_multi_window
-    ref: b47e8385e5a75d38319ad706a64b0ead3108b093
+    ref: 8b774a66671cbb9bcb2631af6ac28f9bdd469ce3
   - package: dynamic_layouts
     path: flutter/dynamic_layouts
     ref: 24cb88413fa5181d949ddacbb30a65d5c459e7d9
+  - package: flutter_custom_cursor
+    path: flutter/flutter_custom_cursor
+    ref: db63b785c38153603e9fb84b50d3ec46f0d7e05e
   - package: flutter_gpu_texture_renderer
     path: flutter/flutter_gpu_texture_renderer
     ref: 08a471bb8ceccdd50483c81cdfa8b81b07b14b87
@@ -158,11 +165,11 @@ flutter:
     ref: f416118d843a7e9ed117c7bb7bdc2deda5a9e86f
   - package: window_manager
     path: flutter/window_manager
-    ref: 85789bfe6e4cfaf4ecc00c52857467fdb7f26879
+    ref: cf4aef0512092fad9344a27ffe1c47ad83269dfc
   - package: window_size
     path: flutter/window_size
     package_path: plugins/window_size
-    ref: eb3964990cf19629c89ff8cb4a37640c7b3d5601
+    ref: 51e67ce047c72b26810b99e8473ddb44612fe356
 windows:
   - name: RustDeskTempTopMostWindow
     path: windows/RustDeskTempTopMostWindow

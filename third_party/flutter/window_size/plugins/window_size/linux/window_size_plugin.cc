@@ -138,6 +138,10 @@ static FlMethodResponse* get_window_info(FlWindowSizePlugin* self) {
   // Get the monitor this window is inside, or the primary monitor if doesn't
   // appear to be in any.
   GdkDisplay* display = get_display(self);
+  if (display == nullptr) {
+    return FL_METHOD_RESPONSE(
+        fl_method_error_response_new(kNoScreenError, nullptr, nullptr));
+  }
   GdkMonitor* monitor_with_window = gdk_display_get_primary_monitor(display);
   int n_monitors = gdk_display_get_n_monitors(display);
   for (int i = 0; i < n_monitors; i++) {
@@ -146,10 +150,22 @@ static FlMethodResponse* get_window_info(FlWindowSizePlugin* self) {
     GdkRectangle frame;
     gdk_monitor_get_geometry(monitor, &frame);
     if ((x >= frame.x && x <= frame.x + frame.width) &&
-        (y >= frame.y && y <= frame.y + frame.width)) {
+        (y >= frame.y && y <= frame.y + frame.height)) {
       monitor_with_window = monitor;
       break;
     }
+  }
+  GdkWindow* gdk_window = gtk_widget_get_window(GTK_WIDGET(window));
+  if (gdk_window != nullptr) {
+    GdkMonitor* monitor_at_window =
+        gdk_display_get_monitor_at_window(display, gdk_window);
+    if (monitor_at_window != nullptr) {
+      monitor_with_window = monitor_at_window;
+    }
+  }
+  if (monitor_with_window == nullptr) {
+    return FL_METHOD_RESPONSE(
+        fl_method_error_response_new(kNoScreenError, nullptr, nullptr));
   }
   fl_value_set_string_take(window_info, kScreenKey,
                            make_monitor_value(monitor_with_window));

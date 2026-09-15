@@ -36,17 +36,29 @@ struct _WindowManagerPlugin {
 
 G_DEFINE_TYPE(WindowManagerPlugin, window_manager_plugin, g_object_get_type())
 
-// Gets the window being controlled.
+// Gets the window being controlled, or nullptr if the view is gone or is not
+// parented to a toplevel window - gtk_widget_get_toplevel() then hands back the
+// widget itself rather than a GtkWindow.
 GtkWindow* get_window(WindowManagerPlugin* self) {
   FlView* view = fl_plugin_registrar_get_view(self->registrar);
   if (view == nullptr)
     return nullptr;
 
-  return GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(view)));
+  GtkWidget* toplevel = gtk_widget_get_toplevel(GTK_WIDGET(view));
+  if (!GTK_IS_WINDOW(toplevel))
+    return nullptr;
+
+  return GTK_WINDOW(toplevel);
 }
 
+// Gets the GdkWindow backing the toplevel. Also nullptr while the toplevel is
+// merely unrealized, so a non-null get_window() is not enough to assume this.
 GdkWindow* get_gdk_window(WindowManagerPlugin* self) {
-  return gtk_widget_get_window(GTK_WIDGET(get_window(self)));
+  GtkWindow* window = get_window(self);
+  if (window == nullptr)
+    return nullptr;
+
+  return gtk_widget_get_window(GTK_WIDGET(window));
 }
 
 static FlMethodResponse* set_as_frameless(WindowManagerPlugin* self,
@@ -816,6 +828,43 @@ static FlMethodResponse* set_brightness(WindowManagerPlugin* self,
   return FL_METHOD_RESPONSE(fl_method_success_response_new(result));
 }
 
+// Methods that stay allowed once the toplevel window is gone.
+//
+// The window can be destroyed while the engine is still running; get_window()
+// then returns nullptr and GTK dereferences it without checking, so every
+// other method is rejected in that state.
+//
+// Exempt are the teardown path (close, destroy, isPreventClose,
+// setPreventClose), ungrabKeyboard - a seat grab outlives the window it was
+// taken on and must still be released - and the two methods that are not about
+// a window at all: setBrightness changes an app-wide GTK setting, and
+// ensureInitialized only answers a handshake without touching anything.
+//
+// grabKeyboard is not exempt: unlike its counterpart it does need the window.
+// Nor is waitUntilReadyToShow, even though it reads like startup: it exists to
+// configure the window, and its own body calls back in through isFullScreen,
+// isMaximized, isMinimized and the setters, all of which need one. Exempting it
+// would only replace this clean error with a confusing one thrown from a nested
+// call.
+//
+// Keyed on that semantics, not on which handlers touch GTK today: blur, dock,
+// undock, isDockable and isDocked are still empty stubs, and exempting them on
+// that basis would bring the crash back the day somebody implements one.
+// https://github.com/rustdesk/rustdesk/issues/15703
+static bool method_survives_window_destruction(const gchar* method) {
+  static const gchar* const kWindowlessMethods[] = {
+      "ensureInitialized", "close",
+      "destroy",           "isPreventClose",
+      "setPreventClose",   "ungrabKeyboard",
+      "setBrightness",
+  };
+  for (size_t i = 0; i < G_N_ELEMENTS(kWindowlessMethods); i++) {
+    if (g_strcmp0(method, kWindowlessMethods[i]) == 0)
+      return true;
+  }
+  return false;
+}
+
 // Called when a method call is received from Flutter.
 static void window_manager_plugin_handle_method_call(
     WindowManagerPlugin* self,
@@ -825,7 +874,12 @@ static void window_manager_plugin_handle_method_call(
   const gchar* method = fl_method_call_get_name(method_call);
   FlValue* args = fl_method_call_get_args(method_call);
 
-  if (g_strcmp0(method, "ensureInitialized") == 0) {
+  if (!method_survives_window_destruction(method) &&
+      get_window(self) == nullptr) {
+    // See method_survives_window_destruction above.
+    response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+        "window_destroyed", "The window has been destroyed", nullptr));
+  } else if (g_strcmp0(method, "ensureInitialized") == 0) {
     g_autoptr(FlValue) result = fl_value_new_bool(true);
     response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
   } else if (g_strcmp0(method, "waitUntilReadyToShow") == 0) {
