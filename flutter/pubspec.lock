@@ -306,6 +306,7 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/dash_chat_2"
+      relative: true
     source: path
     version: "0.0.18"
   dbus:
@@ -336,6 +337,7 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/desktop_multi_window"
+      relative: true
     source: path
     version: "0.1.0"
   device_info_plus:
@@ -374,6 +376,7 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/dynamic_layouts"
+      relative: true
     source: path
     version: "0.0.1+1"
   equatable:
@@ -513,12 +516,14 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/flutter_custom_cursor"
+      relative: true
     source: path
     version: "0.0.3"
   flutter_gpu_texture_renderer:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/flutter_gpu_texture_renderer"
+      relative: true
     source: path
     version: "0.0.1"
   flutter_keyboard_visibility:
@@ -1276,6 +1281,7 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/flutter_texture_rgba_renderer"
+      relative: true
     source: path
     version: "0.0.16"
   timing:
@@ -1314,6 +1320,7 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/uni_links/uni_links"
+      relative: true
     source: path
     version: "0.5.1"
   uni_links_desktop:
@@ -1560,12 +1567,14 @@ packages:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/window_manager"
+      relative: true
     source: path
     version: "0.3.6"
   window_size:
     dependency: "direct main"
     description:
       path: "../third_party/flutter/window_size/plugins/window_size"
+      relative: true
     source: path
     version: "0.1.0"
   xdg_directories:
