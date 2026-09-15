@@ -232,13 +232,13 @@ jobs:
           fi
           GIT_CONFIG_COUNT=1 \
           GIT_CONFIG_KEY_0=http.extraheader \
-          GIT_CONFIG_VALUE_0="Authorization: Bearer ${{ github.token }}" \
+          GIT_CONFIG_VALUE_0="Authorization: basic $(printf 'x-access-token:%s' "${{ github.token }}" | base64 | tr -d '\n\r')" \
             git fetch --no-tags --depth=1 origin "$RQS_SOURCE_SHA"
            git checkout --detach "$RQS_SOURCE_SHA"
            git submodule sync --recursive
            GIT_CONFIG_COUNT=1 \
            GIT_CONFIG_KEY_0=http.extraheader \
-           GIT_CONFIG_VALUE_0="Authorization: Bearer ${{ github.token }}" \
+           GIT_CONFIG_VALUE_0="Authorization: basic $(printf 'x-access-token:%s' "${{ github.token }}" | base64 | tr -d '\n\r')" \
              git submodule update --init --recursive
           expected=$(printf '%s' "$RQS_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')
            actual=$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')
