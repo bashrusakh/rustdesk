@@ -14,3 +14,11 @@
 /third_party/sysinfo/md_doc/sid.md -text
 /third_party/sysinfo/src/windows/sid.rs -text
 /third_party/tao/.changes/readme.md -text
+
+# Owned integrity roots are digested byte-for-byte by
+# scripts/check-flutter-source-ownership.py at their checkout paths. Windows
+# rewrites text files to CRLF under `* text=auto`, which fails every digest
+# there, so keep these roots byte-identical to their blobs on all platforms.
+/third_party/flutter/** -text
+/third_party/windows/RustDeskTempTopMostWindow/** -text
+/third_party/hwcodec/** -text
