@@ -203,6 +203,9 @@ def validate_symlink(path: Path, root: Path, allowed: dict[Path, str]) -> tuple[
     if not is_symlink(path):
         raise ValueError(f"integrity link is not a symlink: {relative_path(path)}")
     target_text = os.readlink(path)
+    if os.name == "nt":
+        # Windows materializes symlink targets with backslashes.
+        target_text = target_text.replace("\\", "/")
     if allowed.get(path) != target_text:
         raise ValueError(f"owned root contains an undeclared or mismatched symlink: {relative_path(path)}")
     target = Path(target_text)
