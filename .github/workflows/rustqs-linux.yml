@@ -342,6 +342,21 @@ jobs:
           chmod 700 "$helper_path"
           printf 'MANIFEST_HELPER_PATH=%s\n' "$helper_path" >> "$GITHUB_ENV"
 
+      # The Linux bundle must always contain custom_.txt when RQS_CUSTOM_TXT_FILE is set,
+      # even when RQS_SOURCE_SHA points at a tree whose build.py predates the fork's
+      # staging (build_flutter_deb calls stage_custom_txt_for_linux_bundle). Preserve the
+      # patcher beside the manifest helper so the source checkout cannot shadow it.
+      - name: Preserve workflow Linux custom_.txt staging patcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_patcher=.github/patches/linux-stage-custom-txt.py
+          patcher_path="${RUNNER_TEMP}/deskforge-linux-stage-custom-txt.py"
+          test -f "$source_patcher" || { echo "::error::workflow-owned custom_.txt staging patcher is missing"; exit 1; }
+          cp -- "$source_patcher" "$patcher_path"
+          chmod 700 "$patcher_path"
+          printf 'LINUX_CUSTOM_TXT_PATCHER=%s\n' "$patcher_path" >> "$GITHUB_ENV"
+
       - name: Checkout source commit
         shell: bash
         run: |
@@ -462,6 +477,18 @@ jobs:
             cp -- "$BRIDGE_ARTIFACT_DIR/$file" "$file"
             test -f "$file" || { echo "::error::restored bridge file is missing from source path: $file"; exit 1; }
           done
+
+      # Ensure the SOURCE tree's build.py stages custom_.txt into the Linux bundle before
+      # packaging. Idempotent when the source already carries the fork staging; fail-closed
+      # when its build.py shape is unknown. Never replaces build.py wholesale.
+      - name: Ensure Linux bundle custom_.txt staging
+        if: env.RQS_CUSTOM_TXT_FILE != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${LINUX_CUSTOM_TXT_PATCHER:-}" || { echo "::error::preserved custom_.txt staging patcher is unavailable"; exit 1; }
+          python3 "$LINUX_CUSTOM_TXT_PATCHER"
+          grep -Fq -- 'stage_custom_txt_for_linux_bundle' build.py || { echo "::error::build.py still lacks the Linux custom_.txt staging helper"; exit 1; }
 
       - name: Build dependencies (apt)
         run: |
