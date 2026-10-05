@@ -37,7 +37,8 @@ BRIDGE_FILES = tuple(
 
 def git_output(*args: str) -> str:
     result = subprocess.run(["git", *args], check=True, capture_output=True, text=True)
-    return result.stdout.strip()
+    # rstrip() (not strip()) keeps the leading status character of submodule status lines intact.
+    return result.stdout.rstrip()
 
 
 def source_tree_sha() -> str:
