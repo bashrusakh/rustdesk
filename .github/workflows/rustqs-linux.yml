@@ -607,7 +607,11 @@ jobs:
            test -f "$deb_source" || { echo "FAIL: expected package not found at $deb_source"; exit 1; }
            if [ -n "${RQS_CUSTOM_TXT_FILE:-}" ]; then
              test -f flutter/build/linux/x64/release/bundle/custom_.txt || { echo "FAIL: custom_.txt is missing from the Linux bundle"; exit 1; }
-             dpkg-deb -c "$deb_source" | grep -Fq -- "./usr/share/rustdesk/custom_.txt" || { echo "FAIL: custom_.txt is missing from the Debian package"; exit 1; }
+             # Capture the full listing first: piping into `grep -q` lets grep exit at the
+             # first match, which gives dpkg-deb's tar a SIGPIPE and fails the pipeline under pipefail.
+             deb_listing_file="$(mktemp)"
+             { dpkg-deb -c "$deb_source" >"$deb_listing_file" && grep -F -- "./usr/share/rustdesk/custom_.txt" "$deb_listing_file" >/dev/null; } || { rm -f -- "$deb_listing_file"; echo "FAIL: custom_.txt is missing from the Debian package"; exit 1; }
+             rm -f -- "$deb_listing_file"
            fi
            cp -- "$deb_source" "$deb_output"
            echo "::notice::DEB: $deb_source → $deb_output"
