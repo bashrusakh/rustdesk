@@ -401,6 +401,38 @@ jobs:
           chmod 700 "$helper_path"
           printf 'MANIFEST_HELPER_PATH=%s\n' "$helper_path" >> "$GITHUB_ENV"
 
+      # libs/portable is a root-workspace member whose build harness is
+      # workflow-owned: requirements.txt pins brotli with hashes (so the L4
+      # `pip3 install --require-hashes` succeeds), generate.py is the
+      # SOURCE_DATE_EPOCH-deterministic revision, and build.rs declares
+      # `rerun-if-changed=app_metadata.toml`. "Checkout source commit" replaces
+      # the whole tree with the target source_sha, whose libs/portable may carry
+      # the bare upstream versions instead (e.g. a bare `brotli` requirement,
+      # which fails --require-hashes). Preserve the workflow-vendored copies
+      # before that checkout so L4 always builds the reviewed harness.
+      - name: Preserve portable harness inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          preserve_dir="${RUNNER_TEMP}/deskforge-portable-harness"
+          if command -v cygpath >/dev/null 2>&1 && [[ "$preserve_dir" == *:* ]]; then
+            preserve_dir=$(cygpath -u "$preserve_dir")
+          fi
+          mkdir -p "$preserve_dir"
+          for rel in libs/portable/requirements.txt libs/portable/generate.py libs/portable/build.rs; do
+            test -f "$rel" || { echo "::error::workflow-owned portable harness file is missing: $rel"; exit 1; }
+            cp -- "$rel" "$preserve_dir/$(basename "$rel")"
+          done
+          requirements_path="$preserve_dir/requirements.txt"
+          generate_path="$preserve_dir/generate.py"
+          build_rs_path="$preserve_dir/build.rs"
+          for preserved in "$requirements_path" "$generate_path" "$build_rs_path"; do
+            test -f "$preserved" || { echo "::error::portable harness preserve failed: $preserved"; exit 1; }
+          done
+          printf 'PORTABLE_REQUIREMENTS_PATH=%s\n' "$requirements_path" >> "$GITHUB_ENV"
+          printf 'PORTABLE_GENERATE_PATH=%s\n' "$generate_path" >> "$GITHUB_ENV"
+          printf 'PORTABLE_BUILD_RS_PATH=%s\n' "$build_rs_path" >> "$GITHUB_ENV"
+
       - name: Checkout source commit
         shell: bash
         run: |
@@ -724,6 +756,20 @@ jobs:
           set -eu
           APP="$RQS_APP_NAME"
           ls flutter/build/windows/x64/runner/Release/ | head
+          # Restore the workflow-owned portable build harness that "Preserve
+          # portable harness inputs" saved before the source checkout. Copying
+          # the preserved copies back into libs/portable/ is the single
+          # mechanism that makes all three consumers see the reviewed harness:
+          # the explicit pip install and generate.py below, plus the nested
+          # `cargo build --locked --release` that generate.py runs (cargo reads
+          # build.rs from the source tree, not from RUNNER_TEMP).
+          test -f "${PORTABLE_REQUIREMENTS_PATH:-}" || { echo "::error::preserved portable requirements.txt is unavailable"; exit 1; }
+          test -f "${PORTABLE_GENERATE_PATH:-}" || { echo "::error::preserved portable generate.py is unavailable"; exit 1; }
+          test -f "${PORTABLE_BUILD_RS_PATH:-}" || { echo "::error::preserved portable build.rs is unavailable"; exit 1; }
+          cp -- "$PORTABLE_REQUIREMENTS_PATH" libs/portable/requirements.txt
+          cp -- "$PORTABLE_GENERATE_PATH" libs/portable/generate.py
+          cp -- "$PORTABLE_BUILD_RS_PATH" libs/portable/build.rs
+          chmod +x libs/portable/generate.py
           pushd libs/portable
           pip3 install --require-hashes -r requirements.txt
           # тот же CLI что вызывает build.py (когда --portable БЕЗ --skip-portable-pack).
