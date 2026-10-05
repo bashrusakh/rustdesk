@@ -33,8 +33,6 @@ env:
 jobs:
   bridge:
     uses: ./.github/workflows/bridge.yml
-    with:
-      enc_payload: ${{ inputs.enc_payload }}
     secrets: inherit
 
   topmost:
