@@ -224,10 +224,12 @@ jobs:
           name: bridge-artifact
           path: ./
 
-      - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@v1
-        with:
-          version: ${{ env.LLVM_VERSION }}
+      - name: Use runner-provided LLVM 20
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\LLVM\bin'
+          Add-Content -Path $env:GITHUB_ENV -Value 'LLVM_PATH=C:\Program Files\LLVM'
+          & 'C:\Program Files\LLVM\bin\clang.exe' --version
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
@@ -368,6 +370,16 @@ jobs:
           ls -lh "./output/"
           echo "L4: ${APP}.exe size = $(stat -c%s "./output/${APP}.exe" 2>/dev/null || wc -c < "./output/${APP}.exe")"
 
+      - name: Dump ALL bindgen outputs
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          find target -name "*_ffi.rs" 2>/dev/null | sort > /tmp/ffi.txt || true
+          echo "=== count: $(wc -l < /tmp/ffi.txt)"
+          cat /tmp/ffi.txt
+          echo "=== sha256 ==="
+          while read -r f; do [ -f "$f" ] && sha256sum "$f"; done < /tmp/ffi.txt
       - name: Upload unsigned
         uses: actions/upload-artifact@v7
         with:
