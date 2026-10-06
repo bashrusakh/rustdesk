@@ -368,6 +368,16 @@ jobs:
           ls -lh "./output/"
           echo "L4: ${APP}.exe size = $(stat -c%s "./output/${APP}.exe" 2>/dev/null || wc -c < "./output/${APP}.exe")"
 
+      - name: Dump ALL bindgen outputs
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          find target -name "*_ffi.rs" 2>/dev/null | sort > /tmp/ffi.txt || true
+          echo "=== count: $(wc -l < /tmp/ffi.txt)"
+          cat /tmp/ffi.txt
+          echo "=== sha256 ==="
+          while read -r f; do [ -f "$f" ] && sha256sum "$f"; done < /tmp/ffi.txt
       - name: Upload unsigned
         uses: actions/upload-artifact@v7
         with:
