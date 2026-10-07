@@ -50,7 +50,6 @@ on:
 
 env:
   RUST_VERSION: "1.75"
-  LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
@@ -224,10 +223,18 @@ jobs:
           name: bridge-artifact
           path: ./
 
-      - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@v1
-        with:
-          version: ${{ env.LLVM_VERSION }}
+      - name: Use runner-provided LLVM and Clang
+        shell: pwsh
+        run: |
+          $llvmRoot = 'C:\Program Files\LLVM'
+          $clang = Join-Path $llvmRoot 'bin\clang.exe'
+          $libclang = Join-Path $llvmRoot 'bin\libclang.dll'
+          if (-not (Test-Path $libclang -PathType Leaf)) {
+            throw "libclang.dll not found at $libclang; the windows runner image no longer ships LLVM where expected"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $llvmRoot 'bin')
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclang"
+          & $clang --version
 
       - name: Install flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
