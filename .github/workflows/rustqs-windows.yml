@@ -498,16 +498,12 @@ jobs:
         run: |
           $llvmRoot = 'C:\Program Files\LLVM'
           $clang = Join-Path $llvmRoot 'bin\clang.exe'
-          if (-not (Test-Path $clang)) {
-            throw "clang.exe not found at $clang; the windows runner image no longer ships LLVM where expected"
+          $libclang = Join-Path $llvmRoot 'bin\libclang.dll'
+          if (-not (Test-Path $libclang -PathType Leaf)) {
+            throw "libclang.dll not found at $libclang; the windows runner image no longer ships LLVM where expected"
           }
-          # The windows runner image preinstalls LLVM (currently 20.1.8) at this
-          # path but does not add it to PATH or set LLVM_PATH. bindgen (libs/scrap)
-          # needs libclang to generate the vpx/aom/yuv FFI bindings; those bindings
-          # were proven byte-identical to the previously pinned LLVM 15.0.6, so the
-          # pinned install is no longer needed. Fail closed if it is ever absent.
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $llvmRoot 'bin')
-          Add-Content -Path $env:GITHUB_ENV -Value "LLVM_PATH=$llvmRoot"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$libclang"
           & $clang --version
 
       - name: Install flutter
