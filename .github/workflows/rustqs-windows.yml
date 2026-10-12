@@ -241,7 +241,11 @@ jobs:
           # Per-field sanity gates (DeskForge #80). Bounds are deliberately basic:
           # decode-proving a PNG and reasonable dimensions/size only.
           rules = {
-              "app-icon.png": (256, 2048, 10 * 1024 * 1024, True, "must be square (used for exe/tray icon resources)"),
+              # app-icon dimension rule lives in ONE layer: the prepare job accepts any
+              # square PNG up to 4096px (format/shape gate only); the build job's
+              # ICO converter owns the final icon constraint (square, 16..256, with
+              # nearest-neighbour downscale to 256 for larger provider icons).
+              "app-icon.png": (4096, 4096, 10 * 1024 * 1024, True, "must be square (used for exe/tray icon resources; larger square icons are downscaled to 256 px for the Windows ICO resources in the build job)"),
               "app-logo.png": (4096, 4096, 10 * 1024 * 1024, False, ""),
               "privacy-screen.png": (4096, 4096, 20 * 1024 * 1024, False, "(renders fullscreen while privacy mode is active)"),
           }
