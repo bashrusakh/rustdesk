@@ -1893,6 +1893,30 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         self.assertFalse(out.exists())
         self.assertFalse(Path(str(out) + ".part").exists())
 
+    def test_watchdog_timeout_stays_retryable(self):
+        # A watchdog aborts the attempt with a timeout, which must stay in the
+        # curl-transient taxonomy: with one retry and no delay the dribbling peer
+        # is contacted twice through two full attempts, then the fetch fails.
+        self.main.trickle_done.clear()
+        before = self.main.snapshot()
+        out, error = self._run(
+            self.main_url + "/trickle-status",
+            policy=self.policy,
+            max_time=1.0,
+            retries=1,
+            retry_delay=0.0,
+        )
+        self.assertIsNotNone(error, "the trickling peer was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
+        self.assertEqual(
+            self.main.snapshot(),
+            (before[0] + 2, before[1] + 2),
+            "a deadline timeout must be retried exactly once",
+        )
+        self._assert_no_output(out)
+
     def test_shell_wrapper_process_bound_is_a_deterministic_backstop(self):
         # The helper cannot interrupt a resolver call that blocks below Python; the
         # wrapper's process-level timeout bounds that case and prints the
