@@ -2770,6 +2770,68 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         self.assertFalse(out.exists(), "a blocked resolver left an output file")
         self.assertFalse(Path(str(out) + ".part").exists())
 
+    def test_resolution_uses_the_current_attempt_budget_not_a_fresh_one(self):
+        # The lookup must be joined with the attempt's *current* remaining budget, not
+        # with a fresh one.  The seam consumes 1.5 s of a 2 s attempt inside the first
+        # hop's resolution phase (the sleep runs before the real _resolve delegates), so
+        # the redirect hop's resolver has well under a second left and blocks on an event
+        # that is never set (on the abandoned daemon thread, exactly as in production).
+        # Current-budget behaviour ends the single attempt at ~2 s; an implementation
+        # that granted the lookup a fresh 2 s budget would take ~3.5 s.  The 2.7 s
+        # assertion sits between the two.  The seam patches the shipped _resolve entry
+        # point and so does not run at all against the pre-fix four-argument _resolve.
+        consumed = []
+        blocked = threading.Event()
+        calls = []
+        real_resolve = self.module._resolve
+        real_getaddrinfo = self.module.socket.getaddrinfo
+
+        def slow_first_resolve(host, port, allow_address, field, watchdog):
+            if not consumed:
+                consumed.append(True)
+                time.sleep(1.5)
+            return real_resolve(host, port, allow_address, field, watchdog)
+
+        def hanging_second_getaddrinfo(host, port, **kwargs):
+            calls.append((host, port))
+            if len(calls) >= 2:
+                blocked.wait()
+            return real_getaddrinfo(host, port, **kwargs)
+
+        self.module._resolve = slow_first_resolve
+        self.module.socket.getaddrinfo = hanging_second_getaddrinfo
+        try:
+            self.main.redirect_port = "http://127.0.0.1/image.png"
+            start = time.monotonic()
+            out, error = self._run(
+                self.main_url + "/redirect-port",
+                policy=self.policy,
+                max_time=2.0,
+                retries=0,
+            )
+            elapsed = time.monotonic() - start
+        finally:
+            self.module._resolve = real_resolve
+            self.module.socket.getaddrinfo = real_getaddrinfo
+            self.main.redirect_port = ""
+        self.assertIsNotNone(error, "the blocked redirect lookup was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
+        self.assertEqual(
+            len(calls),
+            2,
+            "both hops should have reached the resolver (the first hop overran the "
+            "attempt before the redirect hop)",
+        )
+        self.assertLess(
+            elapsed,
+            2.7,
+            "the redirect lookup was granted a fresh budget instead of the attempt's "
+            "remaining one (%.2f s elapsed for a 2 s attempt)" % elapsed,
+        )
+        self._assert_no_output(out)
+
 
 # --------------------------------------------------------------------------- #
 # F4: per-target escaping
