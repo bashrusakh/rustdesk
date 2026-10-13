@@ -204,6 +204,26 @@ def make_png(
     return bytes(out)
 
 
+def png_chunks(data):
+    """Walk a PNG chunk stream (test-side, structural only) -> [(type, payload), ...]."""
+    pos = 8
+    chunks = []
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        chunks.append((ctype, data[pos + 8:pos + 8 + length]))
+        pos += 12 + length
+    return chunks
+
+
+def png_header(data):
+    """Return the IHDR tuple (width, height, depth, color_type, compression, filter, interlace)."""
+    for ctype, payload in png_chunks(data):
+        if ctype == b"IHDR":
+            return struct.unpack(">IIBBBBB", payload)
+    raise AssertionError("PNG has no IHDR chunk")
+
+
 # Adam7 interlace passes as (xstart, ystart, xstep, ystep) (PNG 1.2 8.2).
 _ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
           (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
@@ -1038,6 +1058,155 @@ class PrepareStagingTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# canonical re-encode (download -> decode -> encode -> re-validate -> manifest)
+# --------------------------------------------------------------------------- #
+
+class CanonicalEncodeTests(unittest.TestCase):
+    """prepare_branding_assets must hand consumers a canonical PNG, not the raw download."""
+
+    def setUp(self):
+        self.module = _ValidatorModule.load()
+
+    def _stage(self, name, data):
+        staging = Path(tempfile.mkdtemp(prefix="branding-canonical-"))
+        (staging / name).write_bytes(data)
+        result = run_validator_module([str(staging)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        manifest = json.loads((staging / "branding_manifest.json").read_text())
+        return staging, (staging / name).read_bytes(), manifest["images"][name]
+
+    def test_canonical_output_has_only_ihdr_idat_iend(self):
+        _, canonical, _ = self._stage("app-logo.png", make_png(16, 16, 6, 0))
+        self.assertEqual([t for t, _ in png_chunks(canonical)], [b"IHDR", b"IDAT", b"IEND"])
+
+    def test_interlaced_input_is_accepted_and_emitted_non_interlaced(self):
+        def rgba_fn(x, y):
+            return (
+                (x * 13 + y * 7 + 1) % 256,
+                (x * 3 + y * 11 + 2) % 256,
+                (x * 5 + y * 2 + 3) % 256,
+                (x * 9 + y * 4 + 5) % 256,
+            )
+
+        interlaced = png_bytes(13, 9, 6, 8, rgba_fn, interlace=1)
+        self.assertEqual(png_header(interlaced)[6], 1)
+        _, canonical, entry = self._stage("app-logo.png", interlaced)
+        width, height, depth, color_type, _c, _f, interlace = png_header(canonical)
+        self.assertEqual((width, height, depth, color_type, interlace), (13, 9, 8, 6, 0))
+        self.assertEqual((entry["width"], entry["height"]), (13, 9))
+        self.assertEqual(
+            self.module.load(canonical, "app-logo.png").bgra(),
+            native_bgra(13, 9, 6, 8, rgba_fn),
+        )
+
+    def test_16bit_input_is_accepted_and_emitted_canonical_8bit(self):
+        def rgb16_fn(x, y):
+            return (
+                (x * 4099 + 0x1234) % 65536,
+                (x * 2053 + y * 7 + 0x5678) % 65536,
+                (x * 1031 + y * 11 + 0x9ABC) % 65536,
+            )
+
+        source = png_bytes(5, 3, 2, 16, rgb16_fn)
+        _, canonical, _ = self._stage("app-logo.png", source)
+        width, height, depth, color_type, _c, _f, interlace = png_header(canonical)
+        self.assertEqual((width, height, depth, color_type, interlace), (5, 3, 8, 2, 0))
+        self.assertEqual(
+            self.module.load(canonical, "app-logo.png").bgra(),
+            native_bgra(5, 3, 2, 16, rgb16_fn),
+        )
+
+    def test_16bit_alpha_input_is_emitted_canonical_8bit_rgba(self):
+        def rgba16_fn(x, y):
+            return (
+                (x * 4099 + 0x1234) % 65536,
+                (x * 2053 + y * 7 + 0x5678) % 65536,
+                (x * 1031 + y * 11 + 0x9ABC) % 65536,
+                (x * 97 + y * 13) % 65536,
+            )
+
+        source = png_bytes(5, 3, 6, 16, rgba16_fn)
+        _, canonical, _ = self._stage("app-logo.png", source)
+        width, height, depth, color_type, _c, _f, interlace = png_header(canonical)
+        self.assertEqual((width, height, depth, color_type, interlace), (5, 3, 8, 6, 0))
+        self.assertEqual(
+            self.module.load(canonical, "app-logo.png").bgra(),
+            native_bgra(5, 3, 6, 16, rgba16_fn),
+        )
+
+    def test_alpha_and_dimensions_are_preserved(self):
+        def rgba_fn(x, y):
+            return (200, 100, 50, 0 if (x, y) == (3, 4) else 255)
+
+        source = png_bytes(8, 7, 6, 8, rgba_fn)
+        _, canonical, entry = self._stage("app-logo.png", source)
+        width, height, depth, color_type, _c, _f, interlace = png_header(canonical)
+        self.assertEqual((width, height, depth, color_type, interlace), (8, 7, 8, 6, 0))
+        self.assertEqual((entry["width"], entry["height"]), (8, 7))
+        bgra = self.module.load(canonical, "app-logo.png").bgra()[0]
+        self.assertEqual(bgra[(4 * 8 + 3) * 4 + 3], 0)   # the transparent pixel stays transparent
+        self.assertEqual(bgra[3], 255)                  # an opaque pixel stays opaque
+        self.assertEqual(bgra, native_bgra(8, 7, 6, 8, rgba_fn)[0])
+
+    def test_trns_alpha_is_preserved_as_rgba(self):
+        source = make_png(4, 4, 2, 0, trns=struct.pack(">HHH", 5, 18, 31))
+        _, canonical, _ = self._stage("app-logo.png", source)
+        width, height, depth, color_type, _c, _f, interlace = png_header(canonical)
+        self.assertEqual((width, height, depth, color_type, interlace), (4, 4, 8, 6, 0))
+        self.assertEqual(
+            self.module.load(canonical, "app-logo.png").bgra(),
+            reference_bgra(self.module, source),
+        )
+
+    def test_fully_opaque_truecolor_stays_rgb(self):
+        _, canonical, _ = self._stage("app-logo.png", make_png(6, 5, 2, 0))
+        self.assertEqual(png_header(canonical)[3], 2)
+
+    def test_already_canonical_png_reencodes_idempotently(self):
+        indexed_plte = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+        for label, source in (
+            ("rgba", make_png(9, 5, 6, 3)),
+            ("rgb", make_png(9, 5, 2, 2)),
+            ("indexed", make_png(4, 4, 3, 0, raw=filtered_rows(4, 4, 1, 0, modulo=3), plte=indexed_plte)),
+        ):
+            with self.subTest(label=label):
+                _, once, _ = self._stage("app-logo.png", source)
+                _, twice, _ = self._stage("app-logo.png", once)
+                self.assertEqual(once, twice)
+                self.assertEqual(self.module.encode(self.module.load(once, "app-logo.png")), once)
+
+    def test_corrupt_input_is_rejected_and_staging_left_untouched(self):
+        for label, data in (
+            ("truncated", make_png(omit_iend=True)),
+            ("bad-crc", make_png(corrupt_idat_crc=True)),
+            ("after-iend", make_png(trailing_after_iend=b"JUNKJUNK")),
+            ("trailing", make_png(8, 8, 6, raw=filtered_rows(8, 8, 4, 0) + b"\xAA" * 4096)),
+        ):
+            with self.subTest(label=label):
+                staging = Path(tempfile.mkdtemp(prefix="branding-canonical-bad-"))
+                (staging / "app-logo.png").write_bytes(data)
+                result = run_validator_module([str(staging)])
+                self.assertEqual(result.returncode, 1, label)
+                self.assertIn("::error::", result.stdout, label)
+                self.assertFalse((staging / "branding_manifest.json").exists(), label)
+                self.assertEqual((staging / "app-logo.png").read_bytes(), data, label)
+
+    def test_field_byte_cap_is_still_enforced(self):
+        staging = Path(tempfile.mkdtemp(prefix="branding-canonical-cap-"))
+        (staging / "app-icon.png").write_bytes(b"\x00" * (10 * 1024 * 1024 + 1))  # cap is 10 MiB
+        result = run_validator_module([str(staging)])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exceeds the byte cap", result.stdout)
+        self.assertFalse((staging / "branding_manifest.json").exists())
+
+    def test_load_byte_cap_boundary(self):
+        data = make_png(16, 16, 6, 0)
+        with self.assertRaises(self.module.PngError):
+            self.module.load(data, "x.png", max_bytes=len(data) - 1)
+        self.module.load(data, "x.png", max_bytes=len(data))
+
+
+# --------------------------------------------------------------------------- #
 # F3: fetch-time size cap
 # --------------------------------------------------------------------------- #
 
@@ -1561,6 +1730,31 @@ class BuildConsumerTests(unittest.TestCase):
             "179486104c98c321d91cc7dd807e514531a3d0c3c2756f92e1fe7c1dc8cacb01",
         )
 
+    def test_prepare_then_consumer_icon_ico_is_unchanged(self):
+        # End-to-end: the byte the consumer receives is the canonical re-encode written by
+        # prepare, the manifest digest covers those bytes, and the generated ICO is still the
+        # pinned baseline for the same already-accepted 8-bit non-interlaced fixture.
+        source = make_png(32, 32, 6, 0)
+        staging = Path(tempfile.mkdtemp(prefix="branding-e2e-"))
+        (staging / "app-icon.png").write_bytes(source)
+        prepared = run_validator_module([str(staging)])
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        canonical = (staging / "app-icon.png").read_bytes()
+        manifest = json.loads((staging / "branding_manifest.json").read_text())
+        self.assertEqual(
+            manifest["images"]["app-icon.png"]["sha256"], hashlib.sha256(canonical).hexdigest()
+        )
+        # Ship the validator alongside, exactly as the prepare job does.
+        (staging / "validate_branding_png.py").write_text(validator_source(), encoding="utf-8")
+        repo = make_icon_repo()
+        result = self._run(staging, repo)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((repo / "flutter/assets/icon.png").read_bytes(), canonical)
+        self.assertEqual(
+            hashlib.sha256((repo / "res/icon.ico").read_bytes()).hexdigest(),
+            "179486104c98c321d91cc7dd807e514531a3d0c3c2756f92e1fe7c1dc8cacb01",
+        )
+
     def test_digest_mismatch_fails_closed(self):
         icon = make_png(32, 32, 6, 0)
         logo = make_png(16, 16, 6, 0)
@@ -1652,6 +1846,43 @@ class PrivacyConsumerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(b"g_img", img_cpp)
         self.assertNotEqual(img_cpp, ('#include "pch.h"\n#include "./img.h"\n\n' + self.IMG_CPP).encode())
+
+    def test_prepare_embeds_canonical_privacy_screen(self):
+        # End-to-end: an interlaced provider image is canonicalised by prepare, and the
+        # third-party overlay embeds exactly those canonical bytes (8-bit, non-interlaced).
+        def rgba_fn(x, y):
+            return (
+                (x * 13 + y * 7 + 1) % 256,
+                (x * 3 + y * 11 + 2) % 256,
+                (x * 5 + y * 2 + 3) % 256,
+                (x * 9 + y * 4 + 5) % 256,
+            )
+
+        interlaced = png_bytes(13, 9, 6, 8, rgba_fn, interlace=1)
+        runner_temp = Path(tempfile.mkdtemp(prefix="branding-privacy-e2e-"))
+        artifact = runner_temp / "deskforge-privacy-screen"
+        artifact.mkdir()
+        (artifact / "privacy-screen.png").write_bytes(interlaced)
+        prepared = run_validator_module([str(artifact)])
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        (artifact / "validate_branding_png.py").write_text(validator_source(), encoding="utf-8")
+        canonical = (artifact / "privacy-screen.png").read_bytes()
+        self.assertEqual(png_header(canonical)[6], 0)
+        repo = self._make_repo()
+        result = subprocess.run(
+            ["bash", "-s"], input=self.privacy_shell(), text=True,
+            capture_output=True, cwd=str(repo),
+            env={**os.environ, "RUNNER_TEMP": str(runner_temp)},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        img_cpp = (repo / "third_party/windows/RustDeskTempTopMostWindow/WindowInjection/img.cpp").read_text(encoding="ascii")
+        match = re.search(r"const unsigned char g_img\[\] = \{(.*?)\};", img_cpp, re.DOTALL)
+        self.assertIsNotNone(match)
+        embedded = bytes(int(h, 16) for h in re.findall(r"0x[0-9a-fA-F]{2}", match.group(1)))
+        self.assertEqual(embedded, canonical)
+        self.assertEqual(png_header(embedded)[2], 8)
+        self.assertEqual(png_header(embedded)[3], 6)
+        self.assertEqual(png_header(embedded)[6], 0)
 
     def test_corrupt_png_with_matching_digest_fails_closed(self):
         for name, png in {

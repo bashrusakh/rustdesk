@@ -256,8 +256,9 @@ jobs:
           specification permits for the colour type, either interlace method (none or
           Adam7), bounded and exact decompression of the IDAT stream (never more than the
           scanline byte count the IHDR and interlace layout imply, and neither trailing
-          decompressed nor trailing compressed payload), and a full per-pass
-          scanline/filter traversal canonicalised to 8-bit BGRA for every consumer.
+          decompressed nor trailing compressed payload), a full per-pass scanline/filter
+          traversal canonicalised to 8-bit BGRA, and a canonical 8-bit non-interlaced
+          RGB/RGBA PNG re-encode that every consumer receives instead of the raw download.
           """
 
           import hashlib
@@ -742,10 +743,135 @@ jobs:
               return Png(width, height, color_type, bytes(pixels), plte, trns, transparency)
 
 
+          def _png_chunk(chunk_type, payload):
+              return (
+                  struct.pack(">I", len(payload))
+                  + chunk_type
+                  + payload
+                  + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+              )
+
+
+          def _paeth(a, b, c):
+              p = a + b - c
+              pa = abs(p - a)
+              pb = abs(p - b)
+              pc = abs(p - c)
+              if pa <= pb and pa <= pc:
+                  return a
+              if pb <= pc:
+                  return b
+              return c
+
+
+          def _filter_row(row, previous, bpp, filter_type):
+              filtered = bytearray(len(row))
+              for i in range(len(row)):
+                  a = row[i - bpp] if i >= bpp else 0
+                  b = previous[i]
+                  c = previous[i - bpp] if i >= bpp else 0
+                  if filter_type == 1:
+                      predictor = a
+                  elif filter_type == 2:
+                      predictor = b
+                  elif filter_type == 3:
+                      predictor = (a + b) // 2
+                  elif filter_type == 4:
+                      predictor = _paeth(a, b, c)
+                  else:
+                      predictor = 0
+                  filtered[i] = (row[i] - predictor) & 0xFF
+              return filtered
+
+
+          def _filter_cost(filtered):
+              # Minimum sum of absolute differences (libpng's default heuristic). It is a pure
+              # function of the reconstructed raster, so re-encoding a canonical image reproduces
+              # the same per-scanline filter choices and therefore the same bytes.
+              return sum(value if value < 128 else 256 - value for value in filtered)
+
+
+          def encode(image):
+              """Re-encode a decoded :class:`Png` as a canonical 8-bit non-interlaced PNG.
+
+              Emits only IHDR, IDAT and IEND with correct CRCs and one valid zlib stream, at
+              colour type 2 (RGB) for a fully opaque raster or 6 (RGBA) when the source carried
+              an alpha channel or a tRNS sample, so alpha is preserved. Dimensions are kept
+              exactly. The result is deterministic and idempotent.
+              """
+              width = image.width
+              height = image.height
+              source_channels = _CHANNELS[image.color_type]
+              source_stride = width * source_channels
+              pixels = image.pixels
+              transparency = image.transparency
+              preserve_alpha = image.color_type in (4, 6) or image.trns is not None
+              channels = 4 if preserve_alpha else 3
+              stride = width * channels
+              raster = bytearray(height * stride)
+              for y in range(height):
+                  source_base = y * source_stride
+                  base = y * stride
+                  row_base = y * width
+                  for x in range(width):
+                      sx = source_base + x * source_channels
+                      dx = base + x * channels
+                      if image.color_type == 6:
+                          raster[dx:dx + 3] = pixels[sx:sx + 3]
+                          raster[dx + 3] = pixels[sx + 3]
+                      elif image.color_type == 2:
+                          raster[dx:dx + 3] = pixels[sx:sx + 3]
+                          if preserve_alpha:
+                              raster[dx + 3] = transparency[row_base + x] if transparency is not None else 255
+                      elif image.color_type == 4:
+                          raster[dx] = pixels[sx]
+                          raster[dx + 1] = pixels[sx]
+                          raster[dx + 2] = pixels[sx]
+                          raster[dx + 3] = pixels[sx + 1]
+                      elif image.color_type == 0:
+                          raster[dx] = pixels[sx]
+                          raster[dx + 1] = pixels[sx]
+                          raster[dx + 2] = pixels[sx]
+                          if preserve_alpha:
+                              raster[dx + 3] = transparency[row_base + x] if transparency is not None else 255
+                      else:
+                          index = pixels[sx]
+                          raster[dx] = image.plte[index * 3]
+                          raster[dx + 1] = image.plte[index * 3 + 1]
+                          raster[dx + 2] = image.plte[index * 3 + 2]
+                          if preserve_alpha:
+                              raster[dx + 3] = image.trns[index] if image.trns is not None and index < len(image.trns) else 255
+              raw = bytearray()
+              previous = bytearray(stride)
+              for y in range(height):
+                  row = raster[y * stride:(y + 1) * stride]
+                  best_type = 0
+                  best = _filter_row(row, previous, channels, 0)
+                  best_cost = _filter_cost(best)
+                  for filter_type in range(1, 5):
+                      candidate = _filter_row(row, previous, channels, filter_type)
+                      cost = _filter_cost(candidate)
+                      if cost < best_cost:
+                          best_type = filter_type
+                          best = candidate
+                          best_cost = cost
+                  raw.append(best_type)
+                  raw.extend(best)
+                  previous = row
+              color_type = 6 if preserve_alpha else 2
+              ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+              return (
+                  PNG_SIGNATURE
+                  + _png_chunk(b"IHDR", ihdr)
+                  + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+                  + _png_chunk(b"IEND", b"")
+              )
+
+
           def prepare(staging):
-              """Validate every staged branding image and write branding_manifest.json."""
+              """Canonicalise every staged branding image and write branding_manifest.json."""
               staging = pathlib.Path(staging)
-              images = {}
+              prepared = []
               for name, (max_w, max_h, max_bytes, require_square, square_hint) in _STAGING_RULES.items():
                   path = staging / name
                   if not path.is_file():
@@ -764,9 +890,31 @@ jobs:
                   except PngError as exc:
                       print("::error::" + str(exc))
                       return 1
+                  canonical = encode(image)
+                  # Consumers receive the canonical re-encode, never the raw downloaded bytes, so a
+                  # 16-bit or interlaced source cannot reach the build as-is. The canonical bytes go
+                  # back through the same strict contract (byte cap and dimension gates included)
+                  # before they are staged, so an encoder bug fails closed here instead of shipping.
+                  try:
+                      load(
+                          canonical,
+                          name,
+                          max_width=max_w,
+                          max_height=max_h,
+                          max_bytes=max_bytes,
+                          require_square=require_square,
+                          square_hint=square_hint,
+                      )
+                  except PngError as exc:
+                      print("::error::" + name + " canonical re-encode failed validation: " + str(exc))
+                      return 1
+                  prepared.append((name, path, image, canonical))
+              images = {}
+              for name, path, image, canonical in prepared:
+                  path.write_bytes(canonical)
                   images[name] = {
-                      "sha256": hashlib.sha256(data).hexdigest(),
-                      "bytes": len(data),
+                      "sha256": hashlib.sha256(canonical).hexdigest(),
+                      "bytes": len(canonical),
                       "width": image.width,
                       "height": image.height,
                   }
