@@ -8,9 +8,10 @@ Covers the review findings on the Windows branding workflow:
   F2  one shared structural PNG validator, used by prepare_branding_assets and
       by every consumer (build icon/logo and third-party privacy screen), so any
       branding PNG declared acceptable is structurally whole and decodable;
-  F3  the per-field response cap is bound during transfer, independent of HTTP
-      Content-Length and of the runner's curl version, so an oversized response
-      never reaches the manifest or a downstream consumer;
+  F3  the per-field response cap is bound during transfer by the shipped fetch
+      helper, independent of HTTP Content-Length and of the runner's curl
+      version, so an oversized response never reaches the manifest or a
+      downstream consumer;
   F4  branding text is escaped for each concrete insertion syntax (Windows .rc vs
       TOML basic strings vs interpolated Dart single-quoted literals), so ordinary
       safe punctuation is accepted instead of blanket-rejected;
@@ -20,6 +21,15 @@ Covers the review findings on the Windows branding workflow:
       canonical bytes are bounded by their geometry and pinned by the manifest digest
       instead.
 
+  F6  the branding fetch helper connects only to validated public destinations:
+      each hop is resolved once, a hop whose resolution contains a loopback,
+      private, link-local or other non-public address is refused before any
+      connection is opened, the connection goes to the validated address rather
+      than to the hostname (so nothing can re-resolve between the check and the
+      connect), and every redirect hop repeats the scheme check and the address
+      policy before connecting. A local HTTP fixture plus a policy seam prove
+      the refusals at the connection boundary, not by string validation.
+
 Run with:  python3 tests/test_branding_contract.py
 """
 
@@ -27,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
 import random
@@ -91,6 +102,44 @@ def validator_source() -> str:
         if "class PngError" in body:
             return body
     raise AssertionError("shared validator heredoc not found in the prepare step")
+
+
+def fetcher_source() -> str:
+    for body in _heredocs(_prepare_run()):
+        if "class FetchError" in body and "def fetch_branding_image(" in body:
+            return body
+    raise AssertionError("destination-pinned fetch helper heredoc not found in the prepare step")
+
+
+class _FetcherModule:
+    _module = None
+
+    @classmethod
+    def load(cls):
+        if cls._module is None:
+            directory = Path(tempfile.mkdtemp(prefix="branding-fetcher-"))
+            path = directory / "fetch_branding_image.py"
+            path.write_text(fetcher_source(), encoding="utf-8")
+            spec = importlib.util.spec_from_file_location("deskforge_fetch_branding_image", path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            cls._module = module
+        return cls._module
+
+
+def fixture_address_policy(module):
+    """Permit exactly the fixture address; defer every other address to production."""
+    def policy(address):
+        return str(address) == FIXTURE_ADDRESS or module.is_public_address(address)
+    return policy
+
+
+def fetch_shell_function() -> str:
+    run = _prepare_run()
+    start = run.index("fetch_branding_image() {")
+    end = run.index("fetch_branding_image app_icon_url", start)
+    return run[start:end]
 
 
 class _ValidatorModule:
@@ -1311,202 +1360,379 @@ class CanonicalEncodeTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# F3: fetch-time size cap
+# F3 + F6: destination-pinned fetch boundary
 # --------------------------------------------------------------------------- #
 
-class _OversizeHandler(BaseHTTPRequestHandler):
-    BIG = 4 * 1024 * 1024
+# The local HTTP fixture runs on the machine's loopback interface. The allowed
+# hops in these tests connect to the fixture at 127.0.0.1; the production policy
+# refuses every loopback address, so tests that need an allowed hop inject a
+# policy that additionally permits exactly FIXTURE_ADDRESS and defers every
+# other address (including the 127.0.0.2 redirect target) to the production
+# policy. The connection, redirect, streaming and cap mechanics are real: real
+# sockets, a real HTTP fixture, real chunked and Content-Length bodies, and the
+# shipped helper's real fetch entry point. Only the address-policy layer is
+# simulated for the allowed hops.
+FIXTURE_ADDRESS = "127.0.0.1"
+REFERENCE_PNG = make_png(16, 16, 6, 0)
+
+
+class _FetchServer(socketserver.ThreadingTCPServer):
+    """Threaded HTTP fixture that counts accepted connections and requests."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, address, handler):
+        super().__init__(address, handler)
+        self.lock = threading.Lock()
+        self.connections = 0
+        self.requests = 0
+        self.redirect_ok = ""
+        self.redirect_forbidden = ""
+        self.redirect_ftp = ""
+        self.redirect_loop = ""
+        self.stream_done = threading.Event()
+        self.stream_completed = False
+        self.stream_bytes = 0
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with self.lock:
+            self.connections += 1
+        return conn, addr
+
+    def note_request(self):
+        with self.lock:
+            self.requests += 1
+
+    def snapshot(self):
+        with self.lock:
+            return (self.connections, self.requests)
+
+    def note_stream(self, written, completed):
+        with self.lock:
+            self.stream_bytes = written
+            self.stream_completed = completed
+        self.stream_done.set()
+
+
+class _BrandingFetchHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    CHUNK = 65536
     SMALL = 1024
-    # A body far larger than any per-field cap, sent chunked (no Content-Length) so
-    # the transfer can only be stopped by a client-side bound, never by a declared
-    # length. On the ubuntu-22.04 runner's curl 7.81.0 this endpoint is what proves
-    # the cap is enforced during transfer rather than after a full download.
+    BIG_CL = 4 * 1024 * 1024
     HUGE = 64 * 1024 * 1024
-    BLOCK = 65536
-
-    def _send_chunked(self, total):
-        self.send_response(200)
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-        block = b"A" * self.BLOCK
-        written = 0
-        try:
-            while written < total:
-                self.wfile.write(("%x\r\n" % len(block)).encode() + block + b"\r\n")
-                written += len(block)
-            self.wfile.write(b"0\r\n\r\n")
-        except (BrokenPipeError, ConnectionResetError):
-            # The bounded client closed the stream once the cap was passed.
-            pass
-        self.server.bytes_written = written
-        self.server.completed = written >= total
-
-    def do_GET(self):
-        self.server.request_done.clear()
-        self.server.bytes_written = 0
-        self.server.completed = False
-        self.server.recorder.connected.clear()
-        self.server.recorder.connections = 0
-        try:
-            if self.path == "/big":
-                self._send_chunked(self.BIG)
-            elif self.path == "/huge":
-                self._send_chunked(self.HUGE)
-            elif self.path == "/redirect-ftp":
-                self.send_response(302)
-                self.send_header(
-                    "Location", f"ftp://127.0.0.1:{self.server.recorder.server_address[1]}/x"
-                )
-                self.end_headers()
-            elif self.path == "/chunked-small":
-                body = b"C" * self.SMALL
-                self.send_response(200)
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                self.wfile.write(("%x\r\n" % len(body)).encode() + body + b"\r\n")
-                self.wfile.write(b"0\r\n\r\n")
-            elif self.path == "/small":
-                body = b"C" * self.SMALL
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_error(404)
-        finally:
-            self.server.request_done.set()
 
     def log_message(self, *args):
         pass
 
-
-class _ConnectionRecorder(socketserver.BaseRequestHandler):
-    """Raw TCP listener recording connections to a redirect target.
-
-    Following a redirect to a non-HTTP scheme is only observable as a TCP connect to
-    the redirected host. Recording that connect distinguishes "the client refused to
-    follow the redirect" from "the client followed it and failed later", independently
-    of the curl version's error wording.
-    """
-
-    def handle(self):
-        self.server.connections += 1
-        self.server.connected.set()
+    def _respond(self, body, status=200, headers=()):
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        for name, value in headers:
+            self.send_header(name, value)
+        self.end_headers()
         try:
-            # Answer with an FTP-style error banner so a client that does follow the
-            # redirect fails fast instead of waiting for a client-side timeout.
-            self.request.sendall(b"421 Service not available\r\n")
+            self.wfile.write(body)
         except OSError:
             pass
 
+    def _redirect(self, location):
+        self._respond(b"", status=302, headers=(("Location", location),))
 
-class FetchCapTests(unittest.TestCase):
+    def _stream(self, total, chunked):
+        # A body far larger than any per-field cap. The chunked variant declares no
+        # Content-Length (the transfer can only be stopped by a client-side bound);
+        # the Content-Length variant covers the declared-length shape.
+        self.send_response(200)
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", str(total))
+        self.end_headers()
+        block = b"A" * self.CHUNK
+        written = 0
+        try:
+            while written < total:
+                payload = block[: min(len(block), total - written)]
+                if chunked:
+                    self.wfile.write(b"%x\r\n" % len(payload) + payload + b"\r\n")
+                else:
+                    self.wfile.write(payload)
+                written += len(payload)
+            if chunked:
+                self.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass
+        finally:
+            self.server.note_stream(written, written >= total)
+
+    def do_GET(self):
+        self.server.note_request()
+        if self.path == "/image.png":
+            self._respond(REFERENCE_PNG)
+        elif self.path == "/chunked-small":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            body = b"C" * self.SMALL
+            self.wfile.write(b"%x\r\n" % len(body) + body + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        elif self.path == "/big-cl":
+            self._stream(self.BIG_CL, chunked=False)
+        elif self.path == "/huge":
+            self._stream(self.HUGE, chunked=True)
+        elif self.path == "/redirect-ok":
+            self._redirect(self.server.redirect_ok)
+        elif self.path == "/redirect-forbidden":
+            self._redirect(self.server.redirect_forbidden)
+        elif self.path == "/redirect-ftp":
+            self._redirect(self.server.redirect_ftp)
+        elif self.path == "/loop":
+            self._redirect(self.server.redirect_loop)
+        else:
+            self._respond(b"", status=404)
+
+
+class DestinationPinnedFetchTests(unittest.TestCase):
+    """F6: every connection the fetch boundary makes targets a validated address.
+
+    The production policy is the default. Tests that need an allowed hop inject a
+    policy that permits exactly the fixture address and defers every other
+    address to the production policy, so every refusal below is the production
+    rule. Request and connection counters prove that a refused hop never reached
+    its target.
+    """
+
     @classmethod
     def setUpClass(cls):
-        class _Server(socketserver.ThreadingTCPServer):
-            allow_reuse_address = True
-            daemon_threads = True
-
-        cls.recorder = _Server(("127.0.0.1", 0), _ConnectionRecorder)
-        cls.recorder.connections = 0
-        cls.recorder.connected = threading.Event()
-        cls.server = _Server(("127.0.0.1", 0), _OversizeHandler)
-        cls.server.request_done = threading.Event()
-        cls.server.bytes_written = 0
-        cls.server.completed = False
-        cls.server.recorder = cls.recorder
-        cls.port = cls.server.server_address[1]
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.recorder_thread = threading.Thread(target=cls.recorder.serve_forever, daemon=True)
-        cls.recorder_thread.start()
+        cls.module = _FetcherModule.load()
+        # staticmethod keeps the closure unbound when read back as self.policy.
+        cls.policy = staticmethod(fixture_address_policy(cls.module))
+        cls.main = _FetchServer(("127.0.0.1", 0), _BrandingFetchHandler)
+        cls.ok = _FetchServer(("127.0.0.1", 0), _BrandingFetchHandler)
+        cls.forbidden = _FetchServer(("127.0.0.2", 0), _BrandingFetchHandler)
+        main_port = cls.main.server_address[1]
+        ok_port = cls.ok.server_address[1]
+        forbidden_port = cls.forbidden.server_address[1]
+        cls.main_url = "http://127.0.0.1:%d" % main_port
+        cls.main.redirect_ok = "http://127.0.0.1:%d/image.png" % ok_port
+        cls.main.redirect_forbidden = "http://127.0.0.2:%d/image.png" % forbidden_port
+        cls.main.redirect_ftp = "ftp://127.0.0.1:%d/image.png" % ok_port
+        cls.main.redirect_loop = "%s/loop" % cls.main_url
+        for server in (cls.main, cls.ok, cls.forbidden):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.recorder.shutdown()
-        cls.recorder.server_close()
+        for server in (cls.main, cls.ok, cls.forbidden):
+            server.shutdown()
+            server.server_close()
 
-    @classmethod
-    def fetch_function(cls):
-        run = _prepare_run()
-        start = run.index("fetch_branding_image() {")
-        end = run.index("fetch_branding_image app_icon_url", start)
-        return run[start:end]
-
-    def _fetch(self, path, cap):
+    def _run(self, url, *, cap=1024 * 1024, policy=None, max_redirects=None):
+        """Run the shipped fetch entry point; return (out_path, FetchError or None)."""
         directory = Path(tempfile.mkdtemp(prefix="branding-fetch-"))
         out = directory / "image.png"
-        script = "set -euo pipefail\n" + self.fetch_function() + (
-            'fetch_branding_image app_logo_url "$URL" "$OUT" "$CAP"\n'
+        extra = {}
+        if policy is not None:
+            extra["allow_address"] = policy
+        if max_redirects is not None:
+            extra["max_redirects"] = max_redirects
+        error = None
+        try:
+            self.module.fetch_branding_image("app_logo_url", url, str(out), cap, **extra)
+        except self.module.FetchError as exc:
+            error = exc
+        return out, error
+
+    def _assert_no_output(self, out):
+        self.assertFalse(out.exists(), "a refused fetch left an output file")
+        self.assertFalse(
+            out.with_name(out.name + ".part").exists(),
+            "a refused fetch left a .part file",
         )
-        env = {
-            **os.environ,
-            "URL": f"http://127.0.0.1:{self.port}{path}",
-            "OUT": str(out),
-            "CAP": str(cap),
-        }
-        result = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True, env=env)
-        # Wait for the server-side handler to finish so the recorded stream stats
-        # reflect this fetch rather than a race with the client shutting down.
-        self.assertTrue(self.server.request_done.wait(10), "server never completed the request")
+
+    def _run_shell(self, url, *, cap=1024 * 1024):
+        directory = Path(tempfile.mkdtemp(prefix="branding-fetch-shell-"))
+        out = directory / "image.png"
+        helper = directory / "fetch_branding_image.py"
+        helper.write_text(fetcher_source(), encoding="utf-8")
+        script = (
+            "set -euo pipefail\n"
+            + 'fetcher="' + str(helper) + '"\n'
+            + fetch_shell_function()
+            + 'fetch_branding_image app_logo_url "$URL" "$OUT" "$CAP"\n'
+        )
+        env = {**os.environ, "URL": url, "OUT": str(out), "CAP": str(cap)}
+        result = subprocess.run(
+            ["bash", "-s"], input=script, text=True, capture_output=True, env=env
+        )
         return result, out
 
-    def test_oversized_response_is_rejected_without_leaving_a_file(self):
-        result, out = self._fetch("/big", 1024 * 1024)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("::error::", result.stdout)
-        self.assertFalse(out.exists())
-        self.assertFalse((out.parent / (out.name + ".part")).exists())
+    # 1. direct allowed endpoint -> accepted
+    def test_allowed_endpoint_is_fetched(self):
+        before = self.main.snapshot()
+        out, error = self._run(self.main_url + "/image.png", policy=self.policy)
+        self.assertIsNone(error)
+        self.assertEqual(self.main.snapshot(), (before[0] + 1, before[1] + 1))
+        self.assertEqual(out.read_bytes(), REFERENCE_PNG)
 
-    def test_chunked_oversize_is_bounded_during_transfer(self):
-        # No Content-Length, and a body far above the cap. The fetch must stop the
-        # transfer once the cap is passed instead of downloading the whole stream and
-        # rejecting it afterwards. The server records whether it ever streamed the
-        # complete body: a bounded client makes that impossible.
-        result, out = self._fetch("/huge", 1024 * 1024)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("::error::", result.stdout)
-        self.assertIn("exceeds the per-field byte cap", result.stdout)
-        self.assertFalse(out.exists())
-        self.assertFalse((out.parent / (out.name + ".part")).exists())
+    # 2. direct loopback target -> rejected with no connection
+    def test_direct_loopback_target_is_refused_without_connecting(self):
+        before = self.main.snapshot()
+        out, error = self._run(self.main_url + "/image.png")  # production policy
+        self.assertIsNotNone(error)
+        self.assertIn("non-public address", str(error))
+        self.assertEqual(
+            self.main.snapshot(), before, "a refused loopback hop was still connected to"
+        )
+        self._assert_no_output(out)
+
+    # 3. hostname resolving to a forbidden address -> rejected with no connection
+    def test_hostname_resolving_to_loopback_is_refused_without_connecting(self):
+        before = self.main.snapshot()
+        out, error = self._run("http://localhost:%d/image.png" % self.main.server_address[1])
+        self.assertIsNotNone(error)
+        self.assertIn("localhost", str(error))
+        self.assertIn("non-public address", str(error))
+        self.assertEqual(
+            self.main.snapshot(), before, "the loopback hostname was still connected to"
+        )
+        self._assert_no_output(out)
+
+    # 4. allowed initial endpoint -> redirect to loopback on a different address
+    def test_redirect_to_a_different_loopback_address_is_refused_without_connecting(self):
+        before = self.main.snapshot()
+        forbidden_before = self.forbidden.snapshot()
+        out, error = self._run(self.main_url + "/redirect-forbidden", policy=self.policy)
+        self.assertIsNotNone(error)
+        self.assertIn("127.0.0.2", str(error))
+        self.assertEqual(
+            self.main.snapshot(),
+            (before[0] + 1, before[1] + 1),
+            "the allowed initial hop should be the only connection opened",
+        )
+        self.assertEqual(
+            self.forbidden.snapshot(),
+            forbidden_before,
+            "the refused redirect target (127.0.0.2) received a connection",
+        )
+        self._assert_no_output(out)
+
+    # 5. allowed -> allowed redirect -> accepted
+    def test_allowed_redirect_chain_is_followed(self):
+        before = self.ok.snapshot()
+        out, error = self._run(self.main_url + "/redirect-ok", policy=self.policy)
+        self.assertIsNone(error)
+        self.assertEqual(self.ok.snapshot(), (before[0] + 1, before[1] + 1))
+        self.assertEqual(out.read_bytes(), REFERENCE_PNG)
+
+    # 6. redirect to a non-http(s) scheme -> still rejected
+    def test_redirect_to_a_non_http_scheme_is_refused(self):
+        before = self.ok.snapshot()
+        out, error = self._run(self.main_url + "/redirect-ftp", policy=self.policy)
+        self.assertIsNotNone(error)
+        self.assertIn("http(s)", str(error))
+        self.assertEqual(self.ok.snapshot(), before, "the ftp redirect target was connected to")
+        self._assert_no_output(out)
+
+    # 7. oversized chunked response with no Content-Length -> bounded, refused
+    def test_oversized_chunked_response_is_bounded_during_transfer(self):
+        self.main.stream_done.clear()
+        out, error = self._run(self.main_url + "/huge", cap=1024 * 1024, policy=self.policy)
+        self.assertIsNotNone(error)
+        self.assertIn("exceeds the per-field byte cap", str(error))
+        self._assert_no_output(out)
+        self.assertTrue(self.main.stream_done.wait(10), "the fixture never finished the transfer")
         self.assertFalse(
-            self.server.completed,
+            self.main.stream_completed,
             "the client read the entire oversized chunked body instead of bounding it at fetch time",
         )
         self.assertLess(
-            self.server.bytes_written,
-            _OversizeHandler.HUGE // 2,
+            self.main.stream_bytes,
+            _BrandingFetchHandler.HUGE // 2,
             "the transfer was not cut off near the cap",
         )
 
-    def test_under_cap_content_length_response_is_accepted(self):
-        result, out = self._fetch("/small", 1024 * 1024)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(out.stat().st_size, _OversizeHandler.SMALL)
+    # 8. normal under-cap PNG -> accepted, bytes intact
+    def test_under_cap_png_is_accepted_with_bytes_intact(self):
+        out, error = self._run(self.main_url + "/image.png", cap=1024 * 1024, policy=self.policy)
+        self.assertIsNone(error)
+        data = out.read_bytes()
+        self.assertTrue(data.startswith(PNG_SIGNATURE))
+        self.assertEqual(data, REFERENCE_PNG)
 
     def test_under_cap_chunked_response_is_accepted(self):
-        # The bound must not reject a legitimate body whose length is unknown before
-        # download.
-        result, out = self._fetch("/chunked-small", 1024 * 1024)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(out.stat().st_size, _OversizeHandler.SMALL)
-
-    def test_redirect_to_non_http_scheme_is_not_followed(self):
-        # fetch_branding_image pins both the request and its redirects to http(s). A
-        # provider URL that redirects to ftp://... must not make the runner open the ftp
-        # connection: with the redirect protocol restricted, curl refuses before any
-        # connection, so the recorder sees none. Without the restriction curl follows the
-        # redirect (its default redirect protocol set includes ftp) and connects.
-        result, out = self._fetch("/redirect-ftp", 1024 * 1024)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("::error::", result.stdout)
-        self.assertFalse(out.exists())
-        self.assertFalse(
-            self.server.recorder.connected.wait(1.0),
-            "the fetch followed the provider redirect to a non-HTTP scheme (ftp connection attempted)",
+        # An unknown-length body within the cap must still be accepted: the bound
+        # rejects what is too large, not what is merely undeclared.
+        out, error = self._run(
+            self.main_url + "/chunked-small", cap=1024 * 1024, policy=self.policy
         )
+        self.assertIsNone(error)
+        self.assertEqual(out.read_bytes(), b"C" * _BrandingFetchHandler.SMALL)
+
+    def test_oversized_content_length_response_is_bounded_during_transfer(self):
+        self.main.stream_done.clear()
+        out, error = self._run(self.main_url + "/big-cl", cap=1024 * 1024, policy=self.policy)
+        self.assertIsNotNone(error)
+        self.assertIn("exceeds the per-field byte cap", str(error))
+        self._assert_no_output(out)
+        self.assertTrue(self.main.stream_done.wait(10), "the fixture never finished the transfer")
+        self.assertFalse(
+            self.main.stream_completed,
+            "a declared Content-Length, not the transfer-time cap, bounded the client",
+        )
+
+    def test_redirect_chain_is_capped_and_fails_closed(self):
+        before = self.main.snapshot()
+        out, error = self._run(self.main_url + "/loop", policy=self.policy, max_redirects=2)
+        self.assertIsNotNone(error)
+        self.assertIn("redirects", str(error))
+        self.assertEqual(
+            self.main.snapshot()[1],
+            before[1] + 3,
+            "expected the initial request plus two followed redirects, then a refusal",
+        )
+        self._assert_no_output(out)
+
+    def test_address_policy_refuses_the_documented_non_public_ranges(self):
+        refused = (
+            "0.0.0.1", "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255",
+            "192.168.1.1", "169.254.169.254", "100.64.0.1", "192.0.0.1",
+            "192.0.2.1", "198.18.0.1", "198.51.100.1", "203.0.113.1",
+            "192.88.99.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
+            "::", "::1", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1",
+            "100::1", "2001:db8::1", "2001::1", "2001:2::1", "2001:10::1",
+            "2001:20::1", "64:ff9b::1", "64:ff9b:1::1", "2002::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+        )
+        allowed = (
+            "8.8.8.8", "1.1.1.1", "93.184.216.34", "172.32.0.1", "192.169.0.1",
+            "2606:4700:4700::1111", "::ffff:8.8.8.8",
+        )
+        for address in refused:
+            self.assertFalse(self.module.is_public_address(address), address)
+        for address in allowed:
+            self.assertTrue(self.module.is_public_address(address), address)
+
+    def test_absent_url_is_a_noop_through_the_workflow_shell_wrapper(self):
+        result, out = self._run_shell("")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self._assert_no_output(out)
+
+    def test_workflow_shell_wrapper_refuses_a_loopback_url_end_to_end(self):
+        # The shipped path -- shell wrapper, helper CLI, production policy -- refuses
+        # a loopback URL without connecting to it, and without echoing the URL (it
+        # may be a signed provider URL): only the field and the host are reported.
+        before = self.main.snapshot()
+        result, out = self._run_shell(self.main_url + "/image.png?token=payload-secret")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::app_logo_url", result.stdout)
+        self.assertIn("non-public address", result.stdout)
+        self.assertNotIn("http://", result.stdout)
+        self.assertNotIn("payload-secret", result.stdout)
+        self.assertEqual(self.main.snapshot(), before, "the refused loopback URL was connected to")
+        self._assert_no_output(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -2109,6 +2335,28 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('cp -- "$validator" "$staging/validate_branding_png.py"', windows)
         self.assertIn("validate_branding_png.py", windows)
         self.assertIn("validate_branding_png.py", third)
+
+    def test_branding_fetch_is_destination_pinned_through_the_shipped_helper(self):
+        # The fetch boundary is the shipped helper, not a URL string check: one
+        # authoritative non-public address list, a policy seam defaulting to the
+        # production policy, per-hop pinned connections and TLS on the URL
+        # hostname. Every fetch call site and its per-field cap is unchanged.
+        run = _prepare_run()
+        function = fetch_shell_function()
+        self.assertIn('python3 "$fetcher"', function)
+        self.assertNotIn("curl", function)
+        self.assertIn('fetcher="${RUNNER_TEMP}/fetch_branding_image.py"', run)
+        self.assertIn('chmod 700 "$fetcher"', run)
+        source = fetcher_source()
+        self.assertIn("_NON_PUBLIC_NETWORKS", source)
+        self.assertIn("allow_address=is_public_address", source)
+        self.assertIn("server_hostname", source)
+        for call in (
+            'fetch_branding_image app_icon_url "$RQS_APP_ICON_URL" "$staging/app-icon.png" $((10 * 1024 * 1024))',
+            'fetch_branding_image app_logo_url "$RQS_APP_LOGO_URL" "$staging/app-logo.png" $((10 * 1024 * 1024))',
+            'fetch_branding_image privacy_screen_url "$RQS_PRIVACY_SCREEN_URL" "$staging/privacy-screen.png" $((20 * 1024 * 1024))',
+        ):
+            self.assertIn(call, run)
 
     def test_no_unbounded_decompression_remains(self):
         for path in (WINDOWS, THIRD_PARTY):
