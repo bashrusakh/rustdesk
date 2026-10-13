@@ -242,6 +242,12 @@ def reference_bgra(module, data):
     channels = _CHANNELS[color_type]
     raw = zlib.decompress(idat)
     stride = width * channels
+    transparent_gray = None
+    transparent_rgb = None
+    if trns and color_type == 0:
+        (transparent_gray,) = struct.unpack(">H", trns)
+    elif trns and color_type == 2:
+        transparent_rgb = struct.unpack(">HHH", trns)
     screen = bytearray(width * height * 4)
     prev = bytearray(stride)
     off = 0
@@ -273,11 +279,13 @@ def reference_bgra(module, data):
             if color_type == 6:
                 screen[dx:dx + 4] = bytes([row[sx + 2], row[sx + 1], row[sx], row[sx + 3]])
             elif color_type == 2:
-                screen[dx:dx + 4] = bytes([row[sx + 2], row[sx + 1], row[sx], 255])
+                alpha = 0 if transparent_rgb is not None and (row[sx], row[sx + 1], row[sx + 2]) == transparent_rgb else 255
+                screen[dx:dx + 4] = bytes([row[sx + 2], row[sx + 1], row[sx], alpha])
             elif color_type == 4:
                 screen[dx:dx + 4] = bytes([row[sx], row[sx], row[sx], row[sx + 1]])
             elif color_type == 0:
-                screen[dx:dx + 4] = bytes([row[sx], row[sx], row[sx], 255])
+                alpha = 0 if transparent_gray is not None and row[sx] == transparent_gray else 255
+                screen[dx:dx + 4] = bytes([row[sx], row[sx], row[sx], alpha])
             else:
                 index = row[sx]
                 alpha = trns[index] if index < len(trns) else 255
@@ -340,6 +348,124 @@ class ValidatorTests(unittest.TestCase):
         )
         # A tRNS of exactly the palette length is valid and must stay accepted.
         self.assert_ok(make_png(2, 2, 3, raw=raw, plte=plte, trns=b"\x80"))
+
+    def test_truecolor_trns_makes_matching_pixel_transparent(self):
+        # PNG tRNS is legal for truecolor (color type 2): the named RGB sample becomes
+        # fully transparent and every other pixel stays opaque. A validator that accepts
+        # the file but hard-codes alpha 255 renders the raw PNG transparent in Flutter
+        # while the generated exe/tray ICOs come out opaque.
+        raw = filtered_rows(4, 4, 3, 0)
+        data = make_png(4, 4, 2, raw=raw, trns=struct.pack(">HHH", 5, 18, 31))
+        image = self.assert_ok(data)
+        bgra = image.bgra()[0]
+        # Pixel (0,0) unfilters to RGB(5,18,31) == the tRNS sample -> transparent.
+        self.assertEqual(bgra[3], 0)
+        # Pixel (1,0) is a different colour -> opaque.
+        self.assertEqual(bgra[4 + 3], 255)
+        self.assertEqual((bgra, image.width, image.height), reference_bgra(self.module, data))
+
+    def test_grayscale_trns_makes_matching_pixel_transparent(self):
+        raw = filtered_rows(4, 4, 1, 0)
+        data = make_png(4, 4, 0, raw=raw, trns=struct.pack(">H", 5))
+        image = self.assert_ok(data)
+        bgra = image.bgra()[0]
+        self.assertEqual(bgra[3], 0)   # pixel (0,0) gray == tRNS sample
+        self.assertEqual(bgra[4 + 3], 255)
+        self.assertEqual((bgra, image.width, image.height), reference_bgra(self.module, data))
+
+    def test_rejects_trns_with_wrong_length_per_color_type(self):
+        # Valid tRNS lengths: 2 bytes for grayscale, 6 for truecolor. Anything else is a
+        # malformed chunk and must be rejected instead of silently mis-decoded.
+        self.assert_reject(make_png(4, 4, 0, trns=b"\x00\x00\x00"), "tRNS")
+        self.assert_reject(make_png(4, 4, 2, trns=b"\x00\x00\x00\x00"), "tRNS")
+        self.assert_ok(make_png(4, 4, 0, trns=b"\x00\x00"))
+        self.assert_ok(make_png(4, 4, 2, trns=b"\x00" * 6))
+
+    def test_rejects_trns_on_alpha_color_types(self):
+        # Color types 4 and 6 already carry per-pixel alpha; the spec forbids tRNS there.
+        self.assert_reject(make_png(4, 4, 4, trns=b"\x00\x00"), "tRNS")
+        self.assert_reject(make_png(4, 4, 6, trns=b"\x00" * 6), "tRNS")
+
+    def test_rejects_plte_after_idat(self):
+        # A 1x1 indexed PNG with correct CRCs but PLTE placed after IDAT is accepted by a
+        # validator that never enforces chunk order; ImageMagick rejects it.
+        plte = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(1, 1, 1, 0, modulo=3)))
+        data = (
+            PNG_SIGNATURE
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 3, 0, 0, 0))
+            + idat
+            + _chunk(b"PLTE", plte)
+            + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(data, "PLTE")
+
+    def test_rejects_non_consecutive_idat(self):
+        # IDAT chunks must be consecutive; an ancillary chunk between two IDATs makes the
+        # stream undecodable.
+        plte = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+        compressed = zlib.compress(filtered_rows(2, 2, 1, 0, modulo=3))
+        half = len(compressed) // 2
+        data = (
+            PNG_SIGNATURE
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 3, 0, 0, 0))
+            + _chunk(b"PLTE", plte)
+            + _chunk(b"IDAT", compressed[:half])
+            + _chunk(b"tEXt", b"k\x00v")
+            + _chunk(b"IDAT", compressed[half:])
+            + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(data, "consecutive")
+
+    def test_rejects_plte_on_non_indexed_image(self):
+        # PLTE is only in the declared supported subset for indexed colour, so it must be
+        # rejected for 0/2/4/6 rather than silently ignored.
+        plte = bytes([255, 0, 0])
+        for color_type in (0, 2, 4, 6):
+            with self.subTest(color_type=color_type):
+                self.assert_reject(make_png(4, 4, color_type, plte=plte), "PLTE")
+
+    def test_rejects_duplicate_plte_and_trns(self):
+        plte = bytes([255, 0, 0])
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 3, 0, 0, 0))
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(1, 1, 1, 0, modulo=1)))
+        dup_plte = (
+            PNG_SIGNATURE + ihdr + _chunk(b"PLTE", plte) + _chunk(b"PLTE", plte)
+            + idat + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(dup_plte, "PLTE")
+        dup_trns = (
+            PNG_SIGNATURE + ihdr + _chunk(b"PLTE", plte) + _chunk(b"tRNS", b"\x80")
+            + _chunk(b"tRNS", b"\x80") + idat + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(dup_trns, "tRNS")
+
+    def test_rejects_trns_after_idat(self):
+        plte = bytes([255, 0, 0])
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 3, 0, 0, 0))
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(1, 1, 1, 0, modulo=1)))
+        data = (
+            PNG_SIGNATURE + ihdr + _chunk(b"PLTE", plte) + idat
+            + _chunk(b"tRNS", b"\x80") + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(data, "tRNS")
+
+    def test_rejects_unknown_critical_chunk(self):
+        # An unknown chunk whose type starts uppercase is a critical chunk: a decoder
+        # cannot safely ignore it and must reject the image.
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(8, 8, 4, 0)))
+        data = PNG_SIGNATURE + ihdr + _chunk(b"XXYZ", b"") + idat + _chunk(b"IEND", b"")
+        self.assert_reject(data, "critical")
+
+    def test_accepts_known_ancillary_chunk(self):
+        # Unknown *ancillary* chunks (lowercase first byte) are ignorable per spec and
+        # must stay accepted, so the critical-chunk rule does not over-reject.
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(8, 8, 4, 0)))
+        data = PNG_SIGNATURE + ihdr + _chunk(b"tEXt", b"Comment\x00hi") + idat + _chunk(b"IEND", b"")
+        image = self.assert_ok(data)
+        self.assertEqual(image.bgra(), reference_bgra(self.module, data))
 
     def test_rejects_header_only(self):
         ihdr = struct.pack(">IIBBBBB", 16, 16, 8, 6, 0, 0, 0)
@@ -516,11 +642,19 @@ class _OversizeHandler(BaseHTTPRequestHandler):
         self.server.request_done.clear()
         self.server.bytes_written = 0
         self.server.completed = False
+        self.server.recorder.connected.clear()
+        self.server.recorder.connections = 0
         try:
             if self.path == "/big":
                 self._send_chunked(self.BIG)
             elif self.path == "/huge":
                 self._send_chunked(self.HUGE)
+            elif self.path == "/redirect-ftp":
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"ftp://127.0.0.1:{self.server.recorder.server_address[1]}/x"
+                )
+                self.end_headers()
             elif self.path == "/chunked-small":
                 body = b"C" * self.SMALL
                 self.send_response(200)
@@ -543,6 +677,26 @@ class _OversizeHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ConnectionRecorder(socketserver.BaseRequestHandler):
+    """Raw TCP listener recording connections to a redirect target.
+
+    Following a redirect to a non-HTTP scheme is only observable as a TCP connect to
+    the redirected host. Recording that connect distinguishes "the client refused to
+    follow the redirect" from "the client followed it and failed later", independently
+    of the curl version's error wording.
+    """
+
+    def handle(self):
+        self.server.connections += 1
+        self.server.connected.set()
+        try:
+            # Answer with an FTP-style error banner so a client that does follow the
+            # redirect fails fast instead of waiting for a client-side timeout.
+            self.request.sendall(b"421 Service not available\r\n")
+        except OSError:
+            pass
+
+
 class FetchCapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -550,18 +704,26 @@ class FetchCapTests(unittest.TestCase):
             allow_reuse_address = True
             daemon_threads = True
 
+        cls.recorder = _Server(("127.0.0.1", 0), _ConnectionRecorder)
+        cls.recorder.connections = 0
+        cls.recorder.connected = threading.Event()
         cls.server = _Server(("127.0.0.1", 0), _OversizeHandler)
         cls.server.request_done = threading.Event()
         cls.server.bytes_written = 0
         cls.server.completed = False
+        cls.server.recorder = cls.recorder
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
+        cls.recorder_thread = threading.Thread(target=cls.recorder.serve_forever, daemon=True)
+        cls.recorder_thread.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+        cls.recorder.shutdown()
+        cls.recorder.server_close()
 
     @classmethod
     def fetch_function(cls):
@@ -627,6 +789,21 @@ class FetchCapTests(unittest.TestCase):
         result, out = self._fetch("/chunked-small", 1024 * 1024)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(out.stat().st_size, _OversizeHandler.SMALL)
+
+    def test_redirect_to_non_http_scheme_is_not_followed(self):
+        # fetch_branding_image pins both the request and its redirects to http(s). A
+        # provider URL that redirects to ftp://... must not make the runner open the ftp
+        # connection: with the redirect protocol restricted, curl refuses before any
+        # connection, so the recorder sees none. Without the restriction curl follows the
+        # redirect (its default redirect protocol set includes ftp) and connects.
+        result, out = self._fetch("/redirect-ftp", 1024 * 1024)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::", result.stdout)
+        self.assertFalse(out.exists())
+        self.assertFalse(
+            self.server.recorder.connected.wait(1.0),
+            "the fetch followed the provider redirect to a non-HTTP scheme (ftp connection attempted)",
+        )
 
 
 # --------------------------------------------------------------------------- #

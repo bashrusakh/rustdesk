@@ -247,10 +247,12 @@ jobs:
 
           A branding PNG is accepted only when it is structurally whole and decodable:
           complete chunk stream (IHDR first, per-chunk CRC, mandatory IEND, no data after
-          IEND), PLTE present for indexed colour, allowed compression/filter/interlace
-          flags, bounded and exact decompression of the IDAT stream (never more than the
-          IHDR-implied scanline byte count, and no trailing decompressed payload), and a
-          full scanline/filter traversal.
+          IEND), spec chunk ordering (PLTE only for indexed colour, exactly once and before
+          the first IDAT; tRNS exactly once and before the first IDAT; consecutive IDAT
+          chunks; no unknown critical chunk), a valid per-colour-type tRNS transparency
+          sample, allowed compression/filter/interlace flags, bounded and exact
+          decompression of the IDAT stream (never more than the IHDR-implied scanline byte
+          count, and no trailing decompressed payload), and a full scanline/filter traversal.
           """
 
           import hashlib
@@ -315,6 +317,16 @@ jobs:
                   stride = width * channels
                   pixels = self.pixels
                   screen = bytearray(width * height * 4)
+                  # tRNS names exactly one fully transparent sample: a 2-byte gray value
+                  # (color type 0) or a 6-byte RGB value (color type 2); every other pixel
+                  # stays opaque. Indexed transparency is the per-entry alpha table used
+                  # below. The alpha color types (4/6) never carry tRNS (load() rejects it).
+                  transparent_gray = None
+                  transparent_rgb = None
+                  if self.trns is not None and self.color_type == 0:
+                      (transparent_gray,) = struct.unpack(">H", self.trns)
+                  elif self.trns is not None and self.color_type == 2:
+                      transparent_rgb = struct.unpack(">HHH", self.trns)
                   for y in range(height):
                       base = y * width * 4
                       row = pixels[y * stride:(y + 1) * stride]
@@ -326,22 +338,26 @@ jobs:
                                   row[sx + 2], row[sx + 1], row[sx], row[sx + 3],
                               )
                           elif self.color_type == 2:
+                              alpha = 0 if transparent_rgb is not None and (
+                                  row[sx], row[sx + 1], row[sx + 2]
+                              ) == transparent_rgb else 255
                               screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
-                                  row[sx + 2], row[sx + 1], row[sx], 255,
+                                  row[sx + 2], row[sx + 1], row[sx], alpha,
                               )
                           elif self.color_type == 4:
                               screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
                                   row[sx], row[sx], row[sx], row[sx + 1],
                               )
                           elif self.color_type == 0:
+                              alpha = 0 if transparent_gray is not None and row[sx] == transparent_gray else 255
                               screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
-                                  row[sx], row[sx], row[sx], 255,
+                                  row[sx], row[sx], row[sx], alpha,
                               )
                           else:
                               index = row[sx]
                               if index * 3 + 2 >= len(self.plte):
                                   raise PngError("PNG palette index is out of range")
-                              alpha = self.trns[index] if index < len(self.trns) else 255
+                              alpha = self.trns[index] if self.trns is not None and index < len(self.trns) else 255
                               screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
                                   self.plte[index * 3 + 2],
                                   self.plte[index * 3 + 1],
@@ -383,10 +399,7 @@ jobs:
               pos = 8
               count = 0
               ihdr = None
-              plte = None
-              trns = b""
-              idat_parts = []
-              saw_idat = False
+              chunks = []
               ended = False
               # Full structural walk of the chunk stream (fail on any truncation).
               while pos < size:
@@ -408,17 +421,11 @@ jobs:
                       if count != 0 or ihdr is not None:
                           _fail(label + " has an invalid IHDR placement")
                       ihdr = chunk
-                  elif ctype == b"PLTE":
-                      plte = chunk
-                  elif ctype == b"tRNS":
-                      trns = chunk
-                  elif ctype == b"IDAT":
-                      saw_idat = True
-                      idat_parts.append(chunk)
                   elif ctype == b"IEND":
                       if length != 0:
                           _fail(label + " has a malformed IEND chunk")
                       ended = True
+                  chunks.append((ctype, chunk))
                   pos += 12 + length
                   count += 1
 
@@ -447,11 +454,58 @@ jobs:
                   )
               if require_square and width != height:
                   _fail(label + " " + square_hint if square_hint else label + " must be square")
+              # Chunk-order and critical-chunk rules (PNG 1.2 section 3.3 / 5.6). A
+              # structurally whole stream is not necessarily a decodable one: PLTE must
+              # precede the first IDAT and appear at most once, tRNS must precede the first
+              # IDAT and appear at most once, the IDAT chunks must be consecutive, and an
+              # unknown critical chunk must never be silently ignored.
+              plte = None
+              trns = None
+              idat_parts = []
+              saw_idat = False
+              previous_type = b"IHDR"
+              for chunk_type, chunk in chunks:
+                  if chunk_type == b"PLTE":
+                      if plte is not None:
+                          _fail(label + " has more than one PLTE chunk")
+                      if saw_idat:
+                          _fail(label + " has a PLTE chunk after the first IDAT")
+                      plte = chunk
+                  elif chunk_type == b"tRNS":
+                      if trns is not None:
+                          _fail(label + " has more than one tRNS chunk")
+                      if saw_idat:
+                          _fail(label + " has a tRNS chunk after the first IDAT")
+                      trns = chunk
+                  elif chunk_type == b"IDAT":
+                      if saw_idat and previous_type != b"IDAT":
+                          _fail(label + " has non-consecutive IDAT chunks")
+                      saw_idat = True
+                      idat_parts.append(chunk)
+                  elif chunk_type in (b"IHDR", b"IEND"):
+                      pass
+                  elif chunk_type[0:1].isupper():
+                      _fail(label + " contains an unknown critical chunk " + chunk_type.decode("latin-1"))
+                  previous_type = chunk_type
               if color_type == 3:
-                  if not plte:
+                  if plte is None:
                       _fail(label + " palette PNG is missing its PLTE chunk")
                   if len(plte) % 3 != 0 or not 1 <= len(plte) // 3 <= 256:
                       _fail(label + " has an invalid PLTE chunk")
+              elif plte is not None:
+                  _fail(label + " has a PLTE chunk but is not an indexed (color type 3) PNG")
+              if trns is not None:
+                  if color_type == 3:
+                      if len(trns) > len(plte) // 3:
+                          _fail(label + " tRNS chunk is longer than the palette")
+                  elif color_type == 0:
+                      if len(trns) != 2:
+                          _fail(label + " grayscale tRNS chunk must be exactly 2 bytes")
+                  elif color_type == 2:
+                      if len(trns) != 6:
+                          _fail(label + " truecolor tRNS chunk must be exactly 6 bytes")
+                  else:
+                      _fail(label + " alpha color type " + str(color_type) + " must not carry a tRNS chunk")
               if not saw_idat:
                   _fail(label + " has no image data")
 
@@ -515,8 +569,6 @@ jobs:
               # accepts must actually be decodable by every consumer.
               if color_type == 3:
                   entries = len(plte) // 3
-                  if len(trns) > entries:
-                      _fail(label + " tRNS chunk is longer than the palette")
                   for index in pixels:
                       if index >= entries:
                           _fail(label + " contains a palette index that is out of range")
@@ -630,7 +682,9 @@ jobs:
           # the runner's curl version: curl --max-filesize only aborts an unknown-length
           # body from curl 8.4.0 on, while the ubuntu-22.04 runner ships curl 7.81.0,
           # where a chunked (or understated Content-Length) response would otherwise be
-          # downloaded in full before any post-download check.
+          # downloaded in full before any post-download check. The transfer is pinned to
+          # HTTP(S) for both the initial request and any redirect, so an allowed https
+          # provider URL cannot be followed to a non-HTTP scheme.
           fetch_branding_image() {
             local field="$1" url="$2" out="$3" cap="$4"
             if [ -z "$url" ]; then return 0; fi
@@ -640,8 +694,11 @@ jobs:
             # read, so an oversized body is cut off at fetch time and curl stops with a
             # broken pipe as soon as the cap is passed. This is Content-Length
             # independent and works on the runner's curl 7.81.0 (see the note above).
+            # --proto/--proto-redir keep both the initial request and redirects on
+            # http(s) only, matching the absolute-http(s) URL gate above.
             local fetch_failed=0
             if ! curl -fsSL --retry 2 --retry-delay 2 --max-time 120 \
+                --proto '=http,https' --proto-redir '=http,https' \
                 --output - -- "$url" | head -c "$((cap + 1))" > "$part"; then
               fetch_failed=1
             fi
