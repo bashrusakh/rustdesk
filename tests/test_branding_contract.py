@@ -417,13 +417,48 @@ class ValidatorTests(unittest.TestCase):
         )
         self.assert_reject(data, "consecutive")
 
-    def test_rejects_plte_on_non_indexed_image(self):
-        # PLTE is only in the declared supported subset for indexed colour, so it must be
-        # rejected for 0/2/4/6 rather than silently ignored.
+    def test_rejects_plte_only_where_the_spec_forbids_it(self):
+        # PNG 1.2 4.1.2: PLTE must not appear for grayscale (0) or grayscale+alpha (4).
+        # Only those two are rejected; 2/6 may carry a suggested palette (see the
+        # acceptance test) and 3 requires one.
         plte = bytes([255, 0, 0])
-        for color_type in (0, 2, 4, 6):
+        for color_type in (0, 4):
             with self.subTest(color_type=color_type):
                 self.assert_reject(make_png(4, 4, color_type, plte=plte), "PLTE")
+
+    def test_accepts_suggested_plte_on_truecolor_types(self):
+        # PNG 1.2 4.1.2 permits PLTE on truecolour (2) and truecolour+alpha (6) as a
+        # *suggested* palette. It must be accepted there, and it must not change the
+        # decoded raster: the same image with and without the suggested palette must
+        # produce byte-identical BGRA (the suggested palette is ignored for 2/6).
+        plte = bytes([10, 20, 30, 40, 50, 60, 70, 80, 90])
+        for color_type in (2, 6):
+            with self.subTest(color_type=color_type):
+                plain = self.assert_ok(make_png(6, 5, color_type, 0))
+                with_plte = self.assert_ok(make_png(6, 5, color_type, 0, plte=plte))
+                self.assertEqual(with_plte.bgra(), plain.bgra())
+                self.assertEqual(
+                    with_plte.bgra(),
+                    reference_bgra(self.module, make_png(6, 5, color_type, 0, plte=plte)),
+                )
+        # A second PLTE, or a PLTE placed after the first IDAT, is still rejected.
+        dup = (
+            PNG_SIGNATURE
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + _chunk(b"PLTE", plte)
+            + _chunk(b"PLTE", plte)
+            + _chunk(b"IDAT", zlib.compress(filtered_rows(2, 2, 3, 0)))
+            + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(dup, "PLTE")
+        late = (
+            PNG_SIGNATURE
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + _chunk(b"IDAT", zlib.compress(filtered_rows(2, 2, 3, 0)))
+            + _chunk(b"PLTE", plte)
+            + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(late, "PLTE")
 
     def test_rejects_duplicate_plte_and_trns(self):
         plte = bytes([255, 0, 0])
@@ -449,6 +484,37 @@ class ValidatorTests(unittest.TestCase):
             + _chunk(b"tRNS", b"\x80") + _chunk(b"IEND", b"")
         )
         self.assert_reject(data, "tRNS")
+
+    def test_rejects_indexed_trns_before_plte(self):
+        # PNG 1.2 4.1.2 / 4.3.2: for indexed colour (3) tRNS decorates the palette, so it
+        # must appear *after* PLTE and before the first IDAT. A stream that emits tRNS
+        # before PLTE cannot reference a palette entry and is undecodable.
+        plte = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 3, 0, 0, 0))
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(2, 2, 1, 0, modulo=3)))
+        before = (
+            PNG_SIGNATURE + ihdr + _chunk(b"tRNS", b"\x80") + _chunk(b"PLTE", plte)
+            + idat + _chunk(b"IEND", b"")
+        )
+        self.assert_reject(before, "tRNS")
+        # The spec ordering (PLTE, then tRNS, then IDAT) stays accepted.
+        ordered = (
+            PNG_SIGNATURE + ihdr + _chunk(b"PLTE", plte) + _chunk(b"tRNS", b"\x80")
+            + idat + _chunk(b"IEND", b"")
+        )
+        self.assert_ok(ordered)
+
+    def test_rejects_non_letter_chunk_type(self):
+        # A chunk type is exactly four ASCII letters A-Z / a-z (PNG 1.2 5.3). A type byte
+        # outside that set is a malformed chunk, not an ignorable ancillary chunk: the
+        # old `chunk_type[0:1].isupper()` test treated e.g. b"\x00ZYX" as ancillary and
+        # silently skipped it, so an unknown or mangled chunk could pass unnoticed.
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0))
+        idat = _chunk(b"IDAT", zlib.compress(filtered_rows(8, 8, 4, 0)))
+        for bad_type in (b"\x00ZYX", b"ab c", b"a1ct", b"1234"):
+            with self.subTest(chunk_type=bad_type):
+                data = PNG_SIGNATURE + ihdr + _chunk(bad_type, b"") + idat + _chunk(b"IEND", b"")
+                self.assert_reject(data, "malformed chunk type")
 
     def test_rejects_unknown_critical_chunk(self):
         # An unknown chunk whose type starts uppercase is a critical chunk: a decoder

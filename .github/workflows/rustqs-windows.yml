@@ -247,12 +247,14 @@ jobs:
 
           A branding PNG is accepted only when it is structurally whole and decodable:
           complete chunk stream (IHDR first, per-chunk CRC, mandatory IEND, no data after
-          IEND), spec chunk ordering (PLTE only for indexed colour, exactly once and before
-          the first IDAT; tRNS exactly once and before the first IDAT; consecutive IDAT
-          chunks; no unknown critical chunk), a valid per-colour-type tRNS transparency
-          sample, allowed compression/filter/interlace flags, bounded and exact
-          decompression of the IDAT stream (never more than the IHDR-implied scanline byte
-          count, and no trailing decompressed payload), and a full scanline/filter traversal.
+          IEND), four-letter chunk types, spec chunk ordering (PLTE exactly once and before
+          the first IDAT, required for indexed colour and permitted as a suggested palette
+          for truecolour 2/6 but forbidden for 0/4; tRNS exactly once and before the first
+          IDAT, and for indexed colour after PLTE; consecutive IDAT chunks; no unknown
+          critical chunk), a valid per-colour-type tRNS transparency sample, allowed
+          compression/filter/interlace flags, bounded and exact decompression of the IDAT
+          stream (never more than the IHDR-implied scanline byte count, and no trailing
+          decompressed payload), and a full scanline/filter traversal.
           """
 
           import hashlib
@@ -266,6 +268,15 @@ jobs:
 
           # Colour type -> samples per pixel for the accepted non-interlaced 8-bit PNG.
           _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+          # PNG chunk types are exactly four ASCII letters A-Z / a-z (PNG 1.2 section
+          # 5.3). A byte outside that set is a malformed chunk, not an ignorable
+          # ancillary chunk: the ancillary/critical distinction only exists for a valid
+          # type, so a non-letter type must be rejected rather than silently skipped.
+          def _valid_chunk_type(chunk_type):
+              return len(chunk_type) == 4 and all(
+                  0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A for byte in chunk_type
+              )
 
           # prepare_branding_assets field rules: name -> (max_w, max_h, max_bytes,
           # require_square, square_hint).  Kept exactly at the reviewed 1.4.9 gate.
@@ -454,10 +465,11 @@ jobs:
                   )
               if require_square and width != height:
                   _fail(label + " " + square_hint if square_hint else label + " must be square")
-              # Chunk-order and critical-chunk rules (PNG 1.2 section 3.3 / 5.6). A
-              # structurally whole stream is not necessarily a decodable one: PLTE must
-              # precede the first IDAT and appear at most once, tRNS must precede the first
-              # IDAT and appear at most once, the IDAT chunks must be consecutive, and an
+              # Chunk-order and chunk-type rules (PNG 1.2 sections 3.3 / 4.1.2 / 5.3 / 5.6).
+              # A structurally whole stream is not necessarily a decodable one: every chunk
+              # type must be four ASCII letters, PLTE must precede the first IDAT and appear
+              # at most once, tRNS must precede the first IDAT, follow PLTE for indexed
+              # colour, and appear at most once, the IDAT chunks must be consecutive, and an
               # unknown critical chunk must never be silently ignored.
               plte = None
               trns = None
@@ -465,6 +477,8 @@ jobs:
               saw_idat = False
               previous_type = b"IHDR"
               for chunk_type, chunk in chunks:
+                  if not _valid_chunk_type(chunk_type):
+                      _fail(label + " has a malformed chunk type " + chunk_type.decode("latin-1"))
                   if chunk_type == b"PLTE":
                       if plte is not None:
                           _fail(label + " has more than one PLTE chunk")
@@ -476,6 +490,8 @@ jobs:
                           _fail(label + " has more than one tRNS chunk")
                       if saw_idat:
                           _fail(label + " has a tRNS chunk after the first IDAT")
+                      if color_type == 3 and plte is None:
+                          _fail(label + " has a tRNS chunk before its PLTE chunk")
                       trns = chunk
                   elif chunk_type == b"IDAT":
                       if saw_idat and previous_type != b"IDAT":
@@ -487,13 +503,23 @@ jobs:
                   elif chunk_type[0:1].isupper():
                       _fail(label + " contains an unknown critical chunk " + chunk_type.decode("latin-1"))
                   previous_type = chunk_type
-              if color_type == 3:
-                  if plte is None:
-                      _fail(label + " palette PNG is missing its PLTE chunk")
+              # PLTE is required exactly once for indexed colour (3). PNG 1.2 4.1.2 forbids
+              # it for grayscale (0) and grayscale+alpha (4), but permits it for truecolour
+              # (2) and truecolour+alpha (6) as a *suggested* palette that a decoder may
+              # ignore -- the raster consumer does not use it for those types, so the
+              # decoded output is unchanged. Whenever PLTE is present its structure must be
+              # a valid palette (a multiple of three bytes, 1..256 entries).
+              if plte is not None:
+                  if color_type in (0, 4):
+                      _fail(
+                          label + " has a PLTE chunk but color type " + str(color_type)
+                          + " forbids one (only indexed colour 3, or truecolour 2/6 as a"
+                          " suggested palette, may carry PLTE)"
+                      )
                   if len(plte) % 3 != 0 or not 1 <= len(plte) // 3 <= 256:
                       _fail(label + " has an invalid PLTE chunk")
-              elif plte is not None:
-                  _fail(label + " has a PLTE chunk but is not an indexed (color type 3) PNG")
+              elif color_type == 3:
+                  _fail(label + " palette PNG is missing its PLTE chunk")
               if trns is not None:
                   if color_type == 3:
                       if len(trns) > len(plte) // 3:
