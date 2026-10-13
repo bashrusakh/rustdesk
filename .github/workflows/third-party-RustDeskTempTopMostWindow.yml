@@ -158,7 +158,12 @@ jobs:
             echo "::error::privacy screen image digest verification failed"
             exit 1
           fi
-          if ! python3 "$validator" "$privacy_png" --label privacy-screen.png --max-width 4096 --max-height 4096 --max-bytes 20971520; then
+          # No --max-bytes here: that cap is a fetch-time bound on the downloaded
+          # response only. The canonical privacy-screen.png was already bounded by its
+          # geometry in prepare and is pinned by the sha256 manifest check above, so
+          # re-applying the download cap would reject a valid indexed/16-bit source
+          # whose RGB/RGBA re-encode legitimately exceeds it.
+          if ! python3 "$validator" "$privacy_png" --label privacy-screen.png --max-width 4096 --max-height 4096; then
             echo "::error::privacy screen image sanity checks failed"
             exit 1
           fi

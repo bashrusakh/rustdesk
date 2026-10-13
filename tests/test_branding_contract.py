@@ -13,7 +13,12 @@ Covers the review findings on the Windows branding workflow:
       never reaches the manifest or a downstream consumer;
   F4  branding text is escaped for each concrete insertion syntax (Windows .rc vs
       TOML basic strings vs interpolated Dart single-quoted literals), so ordinary
-      safe punctuation is accepted instead of blanket-rejected.
+      safe punctuation is accepted instead of blanket-rejected;
+  F5  the per-field byte cap bounds only the fetched response. It is never re-applied
+      as a validity gate on the canonical artifact at any consumer: a valid in-domain
+      source within the fetch cap may re-encode to bytes larger than that cap, and the
+      canonical bytes are bounded by their geometry and pinned by the manifest digest
+      instead.
 
 Run with:  python3 tests/test_branding_contract.py
 """
@@ -311,6 +316,31 @@ def png_bytes(width, height, color_type, depth, pixel_fn, *, interlace=0, filter
     return make_png(
         width, height, color_type, depth=depth, interlace=interlace,
         plte=plte, trns=trns, raw=bytes(raw),
+    )
+
+
+def incompressible_canonical_png(width, height, color_type=6):
+    """Build a valid prepare-style canonical PNG whose encoded size is ~its raster size.
+
+    Random samples defeat zlib, so the file length can be pushed just past any byte
+    threshold by growing the raster. A canonical artifact of this size cannot be produced
+    through ``prepare()`` inside the suite (its pure-Python encoder needs minutes at
+    multi-megapixel sizes), so the consumer-side byte-cap tests build the canonical
+    artifact directly with this helper.
+    """
+    channels = _CHANNELS[color_type]
+    stride = width * channels
+    raw = bytearray()
+    random_bytes = os.urandom
+    for _ in range(height):
+        raw.append(0)  # filter type 0 (None): the decoded row is the raster row
+        raw.extend(random_bytes(stride))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    return (
+        PNG_SIGNATURE
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + _chunk(b"IEND", b"")
     )
 
 
@@ -1829,6 +1859,40 @@ class BuildConsumerTests(unittest.TestCase):
             "179486104c98c321d91cc7dd807e514531a3d0c3c2756f92e1fe7c1dc8cacb01",
         )
 
+    def test_canonical_larger_than_the_download_cap_is_consumed_for_icon_and_logo(self):
+        # Regression guard for the consumer-side misuse of the per-field DOWNLOAD cap.
+        # That cap bounds only the fetched response: an indexed 1 B/px source that passes
+        # the fetch cap re-encodes to 3-4 B/px, so the canonical artifact handed to the
+        # consumer can legitimately be larger than the cap. The consumer must still accept
+        # it and produce the ICO / app asset. A pre-fix consumer passed the download cap to
+        # validator.load() and aborted here with "exceeds the byte cap".
+        cap = 10 * 1024 * 1024
+        canonical = incompressible_canonical_png(1630, 1630, 6)
+        self.assertGreater(len(canonical), cap)
+        artifact = make_branding_artifact(icon=canonical, logo=canonical)
+        repo = make_icon_repo()
+        result = self._run(artifact, repo)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("exceeds the byte cap", result.stdout)
+        self.assertEqual((repo / "flutter/assets/icon.png").read_bytes(), canonical)
+        self.assertEqual((repo / "flutter/assets/logo.png").read_bytes(), canonical)
+        self.assertEqual((repo / "res/icon.ico").read_bytes()[:4], b"\x00\x00\x01\x00")
+
+    def test_consumer_dimension_and_square_gates_still_fail_closed(self):
+        # Removing the download cap must not disable the consumer-side gates that remain:
+        # max_width/max_height are still enforced by the shared validator, and png_to_ico
+        # still rejects a non-square icon after decoding.
+        for label, icon, expected in (
+            ("out-of-range dimension", make_png(4097, 8, 6, 0), "out-of-range dimensions"),
+            ("non-square icon", make_png(100, 50, 6, 0), "must be square"),
+        ):
+            with self.subTest(label=label):
+                artifact = make_branding_artifact(icon=icon)
+                repo = make_icon_repo()
+                result = self._run(artifact, repo)
+                self.assertEqual(result.returncode, 1, label)
+                self.assertIn(expected, result.stdout, label)
+
     def test_digest_mismatch_fails_closed(self):
         icon = make_png(32, 32, 6, 0)
         logo = make_png(16, 16, 6, 0)
@@ -1958,6 +2022,31 @@ class PrivacyConsumerTests(unittest.TestCase):
         self.assertEqual(png_header(embedded)[3], 6)
         self.assertEqual(png_header(embedded)[6], 0)
 
+    def test_validator_accepts_a_canonical_over_the_download_cap(self):
+        # The privacy overlay is a canonical artifact whose size can legitimately exceed
+        # the 20 MiB per-field DOWNLOAD cap (that cap bounds only the fetched response: an
+        # indexed 1 B/px source that passes the fetch cap re-encodes to 3-4 B/px). Run the
+        # exact validator argv the consumer shell uses, read from the workflow, so a future
+        # edit that re-adds --max-bytes fails here as well as in the shell run.
+        shell = self.privacy_shell()
+        match = re.search(r'python3 "\$validator" "\$privacy_png"([^\n;]*)', shell)
+        self.assertIsNotNone(match, "privacy validator invocation not found in the workflow")
+        argv = match.group(1).split()
+        self.assertNotIn("--max-bytes", argv)
+        canonical = incompressible_canonical_png(2660, 2660, 2)
+        self.assertGreater(len(canonical), 20 * 1024 * 1024)
+        directory = Path(tempfile.mkdtemp(prefix="branding-privacy-cap-"))
+        validator = directory / "validate_branding_png.py"
+        validator.write_text(validator_source(), encoding="utf-8")
+        png = directory / "privacy-screen.png"
+        png.write_bytes(canonical)
+        result = subprocess.run(
+            [sys.executable, str(validator), str(png), *argv],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("exceeds the byte cap", result.stdout)
+
     def test_corrupt_png_with_matching_digest_fails_closed(self):
         for name, png in {
             "truncated": make_png(omit_iend=True),
@@ -1990,6 +2079,23 @@ class PrivacyConsumerTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_consumers_do_not_reapply_the_download_cap_to_the_canonical_artifact(self):
+        # The per-field byte cap is a fetch-time bound on the downloaded response, never a
+        # validity gate on the locally generated canonical artifact. No consumer site may
+        # pass it to the shared validator again; the canonical bytes are bounded by their
+        # geometry and pinned by the sha256 manifest entry instead.
+        icon_python = BuildConsumerTests.icon_python()
+        loads = re.findall(r"validator\.load\(([^)]*)\)", icon_python)
+        self.assertTrue(loads, "no validator.load() call found in the icon/logo consumer")
+        for call in loads:
+            self.assertNotIn("max_bytes", call)
+        invocations = re.findall(
+            r'python3 "\$validator" "\$privacy_png"([^\n;]*)',
+            PrivacyConsumerTests.privacy_shell(),
+        )
+        self.assertEqual(len(invocations), 1, "expected one privacy validator invocation")
+        self.assertNotIn("--max-bytes", invocations[0])
+
     def test_single_branding_artifact_and_shared_validator_wiring(self):
         windows = WINDOWS.read_text(encoding="utf-8")
         third = THIRD_PARTY.read_text(encoding="utf-8")

@@ -1899,10 +1899,15 @@ jobs:
           def png_to_ico(data, label):
               # The shared validator owns all structure/decompression checks and the
               # raster extraction; this build step only adds the ICO packaging.
+              # No byte cap: the per-field download cap bounds only the fetch-time
+              # response, never the canonical artifact. ``data`` is the canonical
+              # re-encode written by prepare_branding_assets, whose size is already
+              # bounded by the image geometry and pinned by the sha256 manifest entry
+              # verified in source_bytes(); re-applying the download cap here would
+              # reject a valid indexed/16-bit source whose RGB/RGBA re-encode
+              # legitimately exceeds it.
               try:
-                  image = validator.load(
-                      data, label, max_width=4096, max_height=4096, max_bytes=10 * 1024 * 1024
-                  )
+                  image = validator.load(data, label, max_width=4096, max_height=4096)
                   bgra, width, height = image.bgra()
               except validator.PngError as exc:
                   fail(str(exc))
@@ -1948,9 +1953,13 @@ jobs:
               check_anchor("flutter/lib/common.dart", b"const _kDefaultLogoAsset = 'assets/logo.png';", 1)
               # A digest match only proves the bytes are the ones we staged; run
               # the shared structural validator so a corrupt/truncated logo fails
-              # here instead of being copied into the app assets.
+              # here instead of being copied into the app assets. No byte cap: the
+              # canonical artifact is bounded by its geometry and pinned by the
+              # manifest digest, while the per-field download cap applies only at
+              # fetch time, so re-applying it would reject a valid in-domain image
+              # whose canonical re-encode is larger than the fetched source.
               try:
-                  validator.load(logo_png, "app-logo.png", max_width=4096, max_height=4096, max_bytes=10 * 1024 * 1024)
+                  validator.load(logo_png, "app-logo.png", max_width=4096, max_height=4096)
               except validator.PngError as exc:
                   fail(str(exc))
               plans.append(("flutter/assets/logo.png", logo_png))
