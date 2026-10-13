@@ -610,27 +610,38 @@ jobs:
           PY
           chmod 700 "$validator"
 
-          # Per-field caps (DeskForge #80). The cap is enforced during the transfer
-          # by curl --max-filesize, so an oversized response is aborted at fetch and
-          # never reaches the manifest or any downstream consumer. This does not rely
-          # on HTTP Content-Length: curl also aborts mid-transfer when the body
-          # exceeds the cap without a declared length or with a wrong one.
+          # Per-field caps (DeskForge #80). The cap is bound during the transfer by
+          # reading at most cap+1 bytes off the response stream, so an oversized body
+          # is aborted at fetch and never reaches the manifest or any downstream
+          # consumer. This does not rely on HTTP Content-Length and is independent of
+          # the runner's curl version: curl --max-filesize only aborts an unknown-length
+          # body from curl 8.4.0 on, while the ubuntu-22.04 runner ships curl 7.81.0,
+          # where a chunked (or understated Content-Length) response would otherwise be
+          # downloaded in full before any post-download check.
           fetch_branding_image() {
             local field="$1" url="$2" out="$3" cap="$4"
             if [ -z "$url" ]; then return 0; fi
             local part="${out}.part"
             rm -f -- "$part"
+            # Stream the response through a bounded reader: at most cap+1 bytes are
+            # read, so an oversized body is cut off at fetch time and curl stops with a
+            # broken pipe as soon as the cap is passed. This is Content-Length
+            # independent and works on the runner's curl 7.81.0 (see the note above).
+            local fetch_failed=0
             if ! curl -fsSL --retry 2 --retry-delay 2 --max-time 120 \
-                --max-filesize "$cap" --output "$part" -- "$url"; then
-              rm -f -- "$part"
-              echo "::error::$field image fetch failed from the provider URL (absolute http(s) URL required; the runner cannot fetch relative URLs; the response must stay within the ${cap}-byte cap)"
-              exit 1
+                --output - -- "$url" | head -c "$((cap + 1))" > "$part"; then
+              fetch_failed=1
             fi
             local bytes
             bytes=$(wc -c < "$part")
             if [ "$bytes" -gt "$cap" ]; then
               rm -f -- "$part"
               echo "::error::$field image exceeds the per-field byte cap (${cap} bytes)"
+              exit 1
+            fi
+            if [ "$fetch_failed" -ne 0 ]; then
+              rm -f -- "$part"
+              echo "::error::$field image fetch failed from the provider URL (absolute http(s) URL required; the runner cannot fetch relative URLs; the response must stay within the ${cap}-byte cap)"
               exit 1
             fi
             mv -- "$part" "$out"

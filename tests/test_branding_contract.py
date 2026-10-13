@@ -8,8 +8,9 @@ Covers the review findings on the Windows branding workflow:
   F2  one shared structural PNG validator, used by prepare_branding_assets and
       by every consumer (build icon/logo and third-party privacy screen), so any
       branding PNG declared acceptable is structurally whole and decodable;
-  F3  the per-field response cap is enforced at fetch time, so an oversized
-      response never reaches the manifest or a downstream consumer;
+  F3  the per-field response cap is bound during transfer, independent of HTTP
+      Content-Length and of the runner's curl version, so an oversized response
+      never reaches the manifest or a downstream consumer;
   F4  branding text is escaped for each concrete insertion syntax (Windows .rc /
       TOML double-quoted strings vs interpolated Dart single-quoted literals), so
       ordinary safe punctuation is accepted instead of blanket-rejected.
@@ -463,24 +464,56 @@ class PrepareStagingTests(unittest.TestCase):
 class _OversizeHandler(BaseHTTPRequestHandler):
     BIG = 4 * 1024 * 1024
     SMALL = 1024
+    # A body far larger than any per-field cap, sent chunked (no Content-Length) so
+    # the transfer can only be stopped by a client-side bound, never by a declared
+    # length. On the ubuntu-22.04 runner's curl 7.81.0 this endpoint is what proves
+    # the cap is enforced during transfer rather than after a full download.
+    HUGE = 64 * 1024 * 1024
+    BLOCK = 65536
+
+    def _send_chunked(self, total):
+        self.send_response(200)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        block = b"A" * self.BLOCK
+        written = 0
+        try:
+            while written < total:
+                self.wfile.write(("%x\r\n" % len(block)).encode() + block + b"\r\n")
+                written += len(block)
+            self.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            # The bounded client closed the stream once the cap was passed.
+            pass
+        self.server.bytes_written = written
+        self.server.completed = written >= total
 
     def do_GET(self):
-        if self.path == "/big":
-            self.send_response(200)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            block = b"A" * 65536
-            for _ in range(self.BIG // 65536):
-                self.wfile.write(("%x\r\n" % len(block)).encode() + block + b"\r\n")
-            self.wfile.write(b"0\r\n\r\n")
-        elif self.path == "/small":
-            body = b"C" * self.SMALL
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_error(404)
+        self.server.request_done.clear()
+        self.server.bytes_written = 0
+        self.server.completed = False
+        try:
+            if self.path == "/big":
+                self._send_chunked(self.BIG)
+            elif self.path == "/huge":
+                self._send_chunked(self.HUGE)
+            elif self.path == "/chunked-small":
+                body = b"C" * self.SMALL
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(("%x\r\n" % len(body)).encode() + body + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            elif self.path == "/small":
+                body = b"C" * self.SMALL
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404)
+        finally:
+            self.server.request_done.set()
 
     def log_message(self, *args):
         pass
@@ -494,6 +527,9 @@ class FetchCapTests(unittest.TestCase):
             daemon_threads = True
 
         cls.server = _Server(("127.0.0.1", 0), _OversizeHandler)
+        cls.server.request_done = threading.Event()
+        cls.server.bytes_written = 0
+        cls.server.completed = False
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -523,6 +559,9 @@ class FetchCapTests(unittest.TestCase):
             "CAP": str(cap),
         }
         result = subprocess.run(["bash", "-s"], input=script, text=True, capture_output=True, env=env)
+        # Wait for the server-side handler to finish so the recorded stream stats
+        # reflect this fetch rather than a race with the client shutting down.
+        self.assertTrue(self.server.request_done.wait(10), "server never completed the request")
         return result, out
 
     def test_oversized_response_is_rejected_without_leaving_a_file(self):
@@ -532,14 +571,38 @@ class FetchCapTests(unittest.TestCase):
         self.assertFalse(out.exists())
         self.assertFalse((out.parent / (out.name + ".part")).exists())
 
-    def test_under_cap_response_is_accepted(self):
+    def test_chunked_oversize_is_bounded_during_transfer(self):
+        # No Content-Length, and a body far above the cap. The fetch must stop the
+        # transfer once the cap is passed instead of downloading the whole stream and
+        # rejecting it afterwards. The server records whether it ever streamed the
+        # complete body: a bounded client makes that impossible.
+        result, out = self._fetch("/huge", 1024 * 1024)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::", result.stdout)
+        self.assertIn("exceeds the per-field byte cap", result.stdout)
+        self.assertFalse(out.exists())
+        self.assertFalse((out.parent / (out.name + ".part")).exists())
+        self.assertFalse(
+            self.server.completed,
+            "the client read the entire oversized chunked body instead of bounding it at fetch time",
+        )
+        self.assertLess(
+            self.server.bytes_written,
+            _OversizeHandler.HUGE // 2,
+            "the transfer was not cut off near the cap",
+        )
+
+    def test_under_cap_content_length_response_is_accepted(self):
         result, out = self._fetch("/small", 1024 * 1024)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(out.stat().st_size, _OversizeHandler.SMALL)
 
-    def test_fetch_uses_a_bounded_stream_not_content_length(self):
-        function = self.fetch_function()
-        self.assertIn("--max-filesize", function)
+    def test_under_cap_chunked_response_is_accepted(self):
+        # The bound must not reject a legitimate body whose length is unknown before
+        # download.
+        result, out = self._fetch("/chunked-small", 1024 * 1024)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(out.stat().st_size, _OversizeHandler.SMALL)
 
 
 # --------------------------------------------------------------------------- #
