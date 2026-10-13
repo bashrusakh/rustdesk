@@ -780,6 +780,38 @@ class BrandingEscapeTests(unittest.TestCase):
             out["Cargo.toml"],
         )
 
+    def test_cross_field_anchor_composition_applies_once(self):
+        # privacy_policy_url = https://rustdesk.com rewrites the about-page privacy
+        # line into exactly the website_about anchor text, which the per-key count
+        # guard used to read as a second website_about occurrence and reject. That is
+        # a DeskForge-accepted configuration and must apply: the privacy line takes
+        # the privacy value, the website line takes the website value, and each is
+        # replaced exactly once (the introduced sibling anchor text is not
+        # double-replaced).
+        result, out = self._run(privacy="https://rustdesk.com", website="https://example.com")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        dart = out["flutter/lib/desktop/pages/desktop_setting_page.dart"]
+        self.assertEqual(dart.count("launchUrlString('https://rustdesk.com');"), 1)
+        self.assertEqual(dart.count("launchUrlString('https://example.com');"), 1)
+        lines = dart.splitlines()
+        self.assertEqual(lines[-2], "                    launchUrlString('https://rustdesk.com');")
+        self.assertEqual(lines[-1], "                    launchUrlString('https://example.com');")
+        self.assertNotIn("privacy.html", dart)
+
+    def test_cross_field_composition_keeps_anchor_mismatch_fail_closed(self):
+        # The composition fix must not weaken fail-closed source-drift detection: a
+        # missing anchor still aborts, even while another field introduces a sibling
+        # anchor's text.
+        result, _ = self._run(
+            privacy="https://rustdesk.com",
+            website="https://example.com",
+            mutate={
+                "flutter/lib/desktop/pages/install_page.dart": "'https://rustdesk.com/other.html'),\n",
+            },
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("anchor mismatch", result.stdout)
+
     def test_genuine_anchor_mismatch_still_fails_closed(self):
         # Guard the drift direction of the post-apply change: a source file that no longer
         # carries the anchored literal must still abort, so the corrected verification did

@@ -1372,14 +1372,41 @@ jobs:
                       + " the client source changed since the anchored branding table was written; build aborted"
                   )
               data_by_path[path] = data
-          # Phase 2: apply all verified replacements sequentially per file, building the
-          # exact expected post-apply content for each file from the Phase 1 snapshot.
-          expected_by_path = dict(data_by_path)
-          for key, (path, anchor, replacement) in sorted(pending.items()):
-              data = expected_by_path[path]
-              if data.count(anchor) != EXPECTED_COUNTS[key]:
+          # Phase 2: apply all verified replacements against the immutable Phase 1
+          # snapshot. Every anchor occurrence is located by scanning that snapshot
+          # once per key, so each original occurrence is replaced exactly once and a
+          # replacement that itself contains or introduces a sibling anchor's bytes
+          # is never re-scanned: it cannot be double-replaced nor trip a sibling
+          # key's count guard (for example privacy_policy_url = https://rustdesk.com
+          # rewrites the about-page privacy line into the website anchor text, which
+          # is a legitimate DeskForge configuration). Anchors are single-line,
+          # byte-exact and pairwise disjoint in the snapshot, so their spans never
+          # overlap; an overlap is treated as source drift and aborts the build.
+          spans_by_path = {}
+          for key, (path, anchor, replacement) in pending.items():
+              data = data_by_path[path]
+              spans = []
+              start = data.find(anchor)
+              while start != -1:
+                  spans.append((start, start + len(anchor), replacement))
+                  start = data.find(anchor, start + len(anchor))
+              if len(spans) != EXPECTED_COUNTS[key]:
                   fail(key + ": anchor count changed while applying " + path)
-              expected_by_path[path] = data.replace(anchor, replacement)
+              spans_by_path.setdefault(path, []).extend(spans)
+          expected_by_path = {}
+          for path, spans in spans_by_path.items():
+              data = data_by_path[path]
+              spans.sort(key=lambda span: span[0])
+              chunks = []
+              cursor = 0
+              for begin, end, replacement in spans:
+                  if begin < cursor:
+                      fail("overlapping branding anchors in " + path + "; build aborted")
+                  chunks.append(data[cursor:begin])
+                  chunks.append(replacement)
+                  cursor = end
+              chunks.append(data[cursor:])
+              expected_by_path[path] = b"".join(chunks)
           # Phase 3: write each file once, then verify its on-disk bytes equal the exact
           # expected post-replacement content. This replaces the earlier
           # `anchor in data or replacement not in data` rule, which was not a sound
