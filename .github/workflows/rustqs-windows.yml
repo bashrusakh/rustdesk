@@ -1373,7 +1373,18 @@ jobs:
           for key, (path, anchor, replacement) in sorted(pending.items()):
               with open(path, "rb") as handle:
                   data = handle.read()
-              if anchor in data or replacement not in data:
+              if anchor == replacement:
+                  # The branding value equals the current 1.4.9 default, so the
+                  # escaped replacement is byte-identical to the anchor and the
+                  # apply is a legitimate no-op: `anchor` cannot leave the file and
+                  # `replacement` cannot be observed as a distinct token. Verify
+                  # the expected occurrence count of the bytes survives instead of
+                  # reporting the no-op as a failed replacement.
+                  if data.count(anchor) != EXPECTED_COUNTS[key]:
+                      fail(key + ": post-apply verification failed for " + path)
+              elif anchor in data or replacement not in data:
+                  # Real post-apply drift (the anchor survived) or a replacement
+                  # that failed to land still aborts.
                   fail(key + ": post-apply verification failed for " + path)
               print("L3 brand: " + key + " applied to " + path)
           PY

@@ -704,6 +704,24 @@ class BrandingEscapeTests(unittest.TestCase):
         self.assertIn("'https://x.example/w\\'s'", settings)
         self.assertIn("'https://x.example/p\\$v'", settings)
 
+    def test_default_equal_value_is_a_successful_noop(self):
+        # A branding value that equals the current 1.4.9 default literal makes the
+        # escaped replacement byte-identical to the anchor. That is a legitimate
+        # no-op and must not be reported as a failed post-apply verification.
+        cases = {
+            "company_name": {"company": "Purslane Tech Pte. Ltd."},
+            "download_url": {"download": "https://rustdesk.com/download"},
+            "website_url": {"website": "https://rustdesk.com"},
+            "website_url_trailing_slash": {"website": "https://rustdesk.com/"},
+            "privacy_policy_url": {"privacy": "https://rustdesk.com/privacy.html"},
+        }
+        for field, kwargs in cases.items():
+            with self.subTest(field=field):
+                result, out = self._run(**kwargs)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("post-apply verification failed", result.stdout)
+                self.assertIn("applied to", result.stdout)
+
     def test_control_characters_still_rejected(self):
         result, _ = self._run(company="bad\nname")
         self.assertEqual(result.returncode, 1)
@@ -960,8 +978,23 @@ class WorkflowContractTests(unittest.TestCase):
         self.fail("branding step not found")
 
     def test_no_duplicate_rustdesk_name_replacement_mechanism(self):
+        # The RustDesk display-name rename is a single mechanism owned by one
+        # dedicated step; the DFP1 company-name step must not duplicate it, and
+        # there must be no env-default fallback that renames the product to
+        # "RustDesk".
         text = WINDOWS.read_text(encoding="utf-8")
-        self.assertEqual(text.count("RustDesk Remote Desktop"), len(re.findall(r"RustDesk Remote Desktop", text)))
+        rename_runs = [
+            step["run"] for step in _steps(WINDOWS)
+            if step.get("name") == "L3 brand: rename RustDesk → app_name"
+            and isinstance(step.get("run"), str)
+        ]
+        self.assertEqual(len(rename_runs), 1, "expected exactly one RustDesk rename step")
+        needle = "RustDesk Remote Desktop"
+        self.assertGreater(text.count(needle), 0, "RustDesk display-name rename disappeared")
+        # Every RustDesk display-name replacement literal must live inside that
+        # one step's run block; any occurrence elsewhere is a second, conflicting
+        # rename mechanism.
+        self.assertEqual(text.count(needle), rename_runs[0].count(needle))
         self.assertNotIn("RQS_COMPANY_NAME:-RustDesk", text)
 
 
