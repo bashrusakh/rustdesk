@@ -1016,9 +1016,11 @@ jobs:
           # helper is written from the workflow and used from RUNNER_TEMP. The prepare
           # step is the only branding fetch boundary; both consumer jobs read the
           # verified files from the one branding artifact and never fetch a URL.
-          # Address pinning assumes the runner has no HTTP proxy configured: an
-          # environment proxy would connect to the proxy instead of the validated
-          # address and bypass the policy (recorded in the helper docstring too).
+          # Address pinning applies to the connections this helper makes: http.client
+          # and the pinned sockets do not consult http_proxy/https_proxy/ALL_PROXY.
+          # Migration caution -- proxy-aware tooling would connect to the proxy
+          # instead of the validated address and bypass the policy (recorded in the
+          # helper docstring too).
           fetcher="${RUNNER_TEMP}/fetch_branding_image.py"
           cat > "$fetcher" <<'PY'
           #!/usr/bin/env python3
@@ -1044,25 +1046,46 @@ jobs:
           Preserved behaviour, matching the curl pipeline this replaces:
 
             * http(s) only, for the initial URL and for every redirect target;
-            * the per-field byte cap is bound *during* transfer by reading at most
-              ``cap + 1`` body bytes, independent of HTTP Content-Length (chunked bodies
-              included) and of the runner's curl version;
+            * the per-field byte cap is bound *during* transfer: the body is read in
+              ``FETCH_CHUNK`` (64 KiB) pieces and the transfer is aborted as soon as the
+              total received exceeds ``cap``, independent of HTTP Content-Length (chunked
+              bodies included) and of the runner's curl version.  At most ``cap + 64 KiB``
+              bytes are received before the abort, an oversized body is never renamed to
+              the output path, and no output file is produced on failure;
             * ``--retry 2 --retry-delay 2``: up to two retries two seconds apart for the
               failures curl retries as transient (a timeout, or an HTTP 408/429/500/
               502/503/504 response);
-            * ``--max-time 120``: each attempt is bounded by 120 seconds, covering its
-              connection and every redirect hop of that attempt;
+            * ``--max-time 120``: each attempt is bounded by a wall-clock deadline that
+              covers its connection and every redirect hop of that attempt.  The deadline
+              is re-checked between operations, and a watchdog shuts down the attempt's
+              live socket when the deadline expires, so a peer that delivers a byte
+              inside every read timeout -- during the status line, the headers, an
+              interim 1xx response or the body -- cannot extend the attempt past the
+              bound;
             * the download is written to ``<out>.part`` and renamed to ``<out>`` only
               after it was received completely within the cap, so any failure leaves no
-              output file behind.
+              output file behind, and the framing is verified before the rename: a body
+              shorter than its declared Content-Length, or a chunked body that never
+              reaches its terminating chunk, is a failed fetch.
 
-          Reviewer assumption recorded here: address pinning assumes the runner has no
-          HTTP proxy configured.  With ``http_proxy`` / ``https_proxy`` / ``ALL_PROXY``
-          (or a proxy the TLS stack honours) in the environment, a client connects to the
-          proxy instead, the proxy resolves and reaches the destination, and the policy
-          below would no longer bound the address actually connected to.  The GitHub-
-          hosted prepare job configures no environment proxy; if this job ever gains one,
-          the fetch must be revisited.
+          One blocking call cannot be interrupted in-process: a resolver call that
+          blocks below Python (for example a hung ``getaddrinfo``).  The workflow shell
+          wrapper runs the whole helper under a process-level ``timeout`` as the backstop
+          for that case and prints the same deterministic per-field ``::error::`` itself
+          on that timeout path (GNU ``timeout`` exit status 124, or 137 when the
+          kill-after signal was needed), which also keeps a normal helper failure from
+          being reported twice.
+
+          Reviewer assumption recorded here: address pinning applies to the connections
+          this helper makes.  ``http.client`` and the pinned sockets never consult
+          ``http_proxy`` / ``https_proxy`` / ``ALL_PROXY``, so the environment cannot
+          redirect the connection today.  This is a migration caution, not current
+          behaviour: proxy-aware tooling (or any replacement that lets a proxy negotiate
+          the connection) would connect to the proxy instead of the validated address,
+          the proxy would resolve and reach the destination, and the policy below would
+          no longer bound the address actually connected to.  The GitHub-hosted prepare
+          job configures no environment proxy; revisit this if the fetch ever becomes
+          proxy-aware.
 
           Command line:  fetch_branding_image.py FIELD URL OUT CAP
           Failures print a deterministic ``::error::FIELD ...`` annotation on stdout and
@@ -1079,6 +1102,7 @@ jobs:
           import socket
           import ssl
           import sys
+          import threading
           import time
           from urllib.parse import urljoin, urlsplit
 
@@ -1090,13 +1114,13 @@ jobs:
           _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
           _RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
-          # The one authoritative non-public destination policy.  A hop is refused when
-          # any address it resolves to falls in any range below.  IPv4: this-network,
-          # loopback, RFC1918 private, link-local, carrier-grade NAT, IETF protocol
-          # assignments, documentation, benchmarking, deprecated 6to4 relay anycast,
-          # multicast and reserved space.  IPv6: unspecified, loopback, link-local,
-          # unique-local, multicast, discard-only, documentation, Teredo, benchmarking,
-          # ORCHIDv1/v2, NAT64 and 6to4.
+          # The one authoritative non-public destination policy for this contract: the
+          # special-purpose ranges that are not public destinations for a literal fetch
+          # target, drawn from the IANA IPv4 and IPv6 special-purpose registries plus
+          # multicast and transition/deprecated forms that embed an IPv4 destination
+          # (6to4, Teredo, NAT64, deprecated IPv4-compatible).  A hop is refused when
+          # any address it resolves to falls in any range below.  This policy is
+          # deliberately not an exhaustive implementation of Internet routing.
           _NON_PUBLIC_NETWORKS = (
               ipaddress.ip_network("0.0.0.0/8"),
               ipaddress.ip_network("127.0.0.0/8"),
@@ -1115,11 +1139,17 @@ jobs:
               ipaddress.ip_network("240.0.0.0/4"),
               ipaddress.ip_network("::/128"),
               ipaddress.ip_network("::1/128"),
+              # Deprecated IPv4-compatible form (RFC 4291, section 2.5.5.1): not a
+              # routable public IPv6 destination, and it embeds an IPv4 destination
+              # this literal policy cannot verify.
+              ipaddress.ip_network("::/96"),
               ipaddress.ip_network("fe80::/10"),
               ipaddress.ip_network("fc00::/7"),
               ipaddress.ip_network("ff00::/8"),
               ipaddress.ip_network("100::/64"),
+              ipaddress.ip_network("100:0:0:1::/64"),  # Dummy IPv6 Prefix (RFC 9780)
               ipaddress.ip_network("2001:db8::/32"),
+              ipaddress.ip_network("3fff::/20"),  # Documentation (RFC 9637)
               ipaddress.ip_network("2001::/32"),
               ipaddress.ip_network("2001:2::/48"),
               ipaddress.ip_network("2001:10::/28"),
@@ -1127,6 +1157,7 @@ jobs:
               ipaddress.ip_network("64:ff9b::/96"),
               ipaddress.ip_network("64:ff9b:1::/48"),
               ipaddress.ip_network("2002::/16"),
+              ipaddress.ip_network("5f00::/16"),  # Segment Routing (SRv6) SIDs (RFC 9602)
           )
 
 
@@ -1185,9 +1216,66 @@ jobs:
                   pass
 
 
-          def _check_deadline(deadline):
-              if deadline - time.monotonic() <= 0:
-                  raise _Abort(retryable=True)
+          class _AttemptDeadline:
+              """Wall-clock bound for one attempt, enforced across blocking socket I/O.
+
+              The named deadline checks alone cannot bound an attempt: one blocking socket
+              read cannot be interrupted by them, and the socket timeout is only a
+              *per-read* timeout, so a peer that delivers a byte inside every timeout
+              window (during the status line, the headers, an interim 1xx response or the
+              body) can keep one hop alive past any number of named checks.  The watchdog
+              closes that gap: it fires once at the deadline and shuts down the socket the
+              attempt is currently using, so a blocked read or write fails immediately
+              instead of waiting for the next check.  A resolver call that blocks below
+              Python (for example a hung ``getaddrinfo``) cannot be interrupted this way;
+              the shell wrapper's process-level ``timeout`` backstops that case.
+              """
+
+              def __init__(self, max_time):
+                  self._deadline = time.monotonic() + max_time
+                  self._socket = None
+                  self._fired = False
+                  self._lock = threading.Lock()
+                  timer = threading.Timer(max(0.0, max_time), self._expire)
+                  timer.daemon = True
+                  self._timer = timer
+                  timer.start()
+
+              def _expire(self):
+                  with self._lock:
+                      self._fired = True
+                      sock = self._socket
+                  if sock is not None:
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+
+              def remaining(self):
+                  return self._deadline - time.monotonic()
+
+              def expired(self):
+                  return self._fired or self.remaining() <= 0
+
+              def check(self):
+                  if self.expired():
+                      raise _Abort(retryable=True)
+
+              def hold(self, sock):
+                  """Register the attempt's live socket so the watchdog can end it."""
+                  with self._lock:
+                      self._socket = sock
+                      fired = self._fired
+                  if fired:
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+
+              def cancel(self):
+                  self._timer.cancel()
+                  with self._lock:
+                      self._socket = None
 
 
           def _parse_hop(url, field):
@@ -1256,7 +1344,7 @@ jobs:
               return addresses
 
 
-          def _connect_pinned(addresses, deadline):
+          def _connect_pinned(addresses, watchdog):
               """Connect to the first validated address that accepts a connection.
 
               ``addresses`` contains only addresses that already passed the policy, so
@@ -1264,7 +1352,7 @@ jobs:
               """
               timed_out = False
               for family, sockaddr in addresses:
-                  remaining = deadline - time.monotonic()
+                  remaining = watchdog.remaining()
                   if remaining <= 0:
                       timed_out = True
                       break
@@ -1289,26 +1377,27 @@ jobs:
           class _PinnedHTTPConnection(http.client.HTTPConnection):
               """HTTPConnection whose TCP connection goes to a pre-validated address."""
 
-              def __init__(self, host, port, addresses, deadline):
+              def __init__(self, host, port, addresses, watchdog):
                   super().__init__(host, port, timeout=None)
                   self._pinned_addresses = addresses
-                  self._pinned_deadline = deadline
+                  self._watchdog = watchdog
 
               def connect(self):
-                  self.sock = _connect_pinned(self._pinned_addresses, self._pinned_deadline)
+                  self.sock = _connect_pinned(self._pinned_addresses, self._watchdog)
+                  self._watchdog.hold(self.sock)
 
 
           class _PinnedHTTPSConnection(http.client.HTTPSConnection):
               """HTTPSConnection pinned to a validated address; TLS keeps the URL hostname."""
 
-              def __init__(self, host, port, addresses, deadline, context):
+              def __init__(self, host, port, addresses, watchdog, context):
                   super().__init__(host, port, timeout=None, context=context)
                   self._pinned_addresses = addresses
-                  self._pinned_deadline = deadline
+                  self._watchdog = watchdog
                   self._pinned_context = context
 
               def connect(self):
-                  sock = _connect_pinned(self._pinned_addresses, self._pinned_deadline)
+                  sock = _connect_pinned(self._pinned_addresses, self._watchdog)
                   try:
                       # SNI and certificate verification use the URL hostname while the TCP
                       # connection uses the validated address.
@@ -1316,16 +1405,17 @@ jobs:
                   except BaseException:
                       sock.close()
                       raise
+                  self._watchdog.hold(self.sock)
 
 
-          def _open(parsed, host, target, port, addresses, deadline, field, cap):
+          def _open(parsed, host, target, port, addresses, watchdog, field, cap):
               """Open the pinned connection and send the GET; returns (connection, response)."""
               if parsed.scheme == "https":
                   conn = _PinnedHTTPSConnection(
-                      host, port, addresses, deadline, ssl.create_default_context()
+                      host, port, addresses, watchdog, ssl.create_default_context()
                   )
               else:
-                  conn = _PinnedHTTPConnection(host, port, addresses, deadline)
+                  conn = _PinnedHTTPConnection(host, port, addresses, watchdog)
               display_host = "[" + host + "]" if ":" in host else host
               if parsed.port is not None:
                   display_host += ":" + str(parsed.port)
@@ -1353,11 +1443,15 @@ jobs:
                   raise _Abort(retryable=True) from exc
               except (OSError, http.client.HTTPException) as exc:
                   conn.close()
+                  if watchdog.expired():
+                      # The watchdog ended the hop at the attempt deadline; its socket
+                      # shutdown surfaces as EOF or a stream error, not as TimeoutError.
+                      raise _Abort(retryable=True) from exc
                   raise _Abort(message=_failure_message(field, cap)) from exc
               return conn, response
 
 
-          def _download(response, conn, out_path, cap, deadline, field):
+          def _download(response, conn, out_path, cap, watchdog, field):
               """Stream the body to ``<out>.part`` with the cap bound during transfer."""
               part = out_path + ".part"
               _remove(part)
@@ -1365,10 +1459,10 @@ jobs:
               try:
                   with open(part, "wb") as handle:
                       while True:
-                          _check_deadline(deadline)
+                          watchdog.check()
                           if conn.sock is not None:
                               try:
-                                  conn.sock.settimeout(max(0.001, deadline - time.monotonic()))
+                                  conn.sock.settimeout(max(0.001, watchdog.remaining()))
                               except OSError:
                                   pass
                           try:
@@ -1376,6 +1470,8 @@ jobs:
                           except TimeoutError as exc:
                               raise _Abort(retryable=True) from exc
                           except (OSError, http.client.HTTPException) as exc:
+                              if watchdog.expired():
+                                  raise _Abort(retryable=True) from exc
                               raise _Abort(message=_failure_message(field, cap)) from exc
                           if not piece:
                               break
@@ -1384,13 +1480,25 @@ jobs:
                           except OSError as exc:
                               raise _Abort(message=_failure_message(field, cap)) from exc
                           total += len(piece)
-                          # Bound during transfer: at most cap+1 bytes are ever read, so an
-                          # oversized body is refused without relying on Content-Length and
-                          # before it is written out as a complete file.
+                          # Bound during transfer: the body is read in FETCH_CHUNK pieces and
+                          # the transfer is aborted as soon as the total received exceeds the
+                          # cap, so an oversized body is refused without relying on
+                          # Content-Length and before it is renamed to the output path.  At
+                          # most cap + FETCH_CHUNK bytes are ever received.
                           if total > cap:
                               raise _Abort(message=_cap_message(field, cap))
+                  if watchdog.expired():
+                      # The watchdog ended the transfer at the attempt deadline; its socket
+                      # shutdown can look like a clean short EOF, so the bytes received so
+                      # far are not a complete response.
+                      raise _Abort(retryable=True)
+                  # Verify the framing before the rename: a body that ended early is a
+                  # failed fetch, not a short file.
                   if response.length:
-                      # A declared length that was not fully received is a failed fetch.
+                      # A declared length that was not fully received.
+                      raise _Abort(message=_failure_message(field, cap))
+                  if response.chunked and response.chunk_left is not None:
+                      # A chunked body that never reached its terminating chunk.
                       raise _Abort(message=_failure_message(field, cap))
               except BaseException:
                   _remove(part)
@@ -1400,42 +1508,47 @@ jobs:
 
 
           def _fetch_attempt(field, url, out_path, cap, *, allow_address, max_time, max_redirects):
-              deadline = time.monotonic() + max_time
-              current = url
-              redirects = 0
-              while True:
-                  parsed, host, target = _parse_hop(current, field)
-                  port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                  addresses = _resolve(host, port, allow_address, field)
-                  _check_deadline(deadline)
-                  conn, response = _open(parsed, host, target, port, addresses, deadline, field, cap)
-                  try:
-                      if response.status in _REDIRECT_STATUSES:
-                          location = response.getheader("Location")
-                          if not location:
-                              raise _Abort(message=_failure_message(field, cap))
-                          redirects += 1
-                          if redirects > max_redirects:
-                              raise _Abort(
-                                  message=_refused_message(
-                                      field,
-                                      "more than "
-                                      + str(max_redirects)
-                                      + " redirects from "
-                                      + host,
+              watchdog = _AttemptDeadline(max_time)
+              try:
+                  current = url
+                  redirects = 0
+                  while True:
+                      parsed, host, target = _parse_hop(current, field)
+                      port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                      addresses = _resolve(host, port, allow_address, field)
+                      watchdog.check()
+                      conn, response = _open(
+                          parsed, host, target, port, addresses, watchdog, field, cap
+                      )
+                      try:
+                          if response.status in _REDIRECT_STATUSES:
+                              location = response.getheader("Location")
+                              if not location:
+                                  raise _Abort(message=_failure_message(field, cap))
+                              redirects += 1
+                              if redirects > max_redirects:
+                                  raise _Abort(
+                                      message=_refused_message(
+                                          field,
+                                          "more than "
+                                          + str(max_redirects)
+                                          + " redirects from "
+                                          + host,
+                                      )
                                   )
-                              )
-                          # Resolve the next hop against the current URL and repeat the
-                          # scheme check and the address policy on that hop.
-                          current = urljoin(current, location)
-                          continue
-                      if response.status in _RETRYABLE_STATUSES:
-                          raise _Abort(retryable=True)
-                      if not 200 <= response.status < 300:
-                          raise _Abort(message=_failure_message(field, cap))
-                      return _download(response, conn, out_path, cap, deadline, field)
-                  finally:
-                      conn.close()
+                              # Resolve the next hop against the current URL and repeat the
+                              # scheme check and the address policy on that hop.
+                              current = urljoin(current, location)
+                              continue
+                          if response.status in _RETRYABLE_STATUSES:
+                              raise _Abort(retryable=True)
+                          if not 200 <= response.status < 300:
+                              raise _Abort(message=_failure_message(field, cap))
+                          return _download(response, conn, out_path, cap, watchdog, field)
+                      finally:
+                          conn.close()
+              finally:
+                  watchdog.cancel()
 
 
           def fetch_branding_image(
@@ -1522,27 +1635,43 @@ jobs:
 
           # Per-field caps (DeskForge #80) and destination pinning. Every image is
           # downloaded by the workflow-owned fetch_branding_image.py helper written
-          # above, which bounds the transfer at cap+1 bytes: an oversized body is
-          # aborted at fetch and never reaches the manifest or any downstream
-          # consumer. That bound does not rely on HTTP Content-Length, and it no
-          # longer depends on the runner's curl version (curl --max-filesize only
-          # aborts an unknown-length body from curl 8.4.0 on, while the ubuntu-22.04
-          # runner ships curl 7.81.0). The same helper enforces the destination
-          # invariant: every connection it makes -- the initial request and every
-          # redirect hop -- repeats the http(s) scheme check and the non-public
-          # address policy, and connects to the validated address rather than to
-          # the hostname, so neither a provider URL nor a provider-controlled
-          # redirect can send the runner to a loopback, private, link-local or
-          # otherwise non-public destination.
+          # above, which bounds the transfer during download: the body is read in
+          # 64 KiB pieces and the fetch aborts as soon as the total exceeds the cap,
+          # so an oversized body is refused at fetch and never reaches the manifest
+          # or any downstream consumer. That bound does not rely on HTTP
+          # Content-Length, and it no longer depends on the runner's curl version
+          # (curl --max-filesize only aborts an unknown-length body from curl 8.4.0
+          # on, while the ubuntu-22.04 runner ships curl 7.81.0). The same helper
+          # enforces the destination invariant: every connection it makes -- the
+          # initial request and every redirect hop -- repeats the http(s) scheme
+          # check and the non-public address policy, and connects to the validated
+          # address rather than to the hostname, so neither a provider URL nor a
+          # provider-controlled redirect can send the runner to a loopback, private,
+          # link-local or otherwise non-public destination.
           fetch_branding_image() {
             local field="$1" url="$2" out="$3" cap="$4"
             # An absent URL stays a no-op: no fetch, no output, no new failure mode.
             if [ -z "$url" ]; then return 0; fi
             # The helper owns the whole fetch boundary (resolution, address policy,
-            # pinned connections, redirects, transfer-time cap and the .part ->
-            # final rename) and prints the deterministic per-field ::error:: text
-            # itself; the exit code fails this step under set -e.
-            python3 "$fetcher" "$field" "$url" "$out" "$cap"
+            # pinned connections, redirects, transfer-time cap, per-attempt
+            # wall-clock deadline and the .part -> final rename) and prints the
+            # deterministic per-field ::error:: text itself; the exit code fails
+            # this step under set -e.
+            #
+            # Process-level backstop for the one blocking call the helper cannot
+            # interrupt in-process (a hung resolver call): the bound is above the
+            # helper's own worst case (3 attempts x 120 s + 2 x 2 s retry delay).
+            # Only the timeout exit status gets a message from this wrapper, so an
+            # ordinary helper failure is never reported twice.
+            local process_timeout=420
+            local rc=0
+            timeout --signal=TERM --kill-after=10 "$process_timeout" python3 "$fetcher" "$field" "$url" "$out" "$cap" || rc=$?
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              rm -f -- "$out.part"
+              echo "::error::${field} image fetch timed out after the ${process_timeout} s process bound"
+              return 1
+            fi
+            return "$rc"
           }
           fetch_branding_image app_icon_url "$RQS_APP_ICON_URL" "$staging/app-icon.png" $((10 * 1024 * 1024))
           fetch_branding_image app_logo_url "$RQS_APP_LOGO_URL" "$staging/app-logo.png" $((10 * 1024 * 1024))

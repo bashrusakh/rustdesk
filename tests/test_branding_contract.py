@@ -30,6 +30,17 @@ Covers the review findings on the Windows branding workflow:
       policy before connecting. A local HTTP fixture plus a policy seam prove
       the refusals at the connection boundary, not by string validation.
 
+  F7  each fetch attempt is bounded by a wall-clock deadline, not by the named
+      checks between socket operations: a peer that dribbles status-line, header,
+      interim-response or body bytes inside every read timeout is cut off at the
+      deadline by a watchdog that shuts the attempt's live socket down, and the
+      workflow shell wrapper adds a process-level timeout backstop for the one
+      call that cannot be interrupted in-process (a hung resolver call). Framing
+      is verified before the final rename (a body shorter than its declared
+      Content-Length or a chunked body without its terminating chunk fails
+      closed), and a resolution that mixes public and non-public addresses is
+      refused in full before any connection.
+
 Run with:  python3 tests/test_branding_contract.py
 """
 
@@ -43,12 +54,14 @@ import os
 import random
 import re
 import shutil
+import socket
 import socketserver
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zlib
 from http.server import BaseHTTPRequestHandler
@@ -1394,6 +1407,7 @@ class _FetchServer(socketserver.ThreadingTCPServer):
         self.stream_done = threading.Event()
         self.stream_completed = False
         self.stream_bytes = 0
+        self.trickle_done = threading.Event()
 
     def get_request(self):
         conn, addr = super().get_request()
@@ -1422,6 +1436,8 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
     SMALL = 1024
     BIG_CL = 4 * 1024 * 1024
     HUGE = 64 * 1024 * 1024
+    TRICKLE_DELAY = 0.2
+    TRICKLE_LIMIT = 40  # ~8 s of dribbled bytes
 
     def log_message(self, *args):
         pass
@@ -1439,6 +1455,33 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
 
     def _redirect(self, location):
         self._respond(b"", status=302, headers=(("Location", location),))
+
+    def _trickle_bytes(self, preamble):
+        # Deliver the preamble and then one byte per TRICKLE_DELAY, each well
+        # inside any per-read socket timeout, so only a wall-clock deadline can
+        # end the hop.  Bounded, so a client without such a deadline fails the
+        # elapsed-time assertion instead of hanging the suite.
+        try:
+            self.wfile.write(preamble)
+            for _ in range(self.TRICKLE_LIMIT):
+                time.sleep(self.TRICKLE_DELAY)
+                self.wfile.write(b"x")
+        except OSError:
+            pass
+        finally:
+            self.server.trickle_done.set()
+
+    def _trickle_interim(self):
+        # A stream of interim 1xx responses: on interpreters without an interim
+        # limit, only a wall-clock deadline can end this hop.
+        try:
+            for _ in range(self.TRICKLE_LIMIT):
+                self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                time.sleep(self.TRICKLE_DELAY)
+        except OSError:
+            pass
+        finally:
+            self.server.trickle_done.set()
 
     def _stream(self, total, chunked):
         # A body far larger than any per-field cap. The chunked variant declares no
@@ -1469,27 +1512,49 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.note_request()
-        if self.path == "/image.png":
+        path = self.path.split("?", 1)[0]
+        if path == "/image.png":
             self._respond(REFERENCE_PNG)
-        elif self.path == "/chunked-small":
+        elif path == "/chunked-small":
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             body = b"C" * self.SMALL
             self.wfile.write(b"%x\r\n" % len(body) + body + b"\r\n")
             self.wfile.write(b"0\r\n\r\n")
-        elif self.path == "/big-cl":
+        elif path == "/big-cl":
             self._stream(self.BIG_CL, chunked=False)
-        elif self.path == "/huge":
+        elif path == "/huge":
             self._stream(self.HUGE, chunked=True)
-        elif self.path == "/redirect-ok":
+        elif path == "/redirect-ok":
             self._redirect(self.server.redirect_ok)
-        elif self.path == "/redirect-forbidden":
+        elif path == "/redirect-forbidden":
             self._redirect(self.server.redirect_forbidden)
-        elif self.path == "/redirect-ftp":
+        elif path == "/redirect-ftp":
             self._redirect(self.server.redirect_ftp)
-        elif self.path == "/loop":
+        elif path == "/loop":
             self._redirect(self.server.redirect_loop)
+        elif path == "/trickle-status":
+            self._trickle_bytes(b"")
+        elif path == "/trickle-headers":
+            self._trickle_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nX-Trickle: ")
+        elif path == "/trickle-interim":
+            self._trickle_interim()
+        elif path == "/short-body":
+            # Declares 4096 bytes, sends 10 and closes: the rest never arrives.
+            self.send_response(200)
+            self.send_header("Content-Length", "4096")
+            self.end_headers()
+            self.wfile.write(b"P" * 10)
+            self.close_connection = True
+        elif path == "/truncated-chunked":
+            # Declares a 64-byte chunk, sends 16 bytes and closes without the
+            # terminating zero-length chunk.
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"40\r\n" + b"Q" * 16)
+            self.close_connection = True
         else:
             self._respond(b"", status=404)
 
@@ -1529,11 +1594,11 @@ class DestinationPinnedFetchTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def _run(self, url, *, cap=1024 * 1024, policy=None, max_redirects=None):
+    def _run(self, url, *, cap=1024 * 1024, policy=None, max_redirects=None, **options):
         """Run the shipped fetch entry point; return (out_path, FetchError or None)."""
         directory = Path(tempfile.mkdtemp(prefix="branding-fetch-"))
         out = directory / "image.png"
-        extra = {}
+        extra = dict(options)
         if policy is not None:
             extra["allow_address"] = policy
         if max_redirects is not None:
@@ -1705,10 +1770,18 @@ class DestinationPinnedFetchTests(unittest.TestCase):
             "100::1", "2001:db8::1", "2001::1", "2001:2::1", "2001:10::1",
             "2001:20::1", "64:ff9b::1", "64:ff9b:1::1", "2002::1",
             "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+            # IANA non-globally-reachable entries added for policy parity:
+            "3fff::1",  # Documentation (RFC 9637)
+            "5f00::1",  # Segment Routing (SRv6) SIDs (RFC 9602)
+            "100:0:0:1::1",  # Dummy IPv6 Prefix (RFC 9780)
+            "::1.2.3.4",  # deprecated IPv4-compatible form (RFC 4291)
         )
         allowed = (
             "8.8.8.8", "1.1.1.1", "93.184.216.34", "172.32.0.1", "192.169.0.1",
             "2606:4700:4700::1111", "::ffff:8.8.8.8",
+            # IANA entries marked globally reachable must stay accepted:
+            "2001:1::1", "2001:1::2", "2001:1::3", "2001:3::1", "2001:4:112::1",
+            "2001:30::1", "2620:4f:8000::1",
         )
         for address in refused:
             self.assertFalse(self.module.is_public_address(address), address)
@@ -1727,11 +1800,196 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         before = self.main.snapshot()
         result, out = self._run_shell(self.main_url + "/image.png?token=payload-secret")
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.count("::error::"), 1, result.stdout)
         self.assertIn("::error::app_logo_url", result.stdout)
         self.assertIn("non-public address", result.stdout)
         self.assertNotIn("http://", result.stdout)
         self.assertNotIn("payload-secret", result.stdout)
         self.assertEqual(self.main.snapshot(), before, "the refused loopback URL was connected to")
+        self._assert_no_output(out)
+
+    # 9. regression for the blocking review finding: the per-attempt deadline must
+    #    bound the whole hop, not only the named checks between socket operations.
+    TRICKLE_ENDPOINTS = ("/trickle-status", "/trickle-headers", "/trickle-interim")
+
+    def test_trickling_peer_cannot_extend_an_attempt_past_the_deadline(self):
+        # The pre-fix helper only re-checked its deadline between socket operations
+        # and relied on the per-read socket timeout, so each of these dribbling
+        # peers kept its hop alive well past the 1 s attempt bound (8 s with this
+        # bounded fixture, 40 s in the open-ended probe).
+        for path in self.TRICKLE_ENDPOINTS:
+            with self.subTest(path=path):
+                self.main.trickle_done.clear()
+                start = time.monotonic()
+                out, error = self._run(
+                    self.main_url + path, policy=self.policy, max_time=1.0, retries=0
+                )
+                elapsed = time.monotonic() - start
+                self.assertIsNotNone(error, "the trickling peer was accepted")
+                self.assertEqual(
+                    str(error),
+                    self.module._failure_message("app_logo_url", 1024 * 1024),
+                    "expected the deterministic per-field timeout failure",
+                )
+                self.assertLess(
+                    elapsed,
+                    5.0,
+                    "a peer dribbling one byte inside every read timeout extended the "
+                    "attempt past its 1 s deadline",
+                )
+                self._assert_no_output(out)
+                self.assertTrue(
+                    self.main.trickle_done.wait(10),
+                    "the trickle fixture never finished; the client never cut the hop off",
+                )
+
+    def test_trickling_peer_cli_reports_one_deterministic_field_error_within_the_bound(self):
+        # The same regression through the shipped CLI: exactly one deterministic
+        # per-field ::error:: annotation, no traceback, no echoed URL and no output
+        # file.  The test copy shortens the two bound constants and permits exactly
+        # the fixture address through the helper's own allow_address seam (the same
+        # seam the in-process tests use); everything else is the shipped helper.
+        directory = Path(tempfile.mkdtemp(prefix="branding-fetch-cli-"))
+        helper = directory / "fetch_branding_image.py"
+        source = fetcher_source()
+        self.assertIn("FETCH_MAX_TIME = 120.0", source)
+        self.assertIn("FETCH_RETRIES = 2", source)
+        self.assertIn("allow_address=is_public_address,", source)
+        helper.write_text(
+            source.replace("FETCH_MAX_TIME = 120.0", "FETCH_MAX_TIME = 1.0")
+            .replace("FETCH_RETRIES = 2", "FETCH_RETRIES = 0")
+            .replace(
+                "allow_address=is_public_address,",
+                "allow_address=lambda address: str(address) == %r," % FIXTURE_ADDRESS,
+            ),
+            encoding="utf-8",
+        )
+        self.main.trickle_done.clear()
+        out = directory / "image.png"
+        start = time.monotonic()
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(helper),
+                    "app_logo_url",
+                    self.main_url + "/trickle-status?token=payload-secret",
+                    str(out),
+                    str(1024 * 1024),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("the trickling peer kept the helper alive past the attempt deadline")
+        elapsed = time.monotonic() - start
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.count("::error::"), 1, result.stdout)
+        self.assertTrue(result.stdout.startswith("::error::app_logo_url"), result.stdout)
+        self.assertNotIn("http://", result.stdout)
+        self.assertNotIn("payload-secret", result.stdout)
+        self.assertLess(elapsed, 5.0)
+        self.assertFalse(out.exists())
+        self.assertFalse(Path(str(out) + ".part").exists())
+
+    def test_shell_wrapper_process_bound_is_a_deterministic_backstop(self):
+        # The helper cannot interrupt a resolver call that blocks below Python; the
+        # wrapper's process-level timeout bounds that case and prints the
+        # deterministic per-field error itself.  Only the timeout exit status gets
+        # that message, so a normal helper failure is not reported twice (the
+        # loopback wrapper test above counts exactly one ::error:: line).
+        directory = Path(tempfile.mkdtemp(prefix="branding-fetch-process-"))
+        helper = directory / "hanging_fetcher.py"
+        helper.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+        out = directory / "image.png"
+        function = fetch_shell_function()
+        self.assertIn("local process_timeout=420", function)
+        script = (
+            "set -euo pipefail\n"
+            + 'fetcher="' + str(helper) + '"\n'
+            + function.replace("local process_timeout=420", "local process_timeout=2")
+            + 'fetch_branding_image app_logo_url "$URL" "$OUT" "$CAP"\n'
+        )
+        start = time.monotonic()
+        result = subprocess.run(
+            ["bash", "-s"],
+            input=script,
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "URL": "http://example.invalid/image.png?token=payload-secret",
+                "OUT": str(out),
+                "CAP": str(1024 * 1024),
+            },
+            timeout=30,
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.count("::error::"), 1, result.stdout)
+        self.assertIn("::error::app_logo_url", result.stdout)
+        self.assertIn("timed out", result.stdout)
+        self.assertIn("2 s process bound", result.stdout)
+        self.assertLess(elapsed, 20.0)
+        self.assertFalse(out.exists())
+        self.assertFalse(Path(str(out) + ".part").exists())
+
+    def test_short_content_length_body_fails_closed(self):
+        out, error = self._run(self.main_url + "/short-body", policy=self.policy, max_time=5.0)
+        self.assertIsNotNone(error, "a body shorter than its Content-Length was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
+        self._assert_no_output(out)
+
+    def test_truncated_chunked_body_fails_closed(self):
+        out, error = self._run(
+            self.main_url + "/truncated-chunked", policy=self.policy, max_time=5.0
+        )
+        self.assertIsNotNone(error, "a truncated chunked body was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
+        self._assert_no_output(out)
+
+    def test_mixed_public_and_non_public_resolution_is_refused_before_connecting(self):
+        # The public address comes first, so an implementation that connected to
+        # each address as it validated it would reach the public address before
+        # discovering the non-public one; the hop must instead be refused in full
+        # with zero connections attempted.
+        infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 80)),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (FIXTURE_ADDRESS, self.main.server_address[1]),
+            ),
+        ]
+        attempted = []
+        real_getaddrinfo = self.module.socket.getaddrinfo
+        real_socket = self.module.socket.socket
+
+        def fake_getaddrinfo(host, port, **kwargs):
+            return infos
+
+        def forbidden_socket(*args, **kwargs):
+            attempted.append((args, kwargs))
+            raise AssertionError("a connection was attempted for a refused resolution")
+
+        self.module.socket.getaddrinfo = fake_getaddrinfo
+        self.module.socket.socket = forbidden_socket
+        try:
+            out, error = self._run("http://mixed.example/image.png")
+        finally:
+            self.module.socket.getaddrinfo = real_getaddrinfo
+            self.module.socket.socket = real_socket
+        self.assertIsNotNone(error, "the mixed resolution was accepted")
+        self.assertIn("mixed.example", str(error))
+        self.assertIn("non-public address", str(error))
+        self.assertEqual(attempted, [], "the refused hop attempted a connection")
         self._assert_no_output(out)
 
 
