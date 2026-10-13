@@ -1034,7 +1034,10 @@ jobs:
 
           The invariant enforced here is that *every* connection this fetcher makes --
           the initial request and every redirect hop -- uses only a validated public
-          destination.  For each hop the hostname is resolved exactly once, every
+          destination (for IPv6, inside the IANA global-unicast block 2000::/3 and
+          outside every range those registries mark reserved or not globally reachable;
+          for IPv4, outside the special-purpose ranges).  For each hop the hostname is
+          resolved exactly once, every
           resolved address is checked against the address policy, and the connection is
           then made to a validated address rather than to the hostname.  Nothing can
           re-resolve between the check and the connect, and a hop whose resolution
@@ -1056,12 +1059,13 @@ jobs:
               failures curl retries as transient (a timeout, or an HTTP 408/429/500/
               502/503/504 response);
             * ``--max-time 120``: each attempt is bounded by a wall-clock deadline that
-              covers its connection and every redirect hop of that attempt.  The deadline
-              is re-checked between operations, and a watchdog shuts down the attempt's
-              live socket when the deadline expires, so a peer that delivers a byte
-              inside every read timeout -- during the status line, the headers, an
-              interim 1xx response or the body -- cannot extend the attempt past the
-              bound;
+              covers its connection, its TLS handshake and every redirect hop of that
+              attempt.  The deadline is re-checked between operations, the socket timeout
+              is re-armed from the remaining budget immediately before the handshake, and
+              a watchdog shuts down the attempt's live socket when the deadline expires,
+              so a peer that delivers a byte inside every read timeout -- during the
+              status line, the headers, an interim 1xx response, the handshake or the
+              body -- cannot extend the attempt past the bound;
             * the download is written to ``<out>.part`` and renamed to ``<out>`` only
               after it was received completely within the cap, so any failure leaves no
               output file behind, and the framing is verified before the rename: a body
@@ -1114,14 +1118,69 @@ jobs:
           _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
           _RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
-          # The one authoritative non-public destination policy for this contract: the
-          # special-purpose ranges that are not public destinations for a literal fetch
-          # target, drawn from the IANA IPv4 and IPv6 special-purpose registries plus
-          # multicast and transition/deprecated forms that embed an IPv4 destination
-          # (6to4, Teredo, NAT64, deprecated IPv4-compatible).  A hop is refused when
-          # any address it resolves to falls in any range below.  This policy is
-          # deliberately not an exhaustive implementation of Internet routing.
+          # The one authoritative destination policy for this contract.  The IPv4 and
+          # IPv6 halves have different shapes:
+          #
+          #   * IPv4: the entries are the non-public special-purpose ranges, and their
+          #     complement is the ordinary IPv4 unicast space a fetch target lives in,
+          #     so no additional bound is needed.
+          #   * IPv6: the complement of a deny list is *not* public.  Most of the
+          #     128-bit space is outside the global-unicast allocation, so a literal
+          #     IPv6 address is public only when it is inside the IANA global-unicast
+          #     block 2000::/3 *and* outside every entry below.  That bound is enforced
+          #     in is_public_address and is deliberately not `is_global`, whose accepted
+          #     set is wider than the space the registries allocate for routing.
+          #
+          # Registry sources, retrieved 2026-10-14:
+          #
+          #   [A] IANA IPv6 Address Space registry (last updated 2025-10-23): 2000::/3
+          #       is Global Unicast and IANA unicast assignments are limited to it;
+          #       400::/6, 800::/5, 1000::/4, 6000::/3, fe00::/9 and fec0::/10 are
+          #       Reserved by IETF.
+          #   [B] IANA IPv6 Special-Purpose Address Registry (last updated 2025-10-09).
+          #   [C] IANA IPv6 Global Unicast Address Assignments (last updated 2025-10-10):
+          #       3ffe::/16 is RESERVED (the returned 6bone allocation, RFC 5156) and the
+          #       IANA-RESERVED tail 2d00::/8 .. 3ffc::/15 is not yet allocated.
+          #
+          # Inside 2000::/3 the list is every block [B] or [C] marks reserved or not
+          # globally reachable, at least 3ffe::/16.  One residual, stated explicitly:
+          # [B] marks 2001::/23 Globally Reachable False "unless allowed by a more
+          # specific allocation" and lists six reachable sub-blocks, exempted in
+          # _IPV6_REACHABLE_EXCEPTIONS below.  Four sub-blocks of that parent stay
+          # refused on purpose: 2001::/32 (Teredo, Globally Reachable "N/A"), 2001:2::/48
+          # (benchmarking), 2001:10::/28 (deprecated ORCHID, allocation terminated
+          # 2014-03) and 2001:20::/28 (ORCHIDv2, listed Globally Reachable True but
+          # non-routable at the IP layer by design, RFC 7343 section 1.2).
+          #
+          # Second residual: [C]'s registry note also reserves for future allocation
+          # the space inside 2000::/3 that has no ALLOCATED row (for example 2000::/16
+          # and the remainder of 3fff::/16).  This list enumerates the marked blocks;
+          # such unlisted literals pass the policy and have no allocated route today.
+          #
+          # Transition/deprecated forms that embed an IPv4 destination -- ::/96
+          # (IPv4-compatible), 64:ff9b::/96 and 64:ff9b:1::/48 (NAT64), 2002::/16 (6to4),
+          # and ::ffff:0:0/96 (IPv4-mapped, unmapped in is_public_address before
+          # classification) -- stay refused on purpose even where [B]'s Globally
+          # Reachable column is True or "N/A": this literal policy cannot verify the
+          # embedded IPv4 destination, so it fails closed.
+          #
+          # A hop is refused when any address it resolves to falls in any range below
+          # or, for IPv6, outside 2000::/3.  This policy is not an exhaustive
+          # implementation of Internet routing.
+          _IPV6_GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
+
+          # [B] sub-blocks inside 2001::/23 listed as Globally Reachable.
+          _IPV6_REACHABLE_EXCEPTIONS = (
+              ipaddress.ip_network("2001:1::1/128"),    # Port Control Protocol anycast
+              ipaddress.ip_network("2001:1::2/128"),    # TURN anycast
+              ipaddress.ip_network("2001:1::3/128"),    # DNS-SD SDP anycast
+              ipaddress.ip_network("2001:3::/32"),      # AMT
+              ipaddress.ip_network("2001:4:112::/48"),  # AS112-v6
+              ipaddress.ip_network("2001:30::/28"),     # Drone Remote ID DET prefix
+          )
+
           _NON_PUBLIC_NETWORKS = (
+              # IPv4 (complement: the ordinary unicast space).
               ipaddress.ip_network("0.0.0.0/8"),
               ipaddress.ip_network("127.0.0.0/8"),
               ipaddress.ip_network("10.0.0.0/8"),
@@ -1137,6 +1196,27 @@ jobs:
               ipaddress.ip_network("192.88.99.0/24"),
               ipaddress.ip_network("224.0.0.0/4"),
               ipaddress.ip_network("240.0.0.0/4"),
+              # IPv6, inside 2000::/3 ([B] and [C]).
+              ipaddress.ip_network("2001::/23"),        # IETF Protocol Assignments
+              ipaddress.ip_network("2001:db8::/32"),    # Documentation
+              ipaddress.ip_network("2002::/16"),        # 6to4 transition form
+              ipaddress.ip_network("3ffe::/16"),        # returned 6bone allocation
+              ipaddress.ip_network("3fff::/20"),        # Documentation (RFC 9637)
+              ipaddress.ip_network("2d00::/8"),         # [C] IANA-RESERVED tail,
+              ipaddress.ip_network("2e00::/7"),         #     not yet allocated
+              ipaddress.ip_network("3000::/5"),
+              ipaddress.ip_network("3800::/6"),
+              ipaddress.ip_network("3c00::/7"),
+              ipaddress.ip_network("3e00::/8"),
+              ipaddress.ip_network("3f00::/9"),
+              ipaddress.ip_network("3f80::/10"),
+              ipaddress.ip_network("3fc0::/11"),
+              ipaddress.ip_network("3fe0::/12"),
+              ipaddress.ip_network("3ff0::/13"),
+              ipaddress.ip_network("3ff8::/14"),
+              ipaddress.ip_network("3ffc::/15"),
+              # IPv6 outside 2000::/3, kept as explicit transition/deprecated
+              # refusals; the bound already refuses them.
               ipaddress.ip_network("::/128"),
               ipaddress.ip_network("::1/128"),
               # Deprecated IPv4-compatible form (RFC 4291, section 2.5.5.1): not a
@@ -1148,15 +1228,8 @@ jobs:
               ipaddress.ip_network("ff00::/8"),
               ipaddress.ip_network("100::/64"),
               ipaddress.ip_network("100:0:0:1::/64"),  # Dummy IPv6 Prefix (RFC 9780)
-              ipaddress.ip_network("2001:db8::/32"),
-              ipaddress.ip_network("3fff::/20"),  # Documentation (RFC 9637)
-              ipaddress.ip_network("2001::/32"),
-              ipaddress.ip_network("2001:2::/48"),
-              ipaddress.ip_network("2001:10::/28"),
-              ipaddress.ip_network("2001:20::/28"),
               ipaddress.ip_network("64:ff9b::/96"),
               ipaddress.ip_network("64:ff9b:1::/48"),
-              ipaddress.ip_network("2002::/16"),
               ipaddress.ip_network("5f00::/16"),  # Segment Routing (SRv6) SIDs (RFC 9602)
           )
 
@@ -1175,17 +1248,25 @@ jobs:
 
 
           def is_public_address(address):
-              """True when ``address`` is a public destination outside every policy range.
+              """True when ``address`` is a public destination inside the policy.
 
               ``address`` may be a string or an ipaddress address object.  IPv4-mapped
               IPv6 addresses are unmapped first and classified as their IPv4 address, so
-              ``::ffff:127.0.0.1`` is refused exactly like ``127.0.0.1``.
+              ``::ffff:127.0.0.1`` is refused exactly like ``127.0.0.1``.  For IPv6 the
+              deny list alone is not the policy: only the IANA global-unicast block
+              2000::/3 minus the registry-reserved ranges is public, so a literal
+              outside 2000::/3 is refused even though it is not listed below.
               """
               candidate = address
               if not isinstance(candidate, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
                   candidate = ipaddress.ip_address(candidate)
               if isinstance(candidate, ipaddress.IPv6Address) and candidate.ipv4_mapped is not None:
                   candidate = candidate.ipv4_mapped
+              if isinstance(candidate, ipaddress.IPv6Address):
+                  if candidate not in _IPV6_GLOBAL_UNICAST:
+                      return False
+                  if any(candidate in network for network in _IPV6_REACHABLE_EXCEPTIONS):
+                      return True
               return not any(candidate in network for network in _NON_PUBLIC_NETWORKS)
 
 
@@ -1300,6 +1381,35 @@ jobs:
                       raise _Abort(
                           message=_refused_message(field, "provider URL is not a usable absolute http(s) URL")
                       )
+              # Fail fast on the two inputs this fetcher cannot put on the wire: http.client
+              # encodes the request line and header values as ASCII (and the host as IDNA),
+              # so a raw non-ASCII byte in the host or in the request target only fails deep
+              # inside the stack, and a host with an empty DNS label only fails inside the
+              # resolver.  Only the field and, at most, the host are reported -- never the
+              # URL, the path or the query (a provider URL may be signed).
+              if any(ord(character) > 0x7F for character in host):
+                  raise _Abort(
+                      message=_refused_message(
+                          field, host + " is not an ASCII host name the fetcher can send"
+                      )
+                  )
+              if any(ord(character) > 0x7F for character in target):
+                  raise _Abort(
+                      message=_refused_message(
+                          field, host + " request target is not ASCII"
+                      )
+                  )
+              labels = host.split(".")
+              if labels and not labels[-1]:
+                  # A single trailing dot is the DNS root label; any other empty label
+                  # (including a second trailing dot) is not a host name.
+                  labels = labels[:-1]
+              if not labels or any(label == "" for label in labels):
+                  raise _Abort(
+                      message=_refused_message(
+                          field, host + " is not a usable DNS host name (empty label)"
+                      )
+                  )
               return parsed, host, target
 
 
@@ -1400,11 +1510,29 @@ jobs:
                   sock = _connect_pinned(self._pinned_addresses, self._watchdog)
                   try:
                       # SNI and certificate verification use the URL hostname while the TCP
-                      # connection uses the validated address.
-                      self.sock = self._pinned_context.wrap_socket(sock, server_hostname=self.host)
+                      # connection uses the validated address.  The blocking handshake is
+                      # deferred: wrap_socket detaches the raw socket's descriptor into the
+                      # SSLSocket, so only the SSLSocket has a live handle the attempt
+                      # watchdog can shut down during the whole handshake.
+                      self.sock = self._pinned_context.wrap_socket(
+                          sock, server_hostname=self.host, do_handshake_on_connect=False
+                      )
                   except BaseException:
                       sock.close()
                       raise
+                  try:
+                      # Register the wrapped socket with the watchdog before the handshake
+                      # begins, so a stalled handshake is ended at the attempt deadline, and
+                      # re-arm the timeout from the *current* remaining budget: the TCP
+                      # connect may have consumed most of it, and the pre-connect timeout
+                      # would otherwise bound the handshake well past that deadline.
+                      self._watchdog.hold(self.sock)
+                      self.sock.settimeout(max(0.001, self._watchdog.remaining()))
+                      self.sock.do_handshake()
+                  except BaseException:
+                      self.sock.close()
+                      raise
+                  # Re-register the wrapped socket: it stays held for the response and body.
                   self._watchdog.hold(self.sock)
 
 

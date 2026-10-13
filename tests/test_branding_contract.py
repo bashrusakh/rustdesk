@@ -56,6 +56,7 @@ import re
 import shutil
 import socket
 import socketserver
+import ssl
 import struct
 import subprocess
 import sys
@@ -1525,6 +1526,10 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/image.png":
             self._respond(REFERENCE_PNG)
+        elif path.startswith("/encoded/"):
+            # Percent-encoded ASCII request targets must stay fetchable: the URL
+            # carries no raw non-ASCII byte, only the escape sequences.
+            self._respond(REFERENCE_PNG)
         elif path == "/chunked-small":
             self.send_response(200)
             self.send_header("Transfer-Encoding", "chunked")
@@ -1569,6 +1574,109 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
             self._respond(b"", status=404)
 
 
+class _TlsHandshakeFixture(socketserver.ThreadingTCPServer):
+    """Plain-TCP fixture that accepts a connection and never completes TLS.
+
+    The TLS handshake happens before certificate verification, so a fixture
+    with no certificate is enough: ``stall`` reads and never answers, ``drip``
+    sends a TLS record header declaring a 16 KiB body and then one body byte
+    per ``DRIP_STEP`` (well inside any per-read timeout, so only a wall-clock
+    deadline ends the hop).
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True
+    DRIP_STEP = 0.2
+    DRIP_LIMIT = 30  # ~6 s of dribbled TLS record bytes
+
+    def __init__(self, address, mode):
+        super().__init__(address, _TlsHandshakeHandler)
+        self.mode = mode
+        self.lock = threading.Lock()
+        self.connections = 0
+        self.client_closed = threading.Event()
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with self.lock:
+            self.connections += 1
+        return conn, addr
+
+    def snapshot(self):
+        with self.lock:
+            return self.connections
+
+    def note_client_closed(self):
+        self.client_closed.set()
+
+
+class _TlsHandshakeHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            if self.server.mode == "drip":
+                self.request.sendall(b"\x16\x03\x03\x40\x00")
+                try:
+                    for _ in range(self.server.DRIP_LIMIT):
+                        time.sleep(self.server.DRIP_STEP)
+                        self.request.sendall(b"z")
+                except OSError:
+                    pass
+            else:
+                while self.request.recv(4096):
+                    pass
+        except OSError:
+            pass
+        finally:
+            self.server.note_client_closed()
+
+
+HAS_OPENSSL = shutil.which("openssl") is not None
+_TLS_CERTIFICATES = {}
+_TLS_CERTIFICATES_LOCK = threading.Lock()
+
+
+def tls_fixture_certificate(ip):
+    """Self-signed cert/key for one IP SAN, minted once per process.
+
+    Needs an OpenSSL CLI new enough for ``-addext`` (1.1.1+).  The certificate
+    is only a fixture: the fetch under test injects the trust anchor, so this
+    changes trust, never verification or SNI.
+    """
+    with _TLS_CERTIFICATES_LOCK:
+        if ip not in _TLS_CERTIFICATES:
+            directory = Path(tempfile.mkdtemp(prefix="branding-tls-cert-"))
+            cert = directory / "cert.pem"
+            key = directory / "key.pem"
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-nodes", "-days", "1", "-keyout", str(key),
+                    "-out", str(cert), "-subj", "/CN=" + ip,
+                    "-addext", "subjectAltName=IP:" + ip,
+                ],
+                check=True, capture_output=True,
+            )
+            _TLS_CERTIFICATES[ip] = (cert, key)
+        return _TLS_CERTIFICATES[ip]
+
+
+class _TlsFetchServer(_FetchServer):
+    """HTTP fixture behind a real TLS handshake with a fixture certificate."""
+
+    def __init__(self, address, context):
+        super().__init__(address, _BrandingFetchHandler)
+        self.context = context
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        return self.context.wrap_socket(conn, server_side=True), addr
+
+    def handle_error(self, request, client_address):
+        # The wrong-certificate test aborts the handshake; that is the expected
+        # outcome, not a fixture error to print.
+        pass
+
+
 class DestinationPinnedFetchTests(unittest.TestCase):
     """F6: every connection the fetch boundary makes targets a validated address.
 
@@ -1587,6 +1695,8 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         cls.main = _FetchServer(("127.0.0.1", 0), _BrandingFetchHandler)
         cls.ok = _FetchServer(("127.0.0.1", 0), _BrandingFetchHandler)
         cls.forbidden = _FetchServer(("127.0.0.2", 0), _BrandingFetchHandler)
+        cls.tls_stall = _TlsHandshakeFixture(("127.0.0.1", 0), "stall")
+        cls.tls_drip = _TlsHandshakeFixture(("127.0.0.1", 0), "drip")
         main_port = cls.main.server_address[1]
         ok_port = cls.ok.server_address[1]
         forbidden_port = cls.forbidden.server_address[1]
@@ -1595,12 +1705,16 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         cls.main.redirect_forbidden = "http://127.0.0.2:%d/image.png" % forbidden_port
         cls.main.redirect_ftp = "ftp://127.0.0.1:%d/image.png" % ok_port
         cls.main.redirect_loop = "%s/loop" % cls.main_url
-        for server in (cls.main, cls.ok, cls.forbidden):
+        for server in (
+            cls.main, cls.ok, cls.forbidden, cls.tls_stall, cls.tls_drip
+        ):
             threading.Thread(target=server.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
-        for server in (cls.main, cls.ok, cls.forbidden):
+        for server in (
+            cls.main, cls.ok, cls.forbidden, cls.tls_stall, cls.tls_drip
+        ):
             server.shutdown()
             server.server_close()
 
@@ -1788,6 +1902,19 @@ class DestinationPinnedFetchTests(unittest.TestCase):
             "100::1", "2001:db8::1", "2001::1", "2001:2::1", "2001:10::1",
             "2001:20::1", "64:ff9b::1", "64:ff9b:1::1", "2002::1",
             "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+            # IETF-Reserved IPv6 blocks outside the 2000::/3 global-unicast
+            # allocation (IANA IPv6 Address Space registry).  The deny list's
+            # complement is not public there, so a literal outside 2000::/3 is
+            # refused even though it is not in the non-public table.
+            "400::1", "800::1", "1000::1", "6000::1", "fe00::1", "fec0::1",
+            # IANA-RESERVED blocks inside 2000::/3 (IANA IPv6 Global Unicast
+            # Address Assignments registry): 3ffe::/16 is the returned 6bone
+            # allocation (RFC 5156) and the tail rows 2d00::/8 .. 3ffc::/15 are
+            # reserved by IANA and not yet allocated to any registry.
+            "3ffe::1",
+            "2d00::1", "2e00::1", "3000::1", "3800::1", "3c00::1", "3e00::1",
+            "3f00::1", "3f80::1", "3fc0::1", "3fe0::1", "3ff0::1", "3ff8::1",
+            "3ffc::1",
             # IANA non-globally-reachable entries added for policy parity:
             "3fff::1",  # Documentation (RFC 9637)
             "5f00::1",  # Segment Routing (SRv6) SIDs (RFC 9602)
@@ -1796,7 +1923,7 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         )
         allowed = (
             "8.8.8.8", "1.1.1.1", "93.184.216.34", "172.32.0.1", "192.169.0.1",
-            "2606:4700:4700::1111", "::ffff:8.8.8.8",
+            "2606:4700:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8",
             # IANA entries marked globally reachable must stay accepted:
             "2001:1::1", "2001:1::2", "2001:1::3", "2001:3::1", "2001:4:112::1",
             "2001:30::1", "2620:4f:8000::1",
@@ -2048,6 +2175,263 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         self.assertIn("mixed.example", str(error))
         self.assertIn("non-public address", str(error))
         self.assertEqual(attempted, [], "the refused hop attempted a connection")
+        self._assert_no_output(out)
+
+    # 10. deterministic fail-fast refusals for inputs the wire cannot carry
+
+    def _run_with_resolver_guard(self, url, description):
+        """Run the fetch with the resolver replaced by a hard failure.
+
+        The resolver is only reached when the hop was not refused up front, so
+        any implementation that resolves (and then fails deep in http.client or
+        the resolver) an input it cannot put on the wire fails this test.
+        """
+        real_getaddrinfo = self.module.socket.getaddrinfo
+
+        def forbidden_getaddrinfo(host, port, **kwargs):
+            raise AssertionError(
+                description
+                + ": the helper resolved "
+                + repr(host)
+                + " instead of refusing the input up front"
+            )
+
+        self.module.socket.getaddrinfo = forbidden_getaddrinfo
+        try:
+            return self._run(url, policy=self.policy)
+        finally:
+            self.module.socket.getaddrinfo = real_getaddrinfo
+
+    def test_non_ascii_host_is_refused_before_resolution(self):
+        # http.client encodes the Host header as ASCII (or IDNA), so a raw
+        # Unicode host reaches it and fails there with UnicodeEncodeError; the
+        # fetcher must refuse it deterministically instead.
+        out, error = self._run_with_resolver_guard(
+            "http://\u043f\u0440\u0438\u043c\u0435\u0440.\u0440\u0444/icon.png",
+            "non-ASCII host",
+        )
+        self.assertIsNotNone(error, "a raw Unicode host was accepted")
+        text = str(error)
+        self.assertIn("not an ASCII host name", text)
+        self.assertNotIn("http://", text)
+        self.assertNotIn("icon.png", text)
+        self._assert_no_output(out)
+
+    def test_non_ascii_request_target_is_refused_before_connecting(self):
+        # http.client encodes the request line as ASCII, so a raw Unicode path
+        # or query reaches it and fails there with UnicodeEncodeError; the host
+        # may be named in the refusal, the URL, path and query never may.
+        before = self.main.snapshot()
+        out, error = self._run_with_resolver_guard(
+            self.main_url
+            + "/\u0438\u043a\u043e\u043d\u043a\u0430.png?token=payload-secret",
+            "non-ASCII request target",
+        )
+        self.assertIsNotNone(error, "a raw Unicode request target was accepted")
+        text = str(error)
+        self.assertIn("request target is not ASCII", text)
+        self.assertNotIn("http://", text)
+        self.assertNotIn("payload-secret", text)
+        self.assertNotIn("\u0438\u043a\u043e\u043d\u043a\u0430", text)
+        self.assertEqual(
+            self.main.snapshot(), before, "the refused hop was connected to"
+        )
+        self._assert_no_output(out)
+
+    def test_host_with_an_empty_dns_label_is_refused_before_resolution(self):
+        # A host with an empty DNS label only fails later in getaddrinfo; the
+        # fetcher must refuse it deterministically, including a second trailing
+        # dot (the single trailing root dot stays usable).
+        for url in (
+            "http://127.0.0.1..:80/image.png",
+            "http://.example.com/image.png",
+            "http://example..com/image.png",
+        ):
+            with self.subTest(url=url):
+                out, error = self._run_with_resolver_guard(url, "empty DNS label")
+                self.assertIsNotNone(error, "a host with an empty label was accepted")
+                text = str(error)
+                self.assertIn("empty label", text)
+                self.assertNotIn("http://", text)
+                self._assert_no_output(out)
+
+    def test_fail_fast_guard_keeps_wire_safe_hosts_and_targets(self):
+        # Bracketed IPv6 literals, IDNA/punycode hosts, a single trailing root
+        # dot and percent-encoded ASCII targets must stay usable.
+        for url, expected_host in (
+            ("http://[::1]:8080/image.png", "::1"),
+            ("https://xn--e1afmkfd.xn--p1ai/icon.png", "xn--e1afmkfd.xn--p1ai"),
+            ("https://example.com./icon.png", "example.com."),
+            (
+                "http://example.com/%D0%B8%D0%BA%D0%BE%D0%BD%D0%BA%D0%B0.png",
+                "example.com",
+            ),
+        ):
+            with self.subTest(url=url):
+                _parsed, host, _target = self.module._parse_hop(url, "app_logo_url")
+                self.assertEqual(host, expected_host)
+
+    def test_percent_encoded_ascii_target_is_fetched_end_to_end(self):
+        out, error = self._run(
+            self.main_url + "/encoded/%D0%B8%D0%BA%D0%BE%D0%BD%D0%BA%D0%B0.png",
+            policy=self.policy,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(out.read_bytes(), REFERENCE_PNG)
+
+    # 11. the per-attempt wall-clock bound covers the TLS handshake
+
+    STALL_MAX_TIME = 2.0
+    STALL_CONNECT_SECONDS = 1.9
+
+    def test_stalled_tls_handshake_ends_at_the_attempt_bound(self):
+        # White-box seam, and what it does and does not prove: _connect_pinned
+        # is wrapped so that part of the attempt budget is consumed *after* the
+        # socket timeout was armed, exactly as a slow TCP connect does.  That
+        # makes the stale pre-connect timeout observable: a pre-fix helper
+        # reuses it for the blocking handshake and the attempt runs past its
+        # deadline.  The seam only consumes budget; it does not change the
+        # production path under test.  The fixture is plain TCP and never sends
+        # valid TLS data, so this proves the handshake is covered by the attempt
+        # bound; it proves nothing about certificate verification (the hang
+        # precedes verification, no certificate is involved).
+        server = self.tls_stall
+        server.client_closed.clear()
+        before = server.snapshot()
+        real_connect = self.module._connect_pinned
+
+        def slow_connect(addresses, watchdog):
+            sock = real_connect(addresses, watchdog)
+            time.sleep(self.STALL_CONNECT_SECONDS)
+            return sock
+
+        self.module._connect_pinned = slow_connect
+        try:
+            start = time.monotonic()
+            out, error = self._run(
+                "https://127.0.0.1:%d/image.png" % server.server_address[1],
+                policy=self.policy,
+                max_time=self.STALL_MAX_TIME,
+                retries=0,
+            )
+            elapsed = time.monotonic() - start
+        finally:
+            self.module._connect_pinned = real_connect
+        self.assertIsNotNone(error, "the stalled TLS handshake was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
+        self.assertLess(
+            elapsed,
+            self.STALL_MAX_TIME + 1.4,
+            "the stalled TLS handshake was not ended at the attempt bound "
+            "(%.1f s elapsed against a %.1f s deadline)"
+            % (elapsed, self.STALL_MAX_TIME),
+        )
+        self.assertEqual(server.snapshot(), before + 1)
+        self._assert_no_output(out)
+        self.assertTrue(
+            server.client_closed.wait(5),
+            "the client never cut the stalled handshake off",
+        )
+
+    def test_trickling_tls_handshake_is_cut_off_and_stays_retryable(self):
+        # Preserved-behaviour guard, without any seam: the fixture dribbles TLS
+        # record bytes inside every per-read socket timeout, so the hop can only
+        # end at a wall-clock bound, and the deadline abort must stay in the
+        # curl-transient taxonomy (one retry, two bounded attempts).  This held
+        # before the fix too: CPython's SSL layer applies the socket timeout as
+        # a total handshake deadline, so the pre-fix stale timeout already bound
+        # this shape of handshake (it is the *value* of that timeout that was
+        # stale -- see the stalled-handshake test, which is the discriminating
+        # case).  This test keeps the end-to-end handshake path bounded and
+        # retryable after the handshake is deferred and the timeout re-armed.
+        server = self.tls_drip
+        before = server.snapshot()
+        start = time.monotonic()
+        out, error = self._run(
+            "https://127.0.0.1:%d/image.png" % server.server_address[1],
+            policy=self.policy,
+            max_time=1.0,
+            retries=1,
+            retry_delay=0.0,
+        )
+        elapsed = time.monotonic() - start
+        self.assertIsNotNone(error, "the trickling TLS handshake was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
+        self.assertEqual(
+            server.snapshot(),
+            before + 2,
+            "a watchdog deadline timeout must be retried exactly once",
+        )
+        self.assertLess(
+            elapsed,
+            4.5,
+            "the trickling TLS handshake extended an attempt past its deadline "
+            "(%.1f s elapsed for two 1 s attempts)" % elapsed,
+        )
+        self._assert_no_output(out)
+
+    # 12. preserved behaviour of the working HTTPS path (the handshake sequence
+    #     that finding 3 changed): a real handshake completes with the URL
+    #     hostname verified, and a certificate for another host is refused.
+    #     Both held before the fix too; they are the only local coverage of a
+    #     successful TLS handshake through the shipped helper.
+
+    @unittest.skipUnless(HAS_OPENSSL, "openssl CLI required to mint the TLS fixture certificate")
+    def test_https_fetch_completes_with_the_url_hostname_verified(self):
+        cert, key = tls_fixture_certificate("127.0.0.1")
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(str(cert), str(key))
+        server = _TlsFetchServer(("127.0.0.1", 0), server_context)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        real_create = self.module.ssl.create_default_context
+        # Only the trust anchor is injected: check_hostname and certificate
+        # verification stay on, against the URL hostname (server_hostname).
+        self.module.ssl.create_default_context = (
+            lambda *args, **kwargs: real_create(cafile=str(cert))
+        )
+        try:
+            before = server.snapshot()
+            out, error = self._run(
+                "https://127.0.0.1:%d/image.png" % server.server_address[1],
+                policy=self.policy,
+            )
+        finally:
+            self.module.ssl.create_default_context = real_create
+            server.shutdown()
+            server.server_close()
+        self.assertIsNone(error)
+        self.assertEqual(server.snapshot(), (before[0] + 1, before[1] + 1))
+        self.assertEqual(out.read_bytes(), REFERENCE_PNG)
+        self.assertFalse(out.with_name(out.name + ".part").exists())
+
+    @unittest.skipUnless(HAS_OPENSSL, "openssl CLI required to mint the TLS fixture certificate")
+    def test_https_fetch_still_refuses_a_certificate_for_another_host(self):
+        cert, key = tls_fixture_certificate("127.0.0.2")
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(str(cert), str(key))
+        server = _TlsFetchServer(("127.0.0.1", 0), server_context)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        real_create = self.module.ssl.create_default_context
+        self.module.ssl.create_default_context = (
+            lambda *args, **kwargs: real_create(cafile=str(cert))
+        )
+        try:
+            out, error = self._run(
+                "https://127.0.0.1:%d/image.png" % server.server_address[1],
+                policy=self.policy,
+            )
+        finally:
+            self.module.ssl.create_default_context = real_create
+            server.shutdown()
+            server.server_close()
+        self.assertIsNotNone(error, "a certificate for another host was accepted")
+        self.assertEqual(
+            str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
+        )
         self._assert_no_output(out)
 
 
