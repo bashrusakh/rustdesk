@@ -868,6 +868,23 @@ jobs:
               )
 
 
+          # Upper bound on the byte size of ``encode(image)`` for a decoded image whose
+          # geometry already passed the gates.  The canonical re-encode is an 8-bit
+          # non-interlaced PNG whose only variable-length chunk is one IDAT payload produced
+          # by ``zlib.compress(raw, 9)``: zlib guarantees that output is never larger than
+          # ``compressBound(n)`` for an n-byte input, where n is the filter-byte-per-scanline
+          # raster the geometry and canonical channel count imply.  The fixed overhead is the
+          # 8-byte signature plus IHDR (12+13), IDAT framing (12) and IEND (12) -- 57 bytes --
+          # and zlib's bound adds n + (n>>12) + (n>>14) + (n>>25) + 13.  This depends only on
+          # the validated width/height and channel count, never on the download cap, so a
+          # canonical re-encode of any accepted input always satisfies it; it exists solely so
+          # an encoder bug fails closed here instead of shipping an oversized or malformed file.
+          def canonical_byte_bound(image):
+              channels = 4 if (image.color_type in (4, 6) or image.trns is not None) else 3
+              raw = image.height * (1 + image.width * channels)
+              return 57 + raw + (raw >> 12) + (raw >> 14) + (raw >> 25) + 13
+
+
           def prepare(staging):
               """Canonicalise every staged branding image and write branding_manifest.json."""
               staging = pathlib.Path(staging)
@@ -892,16 +909,20 @@ jobs:
                       return 1
                   canonical = encode(image)
                   # Consumers receive the canonical re-encode, never the raw downloaded bytes, so a
-                  # 16-bit or interlaced source cannot reach the build as-is. The canonical bytes go
-                  # back through the same strict contract (byte cap and dimension gates included)
-                  # before they are staged, so an encoder bug fails closed here instead of shipping.
+                  # 16-bit or interlaced source cannot reach the build as-is. A locally generated
+                  # canonical file is not a downloaded response, so the per-field download cap does
+                  # not apply to it: an indexed source can legitimately re-encode to RGB bytes far
+                  # larger than the fetch cap while still being a valid in-domain image. The
+                  # canonical bytes are therefore re-validated against the geometry-derived bound
+                  # (never the download cap) plus the same structural, decode, dimension and square
+                  # gates, so an encoder bug fails closed without rejecting a valid input.
                   try:
                       load(
                           canonical,
                           name,
                           max_width=max_w,
                           max_height=max_h,
-                          max_bytes=max_bytes,
+                          max_bytes=canonical_byte_bound(image),
                           require_square=require_square,
                           square_hint=square_hint,
                       )

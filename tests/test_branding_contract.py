@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import random
 import re
 import shutil
 import socketserver
@@ -727,6 +728,17 @@ class ValidatorTests(unittest.TestCase):
             with self.subTest(color_type=color_type, depth=depth):
                 self.assert_reject(make_png(4, 4, color_type, depth=depth), "bit depth")
 
+    def test_rejects_out_of_range_dimensions_and_non_square_icon(self):
+        # The per-field dimension window and the square-icon rule are enforced by load()
+        # itself, so a value outside them still fails closed.
+        self.assert_reject(
+            make_png(33, 16, 6, 0), "out-of-range dimensions", max_width=32, max_height=32
+        )
+        self.assert_ok(make_png(32, 32, 6, 0), max_width=32, max_height=32)
+        self.assert_reject(
+            make_png(16, 24, 6, 0), "must be square", require_square=True,
+        )
+
     def test_rejects_payload_after_the_zlib_end_marker(self):
         # The decompressed scanline count can be exactly right while the compressed stream
         # carries bytes after the zlib end marker; those must be rejected, not ignored.
@@ -1198,6 +1210,68 @@ class CanonicalEncodeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("exceeds the byte cap", result.stdout)
         self.assertFalse((staging / "branding_manifest.json").exists())
+
+    def test_download_cap_is_not_reapplied_to_the_canonical_reencode(self):
+        # The per-field cap bounds the downloaded response, not the locally generated
+        # canonical file.  An indexed (color type 3) source stores one byte per pixel but
+        # re-encodes to RGB, so a noisy source whose canonical bytes are larger than the cap
+        # is a valid in-domain image that must still be accepted and written.  Exercise the
+        # ordering rule with a small cap: the rule is a parameter of the validator, so this
+        # does not need a multi-megapixel fixture (the same defect is reached by a real
+        # 4096x4096 indexed source against the 10 MiB cap).
+        original = self.module._STAGING_RULES["app-logo.png"]
+        self.addCleanup(self.module._STAGING_RULES.__setitem__, "app-logo.png", original)
+
+        plte = bytes(range(0, 48))  # 16 colors
+        rng = random.Random(0x5EED)
+        raw = bytearray()
+        for _ in range(128):
+            raw.append(0)
+            raw.extend(rng.randrange(16) for _ in range(128))
+        source = make_png(128, 128, 3, 0, raw=bytes(raw), plte=plte)
+
+        image = self.module.load(source, "app-logo.png")
+        canonical = self.module.encode(image)
+        cap = (len(source) + len(canonical)) // 2
+        self.assertLess(len(source), cap)
+        self.assertGreater(len(canonical), cap)
+        self.module._STAGING_RULES["app-logo.png"] = (4096, 4096, cap, False, "")
+
+        staging = Path(tempfile.mkdtemp(prefix="branding-canonical-download-cap-"))
+        (staging / "app-logo.png").write_bytes(source)
+        rc = self.module.prepare(staging)
+        self.assertEqual(rc, 0)
+        manifest = json.loads((staging / "branding_manifest.json").read_text())
+        staged = (staging / "app-logo.png").read_bytes()
+        self.assertEqual(staged, canonical)
+        entry = manifest["images"]["app-logo.png"]
+        self.assertEqual(entry["sha256"], hashlib.sha256(canonical).hexdigest())
+        self.assertEqual(entry["bytes"], len(canonical))
+
+    def test_geometry_derived_bound_covers_the_canonical_reencode(self):
+        # canonical_byte_bound() must be a true upper bound on encode() for every accepted
+        # image, so a valid in-domain input can never be rejected by the re-validation bound.
+        indexed_plte = bytes(range(0, 48))
+        indexed_raw = bytearray()
+        rng = random.Random(0xB0A7)
+        for _ in range(64):
+            indexed_raw.append(0)
+            indexed_raw.extend(rng.randrange(16) for _ in range(64))
+        sources = (
+            make_png(1, 1, 2, 0),
+            make_png(16, 16, 6, 0),
+            make_png(64, 64, 2, 0),
+            make_png(4, 4, 0, 0, trns=struct.pack(">H", 5)),                  # gray + tRNS -> RGBA
+            make_png(64, 64, 3, 0, raw=bytes(indexed_raw), plte=indexed_plte),
+            png_bytes(37, 19, 6, 16, lambda x, y: (x * 257, y * 131, x ^ y, 65535)),  # 16-bit RGBA
+        )
+        for index, source in enumerate(sources):
+            with self.subTest(case=index):
+                image = self.module.load(source, "app-logo.png")
+                canonical = self.module.encode(image)
+                self.assertLessEqual(
+                    len(canonical), self.module.canonical_byte_bound(image)
+                )
 
     def test_load_byte_cap_boundary(self):
         data = make_png(16, 16, 6, 0)
