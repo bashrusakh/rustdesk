@@ -1408,6 +1408,7 @@ class _FetchServer(socketserver.ThreadingTCPServer):
         self.stream_completed = False
         self.stream_bytes = 0
         self.trickle_done = threading.Event()
+        self.trickle_steps = 0
 
     def get_request(self):
         conn, addr = super().get_request()
@@ -1429,12 +1430,16 @@ class _FetchServer(socketserver.ThreadingTCPServer):
             self.stream_completed = completed
         self.stream_done.set()
 
+    def note_trickle(self, steps):
+        with self.lock:
+            self.trickle_steps = steps
+        self.trickle_done.set()
+
 
 class _BrandingFetchHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     CHUNK = 65536
     SMALL = 1024
-    BIG_CL = 4 * 1024 * 1024
     HUGE = 64 * 1024 * 1024
     TRICKLE_DELAY = 0.2
     TRICKLE_LIMIT = 40  # ~8 s of dribbled bytes
@@ -1459,29 +1464,34 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
     def _trickle_bytes(self, preamble):
         # Deliver the preamble and then one byte per TRICKLE_DELAY, each well
         # inside any per-read socket timeout, so only a wall-clock deadline can
-        # end the hop.  Bounded, so a client without such a deadline fails the
-        # elapsed-time assertion instead of hanging the suite.
+        # end the hop.  Bounded, and the delivered step count is recorded, so the
+        # tests can prove the client cut the hop off instead of hanging the suite.
+        steps = 0
         try:
             self.wfile.write(preamble)
             for _ in range(self.TRICKLE_LIMIT):
                 time.sleep(self.TRICKLE_DELAY)
                 self.wfile.write(b"x")
+                steps += 1
         except OSError:
             pass
         finally:
-            self.server.trickle_done.set()
+            self.server.note_trickle(steps)
 
     def _trickle_interim(self):
         # A stream of interim 1xx responses: on interpreters without an interim
-        # limit, only a wall-clock deadline can end this hop.
+        # limit, only a wall-clock deadline can end this hop.  The delivered
+        # response count is recorded for the same cut-off proof as above.
+        steps = 0
         try:
             for _ in range(self.TRICKLE_LIMIT):
                 self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                steps += 1
                 time.sleep(self.TRICKLE_DELAY)
         except OSError:
             pass
         finally:
-            self.server.trickle_done.set()
+            self.server.note_trickle(steps)
 
     def _stream(self, total, chunked):
         # A body far larger than any per-field cap. The chunked variant declares no
@@ -1523,7 +1533,7 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"%x\r\n" % len(body) + body + b"\r\n")
             self.wfile.write(b"0\r\n\r\n")
         elif path == "/big-cl":
-            self._stream(self.BIG_CL, chunked=False)
+            self._stream(self.HUGE, chunked=False)
         elif path == "/huge":
             self._stream(self.HUGE, chunked=True)
         elif path == "/redirect-ok":
@@ -1743,6 +1753,14 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         self.assertIn("exceeds the per-field byte cap", str(error))
         self._assert_no_output(out)
         self.assertTrue(self.main.stream_done.wait(10), "the fixture never finished the transfer")
+        # 64 MiB cannot be absorbed by socket buffers against a 1 MiB cap, so the
+        # fixture must have been cut off far below the declared Content-Length:
+        # the transfer-time cap bounded the client, not the declared length.
+        self.assertLess(
+            self.main.stream_bytes,
+            _BrandingFetchHandler.HUGE // 2,
+            "the transfer was not cut off near the cap",
+        )
         self.assertFalse(
             self.main.stream_completed,
             "a declared Content-Length, not the transfer-time cap, bounded the client",
@@ -1842,6 +1860,12 @@ class DestinationPinnedFetchTests(unittest.TestCase):
                     self.main.trickle_done.wait(10),
                     "the trickle fixture never finished; the client never cut the hop off",
                 )
+                self.assertLess(
+                    self.main.trickle_steps,
+                    _BrandingFetchHandler.TRICKLE_LIMIT,
+                    "the peer delivered its whole dribble budget; the transfer was not "
+                    "cut off at the attempt deadline",
+                )
 
     def test_trickling_peer_cli_reports_one_deterministic_field_error_within_the_bound(self):
         # The same regression through the shipped CLI: exactly one deterministic
@@ -1890,6 +1914,16 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         self.assertNotIn("http://", result.stdout)
         self.assertNotIn("payload-secret", result.stdout)
         self.assertLess(elapsed, 5.0)
+        self.assertTrue(
+            self.main.trickle_done.wait(10),
+            "the trickle fixture never finished; the client never cut the hop off",
+        )
+        self.assertLess(
+            self.main.trickle_steps,
+            _BrandingFetchHandler.TRICKLE_LIMIT,
+            "the peer delivered its whole dribble budget; the transfer was not "
+            "cut off at the attempt deadline",
+        )
         self.assertFalse(out.exists())
         self.assertFalse(Path(str(out) + ".part").exists())
 
