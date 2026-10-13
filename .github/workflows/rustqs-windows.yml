@@ -1034,9 +1034,10 @@ jobs:
 
           The invariant enforced here is that *every* connection this fetcher makes --
           the initial request and every redirect hop -- uses only a validated public
-          destination (for IPv6, inside the IANA global-unicast block 2000::/3 and
-          outside every range those registries mark reserved or not globally reachable;
-          for IPv4, outside the special-purpose ranges).  For each hop the hostname is
+          destination (for IPv6, inside a prefix the IANA Global Unicast Address
+          Assignments registry currently lists as ALLOCATED and outside every range
+          those registries mark reserved or not globally reachable; for IPv4, outside
+          the special-purpose ranges).  For each hop the hostname is
           resolved exactly once, every
           resolved address is checked against the address policy, and the connection is
           then made to a validated address rather than to the hostname.  Nothing can
@@ -1124,12 +1125,23 @@ jobs:
           #   * IPv4: the entries are the non-public special-purpose ranges, and their
           #     complement is the ordinary IPv4 unicast space a fetch target lives in,
           #     so no additional bound is needed.
-          #   * IPv6: the complement of a deny list is *not* public.  Most of the
-          #     128-bit space is outside the global-unicast allocation, so a literal
-          #     IPv6 address is public only when it is inside the IANA global-unicast
-          #     block 2000::/3 *and* outside every entry below.  That bound is enforced
-          #     in is_public_address and is deliberately not `is_global`, whose accepted
+          #   * IPv6: the complement of a deny list is *not* public space.  The
+          #     assignable global-unicast space is 2000::/3 ([A]), and [C]'s registry
+          #     note reserves everything inside that block that has no ALLOCATED row
+          #     "for future allocation", so the gaps between the ALLOCATED rows are
+          #     reserved, not public.  A literal IPv6 address is therefore public only
+          #     when it falls inside an [C] row currently marked ALLOCATED
+          #     (_IPV6_ALLOCATED_PREFIXES below) and is not refused by the
+          #     special-purpose overlay (_NON_PUBLIC_NETWORKS).  Everything else --
+          #     every unlisted gap, every RESERVED row and everything outside 2000::/3
+          #     -- is refused.  This is deliberately not `is_global`, whose accepted
           #     set is wider than the space the registries allocate for routing.
+          #
+          #     Maintenance property, fail-closed: _IPV6_ALLOCATED_PREFIXES is a
+          #     snapshot, not a live query.  A block IANA allocates after the snapshot
+          #     stays refused until the table below is refreshed; the policy never
+          #     admits a literal merely because it is inside 2000::/3 or not (yet)
+          #     listed as reserved.
           #
           # Registry sources, retrieved 2026-10-14:
           #
@@ -1138,24 +1150,24 @@ jobs:
           #       400::/6, 800::/5, 1000::/4, 6000::/3, fe00::/9 and fec0::/10 are
           #       Reserved by IETF.
           #   [B] IANA IPv6 Special-Purpose Address Registry (last updated 2025-10-09).
-          #   [C] IANA IPv6 Global Unicast Address Assignments (last updated 2025-10-10):
-          #       3ffe::/16 is RESERVED (the returned 6bone allocation, RFC 5156) and the
-          #       IANA-RESERVED tail 2d00::/8 .. 3ffc::/15 is not yet allocated.
+          #   [C] IANA IPv6 Global Unicast Address Assignments (last updated 2025-10-10),
+          #       CSV at https://www.iana.org/assignments/ipv6-unicast-address-assignments/
+          #       ipv6-unicast-address-assignments.csv: every row marked ALLOCATED is in
+          #       _IPV6_ALLOCATED_PREFIXES.  3ffe::/16 is RESERVED (the returned 6bone
+          #       allocation, RFC 5156) and the IANA-RESERVED tail 2d00::/8 .. 3ffc::/15
+          #       is RESERVED too, so neither is in the allow list.
           #
-          # Inside 2000::/3 the list is every block [B] or [C] marks reserved or not
-          # globally reachable, at least 3ffe::/16.  One residual, stated explicitly:
-          # [B] marks 2001::/23 Globally Reachable False "unless allowed by a more
-          # specific allocation" and lists six reachable sub-blocks, exempted in
-          # _IPV6_REACHABLE_EXCEPTIONS below.  Four sub-blocks of that parent stay
-          # refused on purpose: 2001::/32 (Teredo, Globally Reachable "N/A"), 2001:2::/48
+          # The 2001::/23 row needs care: [C] marks it ALLOCATED to IANA only
+          # partially, and [B] marks it Globally Reachable False "unless allowed by a
+          # more specific allocation", listing six reachable sub-blocks.  The parent is
+          # therefore *not* re-admitted as a whole: only those six more-specifics are
+          # in the allow list.  The non-reachable sub-blocks stay refused on top of the
+          # allow list -- 2001::/32 (Teredo, Globally Reachable "N/A"), 2001:2::/48
           # (benchmarking), 2001:10::/28 (deprecated ORCHID, allocation terminated
           # 2014-03) and 2001:20::/28 (ORCHIDv2, listed Globally Reachable True but
-          # non-routable at the IP layer by design, RFC 7343 section 1.2).
-          #
-          # Second residual: [C]'s registry note also reserves for future allocation
-          # the space inside 2000::/3 that has no ALLOCATED row (for example 2000::/16
-          # and the remainder of 3fff::/16).  This list enumerates the marked blocks;
-          # such unlisted literals pass the policy and have no allocated route today.
+          # non-routable at the IP layer by design, RFC 7343 section 1.2) -- as does
+          # 2001:db8::/32 (documentation), which falls inside the 2001:c00::/23
+          # ALLOCATED row.
           #
           # Transition/deprecated forms that embed an IPv4 destination -- ::/96
           # (IPv4-compatible), 64:ff9b::/96 and 64:ff9b:1::/48 (NAT64), 2002::/16 (6to4),
@@ -1164,19 +1176,61 @@ jobs:
           # Reachable column is True or "N/A": this literal policy cannot verify the
           # embedded IPv4 destination, so it fails closed.
           #
-          # A hop is refused when any address it resolves to falls in any range below
-          # or, for IPv6, outside 2000::/3.  This policy is not an exhaustive
-          # implementation of Internet routing.
+          # A hop is refused when any address it resolves to falls outside 2000::/3,
+          # outside every ALLOCATED prefix above, or in any range below.  This policy is
+          # not an exhaustive implementation of Internet routing.
           _IPV6_GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
 
-          # [B] sub-blocks inside 2001::/23 listed as Globally Reachable.
-          _IPV6_REACHABLE_EXCEPTIONS = (
+          # [C] Global Unicast Address Assignments rows currently marked ALLOCATED
+          # (retrieved 2026-10-14), the allow list is_public_address requires.  The
+          # 2001::/23 parent row is deliberately not listed as a whole: it is only
+          # partially allocated, so the six Globally Reachable more-specifics [B]
+          # lists under it stand in for its reachable part.  2002::/16 is the
+          # ALLOCATED 6to4 row and is refused by the special-purpose overlay.
+          _IPV6_ALLOCATED_PREFIXES = (
+              # [B] sub-blocks inside 2001::/23 listed as Globally Reachable.
               ipaddress.ip_network("2001:1::1/128"),    # Port Control Protocol anycast
               ipaddress.ip_network("2001:1::2/128"),    # TURN anycast
               ipaddress.ip_network("2001:1::3/128"),    # DNS-SD SDP anycast
               ipaddress.ip_network("2001:3::/32"),      # AMT
               ipaddress.ip_network("2001:4:112::/48"),  # AS112-v6
               ipaddress.ip_network("2001:30::/28"),     # Drone Remote ID DET prefix
+              # Remaining [C] ALLOCATED rows, in registry order.
+              ipaddress.ip_network("2001:200::/23"),
+              ipaddress.ip_network("2001:400::/23"),
+              ipaddress.ip_network("2001:600::/23"),
+              ipaddress.ip_network("2001:800::/22"),
+              ipaddress.ip_network("2001:c00::/23"),
+              ipaddress.ip_network("2001:e00::/23"),
+              ipaddress.ip_network("2001:1200::/23"),
+              ipaddress.ip_network("2001:1400::/22"),
+              ipaddress.ip_network("2001:1800::/23"),
+              ipaddress.ip_network("2001:1a00::/23"),
+              ipaddress.ip_network("2001:1c00::/22"),
+              ipaddress.ip_network("2001:2000::/19"),
+              ipaddress.ip_network("2001:4000::/23"),
+              ipaddress.ip_network("2001:4200::/23"),
+              ipaddress.ip_network("2001:4400::/23"),
+              ipaddress.ip_network("2001:4600::/23"),
+              ipaddress.ip_network("2001:4800::/23"),
+              ipaddress.ip_network("2001:4a00::/23"),
+              ipaddress.ip_network("2001:4c00::/23"),
+              ipaddress.ip_network("2001:5000::/20"),
+              ipaddress.ip_network("2001:8000::/19"),
+              ipaddress.ip_network("2001:a000::/20"),
+              ipaddress.ip_network("2001:b000::/20"),
+              ipaddress.ip_network("2002::/16"),        # 6to4; denied by the overlay
+              ipaddress.ip_network("2003::/18"),
+              ipaddress.ip_network("2400::/12"),
+              ipaddress.ip_network("2410::/12"),
+              ipaddress.ip_network("2600::/12"),
+              ipaddress.ip_network("2610::/23"),
+              ipaddress.ip_network("2620::/23"),
+              ipaddress.ip_network("2630::/12"),
+              ipaddress.ip_network("2800::/12"),
+              ipaddress.ip_network("2a00::/12"),
+              ipaddress.ip_network("2a10::/12"),
+              ipaddress.ip_network("2c00::/12"),
           )
 
           _NON_PUBLIC_NETWORKS = (
@@ -1196,8 +1250,14 @@ jobs:
               ipaddress.ip_network("192.88.99.0/24"),
               ipaddress.ip_network("224.0.0.0/4"),
               ipaddress.ip_network("240.0.0.0/4"),
-              # IPv6, inside 2000::/3 ([B] and [C]).
-              ipaddress.ip_network("2001::/23"),        # IETF Protocol Assignments
+              # IPv6, inside 2000::/3 ([B] and [C]).  The ALLOCATED allow list above
+              # already refuses every RESERVED row and every unlisted gap; the entries
+              # here are the special-purpose forms that stay refused on top of it, plus
+              # the [C] RESERVED rows repeated as a second line of defence.
+              ipaddress.ip_network("2001::/32"),        # Teredo ([B] Globally Reachable N/A)
+              ipaddress.ip_network("2001:2::/48"),      # Benchmarking
+              ipaddress.ip_network("2001:10::/28"),     # Deprecated ORCHID (terminated 2014-03)
+              ipaddress.ip_network("2001:20::/28"),     # ORCHIDv2 (non-routable by design)
               ipaddress.ip_network("2001:db8::/32"),    # Documentation
               ipaddress.ip_network("2002::/16"),        # 6to4 transition form
               ipaddress.ip_network("3ffe::/16"),        # returned 6bone allocation
@@ -1253,9 +1313,11 @@ jobs:
               ``address`` may be a string or an ipaddress address object.  IPv4-mapped
               IPv6 addresses are unmapped first and classified as their IPv4 address, so
               ``::ffff:127.0.0.1`` is refused exactly like ``127.0.0.1``.  For IPv6 the
-              deny list alone is not the policy: only the IANA global-unicast block
-              2000::/3 minus the registry-reserved ranges is public, so a literal
-              outside 2000::/3 is refused even though it is not listed below.
+              deny list alone is not the policy: a literal is public only when it falls
+              inside an ALLOCATED row of the IANA Global Unicast Address Assignments
+              registry and is not refused by the special-purpose overlay, so anything
+              outside 2000::/3 or inside a registry-reserved or unlisted gap is refused
+              even though it is not listed below.
               """
               candidate = address
               if not isinstance(candidate, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
@@ -1265,8 +1327,8 @@ jobs:
               if isinstance(candidate, ipaddress.IPv6Address):
                   if candidate not in _IPV6_GLOBAL_UNICAST:
                       return False
-                  if any(candidate in network for network in _IPV6_REACHABLE_EXCEPTIONS):
-                      return True
+                  if not any(candidate in network for network in _IPV6_ALLOCATED_PREFIXES):
+                      return False
               return not any(candidate in network for network in _NON_PUBLIC_NETWORKS)
 
 

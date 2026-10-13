@@ -1933,6 +1933,51 @@ class DestinationPinnedFetchTests(unittest.TestCase):
         for address in allowed:
             self.assertTrue(self.module.is_public_address(address), address)
 
+    def test_ipv6_allow_list_refuses_every_unallocated_registry_gap(self):
+        # Blocking review finding: inside 2000::/3 the complement of a deny list is
+        # not public space. The IANA IPv6 Global Unicast Address Assignments registry
+        # (retrieved 2026-10-14) states that all address space in the block with no
+        # ALLOCATED row is reserved for future allocation, so the gaps between the
+        # ALLOCATED rows are reserved, not public. These nine literals sit in such
+        # gaps and were accepted by the deny-list-complement policy this allow list
+        # replaces (falsified against the shipped 3247d11d helper: all nine returned
+        # True).
+        gap_literals = (
+            "2000::1",        # no ALLOCATED row covers 2000::/16
+            "2001:1000::1",   # gap between 2001:e00::/23 and 2001:1200::/23
+            "2001:4e00::1",   # gap between 2001:4c00::/23 and 2001:5000::/20
+            "2001:6000::1",   # gap between 2001:5000::/20 and 2001:8000::/19
+            "2001:c000::1",   # after 2001:b000::/20 (2001:c00::/23 covers 0c00, not c000)
+            "2611::1",        # after 2610::/23 (2610:0000 .. 2610:01ff)
+            "2622::1",        # gap between 2620::/23 and 2630::/12
+            "2650::1",        # after 2630::/12 (2630 .. 263f)
+            "3fff:1000::1",   # outside 3fff::/20, in the IANA-RESERVED tail
+        )
+        refused = gap_literals + (
+            # Inside the partially allocated 2001::/23 parent but outside its six
+            # Globally Reachable more-specifics: the parent must not be re-admitted
+            # as a whole, and the /128 anycasts must not widen their /32.
+            "2001::1", "2001:1::4", "2001:5::1",
+            # The seven literals the previous corrective already refused: the six
+            # IETF-Reserved blocks outside 2000::/3 and the returned 6bone 3ffe::/16.
+            "400::1", "800::1", "1000::1", "6000::1", "fe00::1", "fec0::1",
+            "3ffe::1",
+        )
+        allowed = (
+            "2606:4700:4700::1111",      # 2600::/12
+            "2001:4860:4860::8888",      # 2001:4800::/23
+            "2001:1::3",                 # 2001::/23 reachable DNS-SD SDP anycast
+            # Other allocated, globally reachable literals from different registry
+            # rows.
+            "2001:200::1",               # 2001:200::/23 (APNIC)
+            "2400:cb00::1",              # 2400::/12 (APNIC)
+            "2a00:1450:4009:80f::200e",  # 2a00::/12 (RIPE NCC)
+        )
+        for address in refused:
+            self.assertFalse(self.module.is_public_address(address), address)
+        for address in allowed:
+            self.assertTrue(self.module.is_public_address(address), address)
+
     def test_absent_url_is_a_noop_through_the_workflow_shell_wrapper(self):
         result, out = self._run_shell("")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -3057,6 +3102,42 @@ class WorkflowContractTests(unittest.TestCase):
             'fetch_branding_image privacy_screen_url "$RQS_PRIVACY_SCREEN_URL" "$staging/privacy-screen.png" $((20 * 1024 * 1024))',
         ):
             self.assertIn(call, run)
+
+    def test_fetch_policy_is_a_registry_derived_allow_list_with_a_recorded_source(self):
+        # Blocking review finding: the IPv6 bound must be an allow list derived from
+        # the IANA Global Unicast Address Assignments registry, not a deny list whose
+        # complement is not public. The registry source, its retrieval date and the
+        # fail-closed snapshot property are recorded next to the policy; the partially
+        # allocated 2001::/23 parent is represented by its six reachable more-specifics
+        # only, and the special-purpose overlay keeps its refusals on top.
+        source = fetcher_source()
+        self.assertIn("ipv6-unicast-address-assignments.csv", source)
+        self.assertIn("retrieved 2026-10-14", source)
+        self.assertIn("fail-closed", source)
+        self.assertNotIn("_IPV6_REACHABLE_EXCEPTIONS", source)
+        start = source.index("_IPV6_ALLOCATED_PREFIXES = (")
+        end = source.index("\n)", start)
+        allow = source[start:end]
+        # The parent row is not re-admitted; its six reachable more-specifics are.
+        self.assertNotIn('"2001::/23"', allow)
+        for specific in (
+            "2001:1::1/128", "2001:1::2/128", "2001:1::3/128", "2001:3::/32",
+            "2001:4:112::/48", "2001:30::/28",
+        ):
+            self.assertIn(specific, allow)
+        for row in ("2001:200::/23", "2001:2000::/19", "2400::/12", "2600::/12",
+                    "2a00::/12", "2c00::/12"):
+            self.assertIn('"' + row + '"', allow)
+        # RESERVED rows are not allocated and must not be in the allow list.
+        for reserved in ("2d00::/8", "3ffe::/16", "3ffc::/15", "3fff::/20"):
+            self.assertNotIn('"' + reserved + '"', allow)
+        # The special-purpose overlay stays applied on top of the allow list.
+        for denied in (
+            "2001::/32", "2001:2::/48", "2001:10::/28", "2001:20::/28",
+            "2001:db8::/32", "2002::/16", "64:ff9b::/96", "64:ff9b:1::/48",
+            "::/96", "3fff::/20",
+        ):
+            self.assertIn('"' + denied + '"', source)
 
     def test_no_unbounded_decompression_remains(self):
         for path in (WINDOWS, THIRD_PARTY):
