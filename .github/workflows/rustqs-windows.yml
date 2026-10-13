@@ -73,8 +73,9 @@ jobs:
     # resolve once here so both the privacy-mode DLL build (third-party workflow) and
     # the client build consume verified local files instead of re-fetching. Only
     # absolute http(s) URLs are accepted here and in the resolve step; each image is
-    # sanity-checked (PNG, sane dimensions, size cap) and shipped with a sha256
-    # manifest the consumers verify. Empty payload fields skip the whole stage.
+    # fetched under its per-field byte cap and validated by the single shared PNG
+    # validator, which is shipped inside this artifact so every consumer runs the
+    # same code. Empty payload fields skip the whole stage.
     outputs:
       branding_assets_artifact: ${{ steps.fetch_branding.outputs.branding_assets_artifact }}
       privacy_image_artifact: ${{ steps.fetch_branding.outputs.privacy_image_artifact }}
@@ -218,77 +219,433 @@ jobs:
           staging="${RUNNER_TEMP}/deskforge-branding-assets"
           rm -rf "$staging"
           mkdir -p "$staging"
-          fetch_branding_image() {
-            local field="$1" url="$2" out="$3"
-            if [ -z "$url" ]; then return 0; fi
-            if ! curl -fsSL --retry 2 --retry-delay 2 --max-time 120 --output "$out" -- "$url"; then
-              echo "::error::$field image fetch failed from the provider URL (absolute http(s) URL required; the runner cannot fetch relative URLs)"
-              exit 1
-            fi
-          }
-          fetch_branding_image app_icon_url "$RQS_APP_ICON_URL" "$staging/app-icon.png"
-          fetch_branding_image app_logo_url "$RQS_APP_LOGO_URL" "$staging/app-logo.png"
-          fetch_branding_image privacy_screen_url "$RQS_PRIVACY_SCREEN_URL" "$staging/privacy-screen.png"
 
-          if ! python3 - "$staging" <<'PY'
+          # Single authoritative PNG validator. It is written here once and shipped
+          # inside the one deskforge-branding-assets artifact, so the build-job
+          # icon/logo consumers and the third-party privacy-screen consumer all run
+          # byte-identical validation code. This job has no repository checkout
+          # (permissions: {} and no actions/checkout), so the module cannot be read
+          # from the repo; the build job's source checkout also replaces the tree, so
+          # a repo file would not survive to the build consumers either.
+          validator="${RUNNER_TEMP}/validate_branding_png.py"
+          cat > "$validator" <<'PY'
+          #!/usr/bin/env python3
+          """Single authoritative validator for DeskForge branding PNG images.
+
+          One implementation is used everywhere a branding PNG is accepted or consumed:
+
+            * ``prepare_branding_assets`` writes it, runs it over the staging directory
+              and ships it inside the single ``deskforge-branding-assets`` artifact;
+            * the Windows client build (icon + logo consumers) and the third-party
+              privacy-mode overlay consumer import it from that same artifact.
+
+          The prepare job has no repository checkout (``permissions: {}`` and no
+          ``actions/checkout``) and the build job's source checkout replaces the whole
+          tree, so a repository file cannot be reached from every consumer.  Defining the
+          contract once here and carrying it with the one branding artifact keeps every
+          consumer on identical code.
+
+          A branding PNG is accepted only when it is structurally whole and decodable:
+          complete chunk stream (IHDR first, per-chunk CRC, mandatory IEND, no data after
+          IEND), PLTE present for indexed colour, allowed compression/filter/interlace
+          flags, bounded and exact decompression of the IDAT stream (never more than the
+          IHDR-implied scanline byte count, and no trailing decompressed payload), and a
+          full scanline/filter traversal.
+          """
+
           import hashlib
           import json
           import pathlib
           import struct
           import sys
+          import zlib
 
-          staging = pathlib.Path(sys.argv[1])
-          # Per-field sanity gates (DeskForge #80). Bounds are deliberately basic:
-          # decode-proving a PNG and reasonable dimensions/size only.
-          rules = {
-              # app-icon dimension rule lives in ONE layer: the prepare job accepts any
-              # square PNG up to 4096px (format/shape gate only); the build job's
-              # ICO converter owns the final icon constraint (square, 16..256, with
+          PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+          # Colour type -> samples per pixel for the accepted non-interlaced 8-bit PNG.
+          _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+          # prepare_branding_assets field rules: name -> (max_w, max_h, max_bytes,
+          # require_square, square_hint).  Kept exactly at the reviewed 1.4.9 gate.
+          _STAGING_RULES = {
+              # app-icon dimension rule lives in ONE layer: this prepare gate accepts any
+              # square PNG up to 4096px (format/shape gate only); the build job's ICO
+              # converter owns the final icon constraint (square, 16..256, with
               # nearest-neighbour downscale to 256 for larger provider icons).
-              "app-icon.png": (4096, 4096, 10 * 1024 * 1024, True, "must be square (used for exe/tray icon resources; larger square icons are downscaled to 256 px for the Windows ICO resources in the build job)"),
+              "app-icon.png": (
+                  4096,
+                  4096,
+                  10 * 1024 * 1024,
+                  True,
+                  "must be square (used for exe/tray icon resources; larger square icons are downscaled to 256 px for the Windows ICO resources in the build job)",
+              ),
               "app-logo.png": (4096, 4096, 10 * 1024 * 1024, False, ""),
-              "privacy-screen.png": (4096, 4096, 20 * 1024 * 1024, False, "(renders fullscreen while privacy mode is active)"),
+              "privacy-screen.png": (
+                  4096,
+                  4096,
+                  20 * 1024 * 1024,
+                  False,
+                  "(renders fullscreen while privacy mode is active)",
+              ),
           }
-          images = {}
-          for name, (max_w, max_h, max_bytes, must_be_square, extra) in rules.items():
-              path = staging / name
-              if not path.is_file():
-                  continue
-              data = path.read_bytes()
+
+
+          class PngError(Exception):
+              """Raised when a branding PNG fails the shared validation contract."""
+
+
+          class Png:
+              """A validated, fully decoded 8-bit non-interlaced PNG."""
+
+              __slots__ = ("width", "height", "color_type", "pixels", "plte", "trns")
+
+              def __init__(self, width, height, color_type, pixels, plte, trns):
+                  self.width = width
+                  self.height = height
+                  self.color_type = color_type
+                  self.pixels = pixels  # unfiltered scanlines, filter byte removed
+                  self.plte = plte
+                  self.trns = trns
+
+              def bgra(self):
+                  """Return ``(BGRA bytes, width, height)``; > 256px is downscaled to 256."""
+                  channels = _CHANNELS[self.color_type]
+                  width = self.width
+                  height = self.height
+                  stride = width * channels
+                  pixels = self.pixels
+                  screen = bytearray(width * height * 4)
+                  for y in range(height):
+                      base = y * width * 4
+                      row = pixels[y * stride:(y + 1) * stride]
+                      for x in range(width):
+                          sx = x * channels
+                          dx = base + x * 4
+                          if self.color_type == 6:
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx + 2], row[sx + 1], row[sx], row[sx + 3],
+                              )
+                          elif self.color_type == 2:
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx + 2], row[sx + 1], row[sx], 255,
+                              )
+                          elif self.color_type == 4:
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx], row[sx], row[sx], row[sx + 1],
+                              )
+                          elif self.color_type == 0:
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx], row[sx], row[sx], 255,
+                              )
+                          else:
+                              index = row[sx]
+                              if index * 3 + 2 >= len(self.plte):
+                                  raise PngError("PNG palette index is out of range")
+                              alpha = self.trns[index] if index < len(self.trns) else 255
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  self.plte[index * 3 + 2],
+                                  self.plte[index * 3 + 1],
+                                  self.plte[index * 3],
+                                  alpha,
+                              )
+                  if width > 256 or height > 256:
+                      # exe resource icons must stay <= 256px: nearest-neighbour downscale.
+                      target = 256
+                      scaled = bytearray(target * target * 4)
+                      for ty in range(target):
+                          source_row = (ty * height // target) * width * 4
+                          for tx in range(target):
+                              source = source_row + (tx * width // target) * 4
+                              dest = (ty * target + tx) * 4
+                              scaled[dest:dest + 4] = screen[source:source + 4]
+                      return bytes(scaled), target, target
+                  return bytes(screen), width, height
+
+
+          def _fail(message):
+              raise PngError(message)
+
+
+          def load(data, label="PNG", max_width=4096, max_height=4096, max_bytes=None,
+                   require_square=False, square_hint=""):
+              """Validate one branding PNG and return a decoded :class:`Png`.
+
+              Raises :class:`PngError` for any structural, digest-independent defect.
+              """
+              if max_bytes is not None and len(data) > max_bytes:
+                  _fail(label + " exceeds the byte cap (" + str(max_bytes) + ")")
               if len(data) < 33:
-                  sys.exit(f"::error::{name} is too small to be a PNG image")
-              if len(data) > max_bytes:
-                  sys.exit(f"::error::{name} exceeds the byte cap ({max_bytes})")
-              if data[:8] != b"\x89PNG\r\n\x1a\n":
-                  sys.exit(f"::error::{name} is not a PNG image; provider image URLs must point to .png files")
-              try:
-                  width, height, depth, color_type, _compression, _filter, interlace = struct.unpack(">IIBBBBB", data[16:29])
-              except struct.error:
-                  sys.exit(f"::error::{name} has an unreadable PNG header")
+                  _fail(label + " is too small to be a PNG image")
+              if data[:8] != PNG_SIGNATURE:
+                  _fail(label + " is not a PNG image; provider image URLs must point to .png files")
+
+              size = len(data)
+              pos = 8
+              count = 0
+              ihdr = None
+              plte = None
+              trns = b""
+              idat_parts = []
+              saw_idat = False
+              ended = False
+              # Full structural walk of the chunk stream (fail on any truncation).
+              while pos < size:
+                  if ended:
+                      _fail(label + " has data after IEND")
+                  if size - pos < 8:
+                      _fail(label + " ends inside a chunk header (truncated)")
+                  (length,) = struct.unpack(">I", data[pos:pos + 4])
+                  ctype = data[pos + 4:pos + 8]
+                  if pos + 12 + length > size:
+                      _fail(label + " chunk extends past its declared length (truncated)")
+                  chunk = data[pos + 8:pos + 8 + length]
+                  (crc,) = struct.unpack(">I", data[pos + 8 + length:pos + 12 + length])
+                  if (zlib.crc32(ctype + chunk) & 0xFFFFFFFF) != crc:
+                      _fail(label + " chunk CRC mismatch")
+                  if count == 0 and ctype != b"IHDR":
+                      _fail(label + " first chunk is not IHDR")
+                  if ctype == b"IHDR":
+                      if count != 0 or ihdr is not None:
+                          _fail(label + " has an invalid IHDR placement")
+                      ihdr = chunk
+                  elif ctype == b"PLTE":
+                      plte = chunk
+                  elif ctype == b"tRNS":
+                      trns = chunk
+                  elif ctype == b"IDAT":
+                      saw_idat = True
+                      idat_parts.append(chunk)
+                  elif ctype == b"IEND":
+                      if length != 0:
+                          _fail(label + " has a malformed IEND chunk")
+                      ended = True
+                  pos += 12 + length
+                  count += 1
+
+              if not ended:
+                  _fail(label + " is truncated (no IEND chunk)")
+              if ihdr is None or len(ihdr) != 13:
+                  _fail(label + " has an unreadable IHDR chunk")
+              width, height, depth, color_type, compression, filter_method, interlace = struct.unpack(
+                  ">IIBBBBB", ihdr
+              )
+              if width == 0 or height == 0:
+                  _fail(label + " has a zero dimension")
               if interlace != 0:
-                  sys.exit(f"::error::{name} is an interlaced PNG; only non-interlaced PNG is supported")
+                  _fail(label + " is an interlaced PNG; only non-interlaced PNG is supported")
               if depth != 8:
-                  sys.exit(f"::error::{name} uses unsupported PNG bit depth {depth}; 8-bit PNG is required")
-              if not 1 <= width <= max_w or not 1 <= height <= max_h:
-                  sys.exit(f"::error::{name} has out-of-range dimensions {width}x{height} (max {max_w}x{max_h})")
-              if not 0 <= color_type <= 6 or color_type == 1 or color_type == 5:
-                  sys.exit(f"::error::{name} uses unsupported PNG color type {color_type}")
-              if must_be_square and width != height:
-                  sys.exit(f"::error::{name} {extra}")
-              images[name] = {
-                  "sha256": hashlib.sha256(data).hexdigest(),
-                  "bytes": len(data),
-                  "width": width,
-                  "height": height,
-              }
-          if images:
-              (staging / "branding_manifest.json").write_text(json.dumps({"images": images}), encoding="utf-8")
-          print(f"branding assets staged: {', '.join(images) if images else 'none'}")
+                  _fail(label + " uses unsupported PNG bit depth " + str(depth) + "; 8-bit PNG is required")
+              if compression != 0 or filter_method != 0:
+                  _fail(label + " uses unsupported compression/filter method flags")
+              channels = _CHANNELS.get(color_type)
+              if channels is None:
+                  _fail(label + " uses unsupported PNG color type " + str(color_type))
+              if not 1 <= width <= max_width or not 1 <= height <= max_height:
+                  _fail(
+                      label + " has out-of-range dimensions " + str(width) + "x" + str(height)
+                      + " (max " + str(max_width) + "x" + str(max_height) + ")"
+                  )
+              if require_square and width != height:
+                  _fail(label + " " + square_hint if square_hint else label + " must be square")
+              if color_type == 3:
+                  if not plte:
+                      _fail(label + " palette PNG is missing its PLTE chunk")
+                  if len(plte) % 3 != 0 or not 1 <= len(plte) // 3 <= 256:
+                      _fail(label + " has an invalid PLTE chunk")
+              if not saw_idat:
+                  _fail(label + " has no image data")
+
+              idat = b"".join(idat_parts)
+              stride = width * channels
+              expected = height * (stride + 1)
+              # Bounded decompression: never ask zlib for more than one byte beyond the
+              # IHDR-implied scanline stream, so a decompression bomb cannot allocate
+              # meaningfully more than the declared image size.
+              try:
+                  decompressor = zlib.decompressobj()
+                  raw = decompressor.decompress(idat, expected + 1)
+              except zlib.error as exc:
+                  _fail(label + " image data is corrupt: " + str(exc))
+              if len(raw) > expected:
+                  _fail(
+                      label + " image data contains more scanline bytes than the IHDR dimensions"
+                      " allow (extra or trailing pixel data)"
+                  )
+              if not decompressor.eof or decompressor.unconsumed_tail:
+                  _fail(label + " image data stream is incomplete or has trailing data")
+              if len(raw) != expected:
+                  _fail(label + " image data is incomplete (truncated)")
+
+              # Full scanline/filter traversal: unfilter every row, rejecting unknown
+              # filter types, and keep the unfiltered pixels for raster consumers.
+              pixels = bytearray(height * stride)
+              prev = bytearray(stride)
+              off = 0
+              poff = 0
+              for _row in range(height):
+                  ftype = raw[off]
+                  off += 1
+                  row = bytearray(raw[off:off + stride])
+                  off += stride
+                  for i in range(stride):
+                      a_ = row[i - channels] if i >= channels else 0
+                      b_ = prev[i]
+                      c_ = prev[i - channels] if i >= channels else 0
+                      if ftype == 1:
+                          row[i] = (row[i] + a_) & 0xFF
+                      elif ftype == 2:
+                          row[i] = (row[i] + b_) & 0xFF
+                      elif ftype == 3:
+                          row[i] = (row[i] + (a_ + b_) // 2) & 0xFF
+                      elif ftype == 4:
+                          p_ = a_ + b_ - c_
+                          pa, pb, pc = abs(p_ - a_), abs(p_ - b_), abs(p_ - c_)
+                          pr = a_ if pa <= pb and pa <= pc else (b_ if pb <= pc else c_)
+                          row[i] = (row[i] + pr) & 0xFF
+                      elif ftype != 0:
+                          _fail(label + " uses an unknown scanline filter")
+                  pixels[poff:poff + stride] = row
+                  poff += stride
+                  prev = row
+              return Png(width, height, color_type, bytes(pixels), plte, trns)
+
+
+          def prepare(staging):
+              """Validate every staged branding image and write branding_manifest.json."""
+              staging = pathlib.Path(staging)
+              images = {}
+              for name, (max_w, max_h, max_bytes, require_square, square_hint) in _STAGING_RULES.items():
+                  path = staging / name
+                  if not path.is_file():
+                      continue
+                  data = path.read_bytes()
+                  try:
+                      image = load(
+                          data,
+                          name,
+                          max_width=max_w,
+                          max_height=max_h,
+                          max_bytes=max_bytes,
+                          require_square=require_square,
+                          square_hint=square_hint,
+                      )
+                  except PngError as exc:
+                      print("::error::" + str(exc))
+                      return 1
+                  images[name] = {
+                      "sha256": hashlib.sha256(data).hexdigest(),
+                      "bytes": len(data),
+                      "width": image.width,
+                      "height": image.height,
+                  }
+              if images:
+                  (staging / "branding_manifest.json").write_text(
+                      json.dumps({"images": images}), encoding="utf-8"
+                  )
+              print("branding assets staged: " + (", ".join(images) if images else "none"))
+              return 0
+
+
+          def main(argv):
+              if not argv:
+                  sys.stderr.write(
+                      "usage: validate_branding_png.py <png-or-staging-dir>"
+                      " [--label L] [--max-width N] [--max-height N] [--max-bytes N] [--require-square]\n"
+                  )
+                  return 2
+              target = pathlib.Path(argv[0])
+              label = None
+              max_width = 4096
+              max_height = 4096
+              max_bytes = None
+              require_square = False
+              index = 1
+              while index < len(argv):
+                  option = argv[index]
+                  if option == "--require-square":
+                      require_square = True
+                      index += 1
+                      continue
+                  if option in ("--label", "--max-width", "--max-height", "--max-bytes") and index + 1 < len(argv):
+                      value = argv[index + 1]
+                      if option == "--label":
+                          label = value
+                      elif option == "--max-width":
+                          max_width = int(value)
+                      elif option == "--max-height":
+                          max_height = int(value)
+                      else:
+                          max_bytes = int(value)
+                      index += 2
+                      continue
+                  sys.stderr.write("unknown argument: " + option + "\n")
+                  return 2
+              if target.is_dir():
+                  return prepare(target)
+              if not target.is_file():
+                  print("::error::" + str(target) + " is missing")
+                  return 1
+              name = label or target.name
+              try:
+                  image = load(
+                      target.read_bytes(),
+                      name,
+                      max_width=max_width,
+                      max_height=max_height,
+                      max_bytes=max_bytes,
+                      require_square=require_square,
+                  )
+              except PngError as exc:
+                  print("::error::" + str(exc))
+                  return 1
+              print(
+                  name + " verified: structurally complete and decodable "
+                  + str(image.width) + "x" + str(image.height)
+              )
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv[1:]))
           PY
-          then
+          chmod 700 "$validator"
+
+          # Per-field caps (DeskForge #80). The cap is enforced during the transfer
+          # by curl --max-filesize, so an oversized response is aborted at fetch and
+          # never reaches the manifest or any downstream consumer. This does not rely
+          # on HTTP Content-Length: curl also aborts mid-transfer when the body
+          # exceeds the cap without a declared length or with a wrong one.
+          fetch_branding_image() {
+            local field="$1" url="$2" out="$3" cap="$4"
+            if [ -z "$url" ]; then return 0; fi
+            local part="${out}.part"
+            rm -f -- "$part"
+            if ! curl -fsSL --retry 2 --retry-delay 2 --max-time 120 \
+                --max-filesize "$cap" --output "$part" -- "$url"; then
+              rm -f -- "$part"
+              echo "::error::$field image fetch failed from the provider URL (absolute http(s) URL required; the runner cannot fetch relative URLs; the response must stay within the ${cap}-byte cap)"
+              exit 1
+            fi
+            local bytes
+            bytes=$(wc -c < "$part")
+            if [ "$bytes" -gt "$cap" ]; then
+              rm -f -- "$part"
+              echo "::error::$field image exceeds the per-field byte cap (${cap} bytes)"
+              exit 1
+            fi
+            mv -- "$part" "$out"
+          }
+          fetch_branding_image app_icon_url "$RQS_APP_ICON_URL" "$staging/app-icon.png" $((10 * 1024 * 1024))
+          fetch_branding_image app_logo_url "$RQS_APP_LOGO_URL" "$staging/app-logo.png" $((10 * 1024 * 1024))
+          fetch_branding_image privacy_screen_url "$RQS_PRIVACY_SCREEN_URL" "$staging/privacy-screen.png" $((20 * 1024 * 1024))
+
+          # Validate every staged image and write branding_manifest.json with the same
+          # module that is shipped to the consumers.
+          if ! python3 "$validator" "$staging"; then
             echo "::error::branding image sanity checks failed"
             exit 1
           fi
+          cp -- "$validator" "$staging/validate_branding_png.py"
 
           if [ ! -f "$staging/branding_manifest.json" ]; then
             echo "no DeskForge branding images requested; skipping"
@@ -880,10 +1237,13 @@ jobs:
       # website_url / privacy_policy_url, each applied ONLY when non-empty.
       # Every replacement is anchored to the exact 1.4.9 source literals scoped to
       # the file being branded; a missing or already-changed anchor aborts the build
-      # (fail-on-mismatch — no silent skips). Values are inserted as plain literal
-      # bytes: characters \ ' " $ and control characters are rejected in values so
-      # replacements cannot escape the target string literals. License/attribution
-      # text (res/msi License.rtf, code headers) is deliberately NOT touched.
+      # (fail-on-mismatch — no silent skips). Ordinary safe punctuation is supported
+      # by escaping the value for each concrete insertion syntax: Windows .rc and
+      # TOML double-quoted strings share one escape set, while interpolated Dart
+      # single-quoted literals use another. Control characters are still rejected,
+      # so a value can never escape the literal it is inserted into. License/
+      # attribution text (res/msi License.rtf, code headers) is deliberately NOT
+      # touched.
       - name: 'L3 brand: company name + branded About links'
         if: env.RQS_COMPANY_NAME != '' || env.RQS_DOWNLOAD_URL != '' || env.RQS_WEBSITE_URL != '' || env.RQS_PRIVACY_POLICY_URL != ''
         shell: bash
@@ -902,20 +1262,37 @@ jobs:
                   return None
               if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
                   fail(field + " contains control characters")
-              if any(c in raw for c in "\\\"'$"):
-                  fail(field + " must not contain backslash, quote, double-quote or dollar characters")
               if len(raw.encode("utf-8")) > max_bytes:
                   fail(field + " exceeds " + str(max_bytes) + " bytes")
               return raw
+
+          def escape_quoted(value):
+              # Windows .rc double-quoted values and TOML basic strings share one
+              # escape set: a backslash is doubled and a double-quote escaped so the
+              # value cannot terminate the string literal it is inserted into.
+              return value.replace("\\", "\\\\").replace('"', '\\"')
+
+          def escape_dart(value):
+              # Dart single-quoted literals are interpolated: a backslash and a single
+              # quote are escaped and '$' is escaped so it cannot start an
+              # interpolation expression.
+              return value.replace("\\", "\\\\").replace("'", "\\'").replace("$", "\\$")
 
           company = validated("company_name", os.environ.get("RQS_COMPANY_NAME", ""), 256)
           download = validated("download_url", os.environ.get("RQS_DOWNLOAD_URL", ""), 2048)
           website = validated("website_url", os.environ.get("RQS_WEBSITE_URL", ""), 2048)
           privacy = validated("privacy_policy_url", os.environ.get("RQS_PRIVACY_POLICY_URL", ""), 2048)
 
-          companyCopyright = ("Copyright © 2026 " + company + ". All rights reserved.").encode("utf-8") if company else None
-          companyCargoCopyright = ('LegalCopyright = "Copyright © 2026 ' + company + '. All rights reserved."').encode("utf-8") if company else None
-          companyRcName = ('VALUE "CompanyName", "' + company + '" "\\0"').encode("utf-8") if company else None
+          # company_name is inserted into double-quoted .rc/TOML literals AND into
+          # an interpolated Dart single-quoted literal, so keep both escaped forms.
+          companyQuoted = escape_quoted(company) if company else None
+          companyDart = escape_dart(company) if company else None
+          downloadDart = escape_dart(download) if download else None
+          websiteDart = escape_dart(website) if website else None
+          privacyDart = escape_dart(privacy) if privacy else None
+          companyCopyright = ("Copyright © 2026 " + companyQuoted + ". All rights reserved.").encode("utf-8") if company else None
+          companyCargoCopyright = ('LegalCopyright = "Copyright © 2026 ' + companyQuoted + '. All rights reserved."').encode("utf-8") if company else None
+          companyRcName = ('VALUE "CompanyName", "' + companyQuoted + '" "\\0"').encode("utf-8") if company else None
           companyCargoAnchor = 'LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."'.encode("utf-8")
 
           ANCHORS = {
@@ -923,15 +1300,15 @@ jobs:
               "company_runrc_copyright": ('flutter/windows/runner/Runner.rc', 'Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved.'.encode("utf-8"), companyCopyright),
               "company_cargo": ("Cargo.toml", companyCargoAnchor, companyCargoCopyright),
               "company_packercargo": ("libs/portable/Cargo.toml", companyCargoAnchor, companyCargoCopyright),
-              "company_about_dart": ("flutter/lib/desktop/pages/desktop_setting_page.dart", 'Purslane Tech Pte. Ltd.'.encode("utf-8"), company.encode("utf-8") if company else None),
-              "download_desktop": ("flutter/lib/desktop/pages/desktop_home_page.dart", b"'https://rustdesk.com/download'", ("'" + download + "'").encode("utf-8") if download else None),
-              "download_mobile": ("flutter/lib/mobile/pages/connection_page.dart", b"'https://rustdesk.com/download'", ("'" + download + "'").encode("utf-8") if download else None),
-              "website_about": ("flutter/lib/desktop/pages/desktop_setting_page.dart", b"launchUrlString('https://rustdesk.com');", ("launchUrlString('" + website + "');").encode("utf-8") if website else None),
-              "website_powered": ("flutter/lib/common.dart", b"launchUrl(Uri.parse('https://rustdesk.com'));", ("launchUrl(Uri.parse('" + website + "'));").encode("utf-8") if website else None),
-              "website_mobile": ("flutter/lib/mobile/pages/settings_page.dart", b"const url = 'https://rustdesk.com/';", ("const url = '" + website + "';").encode("utf-8") if website else None),
-              "privacy_about": ("flutter/lib/desktop/pages/desktop_setting_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacy + "'").encode("utf-8") if privacy else None),
-              "privacy_install": ("flutter/lib/desktop/pages/install_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacy + "'").encode("utf-8") if privacy else None),
-              "privacy_mobile": ("flutter/lib/mobile/pages/settings_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacy + "'").encode("utf-8") if privacy else None),
+              "company_about_dart": ("flutter/lib/desktop/pages/desktop_setting_page.dart", 'Purslane Tech Pte. Ltd.'.encode("utf-8"), companyDart.encode("utf-8") if company else None),
+              "download_desktop": ("flutter/lib/desktop/pages/desktop_home_page.dart", b"'https://rustdesk.com/download'", ("'" + downloadDart + "'").encode("utf-8") if download else None),
+              "download_mobile": ("flutter/lib/mobile/pages/connection_page.dart", b"'https://rustdesk.com/download'", ("'" + downloadDart + "'").encode("utf-8") if download else None),
+              "website_about": ("flutter/lib/desktop/pages/desktop_setting_page.dart", b"launchUrlString('https://rustdesk.com');", ("launchUrlString('" + websiteDart + "');").encode("utf-8") if website else None),
+              "website_powered": ("flutter/lib/common.dart", b"launchUrl(Uri.parse('https://rustdesk.com'));", ("launchUrl(Uri.parse('" + websiteDart + "'));").encode("utf-8") if website else None),
+              "website_mobile": ("flutter/lib/mobile/pages/settings_page.dart", b"const url = 'https://rustdesk.com/';", ("const url = '" + websiteDart + "';").encode("utf-8") if website else None),
+              "privacy_about": ("flutter/lib/desktop/pages/desktop_setting_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacyDart + "'").encode("utf-8") if privacy else None),
+              "privacy_install": ("flutter/lib/desktop/pages/install_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacyDart + "'").encode("utf-8") if privacy else None),
+              "privacy_mobile": ("flutter/lib/mobile/pages/settings_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacyDart + "'").encode("utf-8") if privacy else None),
           }
           EXPECTED_COUNTS = {
               "company_runrc_name": 1,
@@ -999,17 +1376,29 @@ jobs:
           set -euo pipefail
           python3 - "$BRANDED_ASSETS_DIR" <<'PY'
           import hashlib
+          import importlib.util
           import json
           import pathlib
           import struct
           import sys
-          import zlib
 
           assets_dir = pathlib.Path(sys.argv[1])
 
           def fail(message):
               print("::error::" + message)
               raise SystemExit(1)
+
+          # Shared branding PNG validator: prepared once by the
+          # prepare_branding_assets job and shipped inside this same artifact,
+          # so the icon/logo consumers run byte-identical validation code.
+          validator_path = assets_dir / "validate_branding_png.py"
+          if not validator_path.is_file():
+              fail("branded assets artifact is missing the shared PNG validator (validate_branding_png.py)")
+          spec = importlib.util.spec_from_file_location("deskforge_validate_branding_png", validator_path)
+          if spec is None or spec.loader is None:
+              fail("shared PNG validator cannot be loaded from the branded assets artifact")
+          validator = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(validator)
 
           manifest_path = assets_dir / "branding_manifest.json"
           if not manifest_path.is_file():
@@ -1041,107 +1430,16 @@ jobs:
               if len(data) < 22 or data[0:4] != b"\x00\x00\x01\x00" or data[4] < 1:
                   fail("cannot replace " + label + ": existing file is not a valid ICO")
 
-          def decode_png_bgra(data):
-              # Minimal PNG reader (8-bit, non-interlaced; the prepare job already
-              # gates magic/color-type/size): returns (BGRA bytes, width, height).
-              if data[:8] != b"\x89PNG\r\n\x1a\n":
-                  fail("app icon is not a PNG image")
-              pos = 8
-              ihdr = None
-              plte = None
-              trns = b""
-              idat = b""
-              while pos < len(data):
-                  length = struct.unpack(">I", data[pos:pos + 4])[0]
-                  ctype = data[pos + 4:pos + 8]
-                  chunk = data[pos + 8:pos + 8 + length]
-                  pos += 12 + length
-                  if ctype == b"IHDR":
-                      ihdr = struct.unpack(">IIBBBBB", chunk)
-                  elif ctype == b"PLTE":
-                      plte = chunk
-                  elif ctype == b"tRNS":
-                      trns = chunk
-                  elif ctype == b"IDAT":
-                      idat = idat + chunk
-                  elif ctype == b"IEND":
-                      break
-              if ihdr is None:
-                  fail("app icon PNG has no IHDR chunk")
-              width, height, _depth, color_type, _comp, _filt, interlace = ihdr
-              if interlace != 0:
-                  fail("app icon PNG is interlaced; unsupported for icon conversion")
-              channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
-              if channels is None:
-                  fail("app icon PNG uses unsupported color type " + str(color_type))
-              if color_type == 3 and not plte:
-                  fail("app icon palette PNG is missing its PLTE chunk")
-              try:
-                  raw = zlib.decompress(idat)
-              except zlib.error as exc:
-                  fail("app icon PNG pixel data is corrupt: " + str(exc))
-              stride = width * channels
-              if len(raw) < height * (stride + 1):
-                  fail("app icon PNG rows are truncated")
-              screen = bytearray(width * height * 4)
-              prev = bytearray(stride)
-              off = 0
-              for y in range(height):
-                  ftype = raw[off]
-                  off += 1
-                  row = bytearray(raw[off:off + stride])
-                  off += stride
-                  for i in range(stride):
-                      a_ = row[i - channels] if i >= channels else 0
-                      b_ = prev[i]
-                      c_ = prev[i - channels] if i >= channels else 0
-                      if ftype == 1:
-                          row[i] = (row[i] + a_) & 0xFF
-                      elif ftype == 2:
-                          row[i] = (row[i] + b_) & 0xFF
-                      elif ftype == 3:
-                          row[i] = (row[i] + (a_ + b_) // 2) & 0xFF
-                      elif ftype == 4:
-                          p_ = a_ + b_ - c_
-                          pa, pb, pc = abs(p_ - a_), abs(p_ - b_), abs(p_ - c_)
-                          pr = a_ if pa <= pb and pa <= pc else (b_ if pb <= pc else c_)
-                          row[i] = (row[i] + pr) & 0xFF
-                      elif ftype != 0:
-                          fail("app icon PNG uses an unknown scanline filter")
-                  prev = row
-                  base = y * width * 4
-                  for x in range(width):
-                      sx = x * channels
-                      dx = base + x * 4
-                      if color_type == 6:
-                          screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = row[sx + 2], row[sx + 1], row[sx], row[sx + 3]
-                      elif color_type == 2:
-                          screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = row[sx + 2], row[sx + 1], row[sx], 255
-                      elif color_type == 4:
-                          screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = row[sx], row[sx], row[sx], row[sx + 1]
-                      elif color_type == 0:
-                          screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = row[sx], row[sx], row[sx], 255
-                      else:
-                          idx = row[sx]
-                          if idx * 3 + 2 >= len(plte):
-                              fail("app icon PNG palette index is out of range")
-                          alpha = trns[idx] if idx < len(trns) else 255
-                          screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = plte[idx * 3 + 2], plte[idx * 3 + 1], plte[idx * 3], alpha
-              if width > 256 or height > 256:
-                  # exe resource icons must stay <= 256px: nearest-neighbour downscale.
-                  target = 256
-                  scaled = bytearray(target * target * 4)
-                  for ty in range(target):
-                      t = (ty * height // target) * width * 4
-                      for tx in range(target):
-                          s = t + (tx * width // target) * 4
-                          d = (ty * target + tx) * 4
-                          scaled[d:d + 4] = screen[s:s + 4]
-                  return bytes(scaled), target, target
-              return bytes(screen), width, height
-
           def png_to_ico(data, label):
-              bgra, width, height = decode_png_bgra(data)
+              # The shared validator owns all structure/decompression checks and the
+              # raster extraction; this build step only adds the ICO packaging.
+              try:
+                  image = validator.load(
+                      data, label, max_width=4096, max_height=4096, max_bytes=10 * 1024 * 1024
+                  )
+                  bgra, width, height = image.bgra()
+              except validator.PngError as exc:
+                  fail(str(exc))
               if width != height or not 16 <= width <= 256:
                   fail(label + " must be square and between 16 and 256 px for the Windows icon resources (enforced for app_icon_url)")
               mask_stride = ((width + 31) // 32) * 4
@@ -1182,6 +1480,13 @@ jobs:
               # 1.4.9 runtime anchor: _Logo/loadLogo renders assets/logo.png (max 300x60)
               # on the desktop home page.
               check_anchor("flutter/lib/common.dart", b"const _kDefaultLogoAsset = 'assets/logo.png';", 1)
+              # A digest match only proves the bytes are the ones we staged; run
+              # the shared structural validator so a corrupt/truncated logo fails
+              # here instead of being copied into the app assets.
+              try:
+                  validator.load(logo_png, "app-logo.png", max_width=4096, max_height=4096, max_bytes=10 * 1024 * 1024)
+              except validator.PngError as exc:
+                  fail(str(exc))
               plans.append(("flutter/assets/logo.png", logo_png))
               print("app logo: flutter/assets/logo.png prepared")
           for path, data in plans:

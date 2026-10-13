@@ -124,17 +124,20 @@ jobs:
             echo "::error::privacy screen branding manifest missing from the artifact (expected branding_manifest.json); build aborted"
             exit 1
           fi
+          validator="${RUNNER_TEMP}/deskforge-privacy-screen/validate_branding_png.py"
+          if [ ! -f "$validator" ]; then
+            echo "::error::shared branding PNG validator is missing from the artifact (expected validate_branding_png.py); build aborted"
+            exit 1
+          fi
           # The third-party job trusts nothing between prepare and here: verify the
-          # sha256 manifest entry, then fully validate the image (complete chunk
-          # stream: IHDR first, per-chunk CRC, IEND at EOF, decodable pixel data)
-          # before replacing the privacy overlay. A truncated/corrupt payload fails
-          # here instead of embedding undecodable bytes into g_img.
+          # sha256 manifest entry, then run the SAME shared validator the prepare job
+          # used (shipped inside this artifact). The overlay is replaced only when the
+          # image is structurally whole and fully decodable; a truncated/corrupt
+          # payload fails here instead of embedding undecodable bytes into g_img.
           if ! python3 - "$privacy_png" "$manifest_json" <<'PY'
           import hashlib
           import json
-          import struct
           import sys
-          import zlib
 
           def fail(message):
               print("::error::" + message)
@@ -150,102 +153,12 @@ jobs:
               fail("branding manifest has no sha256 entry for privacy-screen.png; build aborted")
           if hashlib.sha256(data).hexdigest() != entry["sha256"]:
               fail("privacy-screen.png digest does not match the prepared manifest; build aborted")
-          if len(data) < 33:
-              fail("privacy-screen.png is too small to be a PNG image")
-          if data[:8] != b"\x89PNG\r\n\x1a\n":
-              fail("privacy-screen.png is not a PNG image")
-          if len(data) > 20 * 1024 * 1024:
-              fail("privacy-screen.png exceeds the 20 MB byte cap")
-          # Full structural walk of the PNG chunk stream (fail-on-truncation).
-          pos = 8
-          count = 0
-          ihdr = None
-          plte = None
-          idat = b""
-          ended = False
-          while pos < len(data):
-              if len(data) - pos < 8:
-                  fail("privacy-screen.png ends inside a chunk header (truncated)")
-              (length,) = struct.unpack(">I", data[pos:pos + 4])
-              ctype = data[pos + 4:pos + 8]
-              if pos + 12 + length > len(data):
-                  fail("privacy-screen.png chunk extends past its declared length (truncated)")
-              chunk = data[pos + 8:pos + 8 + length]
-              (crc,) = struct.unpack(">I", data[pos + 8 + length:pos + 12 + length])
-              if (zlib.crc32(ctype + chunk) & 0xFFFFFFFF) != crc:
-                  fail("privacy-screen.png chunk CRC mismatch")
-              if count == 0 and ctype != b"IHDR":
-                  fail("privacy-screen.png first chunk is not IHDR")
-              if ended:
-                  fail("privacy-screen.png has data after IEND")
-              if ctype == b"IEND":
-                  ended = True
-              elif ctype == b"IHDR":
-                  ihdr = chunk
-              elif ctype == b"PLTE":
-                  plte = chunk
-              elif ctype == b"IDAT":
-                  idat = idat + chunk
-              pos += 12 + length
-              count += 1
-          if not ended:
-              fail("privacy-screen.png is truncated (no IEND chunk)")
-          if ihdr is None or len(ihdr) != 13:
-              fail("privacy-screen.png has an unreadable IHDR chunk")
-          try:
-              width, height, depth, color_type, _compression, _filter, interlace = struct.unpack(">IIBBBBB", ihdr)
-          except struct.error:
-              fail("privacy-screen.png has an unreadable PNG header")
-          if interlace != 0 or depth != 8:
-              fail("privacy-screen.png must be non-interlaced 8-bit")
-          if _compression != 0 or _filter != 0:
-              fail("privacy-screen.png uses unsupported compression/filter method flags")
-          if not 1 <= width <= 4096 or not 1 <= height <= 4096:
-              fail("privacy-screen.png dimensions out of range " + str(width) + "x" + str(height) + " (max 4096x4096, fullscreen overlay image)")
-          channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
-          if channels is None:
-              fail("privacy-screen.png uses unsupported PNG color type " + str(color_type))
-          if color_type == 3 and not plte:
-              fail("privacy-screen.png palette PNG is missing its PLTE chunk")
-          if not idat:
-              fail("privacy-screen.png has no image data")
-          # Full pixel-data decode: complete decompressed stream and valid scanline
-          # filters on every row prove the image decodes end to end.
-          try:
-              raw = zlib.decompress(idat)
-          except zlib.error as exc:
-              fail("privacy-screen.png image data is corrupt: " + str(exc))
-          stride = width * channels
-          if len(raw) < height * (stride + 1):
-              fail("privacy-screen.png image data is incomplete (truncated)")
-          prev = bytearray(stride)
-          off = 0
-          for _y in range(height):
-              ftype = raw[off]
-              off += 1
-              row = bytearray(raw[off:off + stride])
-              off += stride
-              for i in range(stride):
-                  a_ = row[i - channels] if i >= channels else 0
-                  b_ = prev[i]
-                  c_ = prev[i - channels] if i >= channels else 0
-                  if ftype == 1:
-                      row[i] = (row[i] + a_) & 0xFF
-                  elif ftype == 2:
-                      row[i] = (row[i] + b_) & 0xFF
-                  elif ftype == 3:
-                      row[i] = (row[i] + (a_ + b_) // 2) & 0xFF
-                  elif ftype == 4:
-                      p_ = a_ + b_ - c_
-                      pa, pb, pc = abs(p_ - a_), abs(p_ - b_), abs(p_ - c_)
-                      pr = a_ if pa <= pb and pa <= pc else (b_ if pb <= pc else c_)
-                      row[i] = (row[i] + pr) & 0xFF
-                  elif ftype != 0:
-                      fail("privacy-screen.png uses an unknown scanline filter")
-              prev = row
-          print("privacy-screen.png verified: digest matches manifest, chunk stream complete, fully decodable " + str(width) + "x" + str(height))
           PY
           then
+            echo "::error::privacy screen image digest verification failed"
+            exit 1
+          fi
+          if ! python3 "$validator" "$privacy_png" --label privacy-screen.png --max-width 4096 --max-height 4096 --max-bytes 20971520; then
             echo "::error::privacy screen image sanity checks failed"
             exit 1
           fi
