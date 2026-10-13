@@ -1262,9 +1262,11 @@ jobs:
       # Every replacement is anchored to the exact 1.4.9 source literals scoped to
       # the file being branded; a missing or already-changed anchor aborts the build
       # (fail-on-mismatch — no silent skips). Ordinary safe punctuation is supported
-      # by escaping the value for each concrete insertion syntax: Windows .rc and
-      # TOML double-quoted strings share one escape set, while interpolated Dart
-      # single-quoted literals use another. Control characters are still rejected,
+      # by escaping the value for each concrete insertion syntax: Windows .rc values
+      # (backslash doubled, embedded quote written as a doubled quote), TOML basic
+      # strings (backslash doubled, embedded quote backslash-escaped), and
+      # interpolated Dart single-quoted literals (backslash, single quote and '$'
+      # escaped). Control characters are still rejected,
       # so a value can never escape the literal it is inserted into. License/
       # attribution text (res/msi License.rtf, code headers) is deliberately NOT
       # touched.
@@ -1290,10 +1292,18 @@ jobs:
                   fail(field + " exceeds " + str(max_bytes) + " bytes")
               return raw
 
-          def escape_quoted(value):
-              # Windows .rc double-quoted values and TOML basic strings share one
-              # escape set: a backslash is doubled and a double-quote escaped so the
-              # value cannot terminate the string literal it is inserted into.
+          def escape_rc(value):
+              # Windows .rc double-quoted values: a backslash is doubled, but an
+              # embedded double quote is written as a doubled quote `""` because RC
+              # has no backslash quote escape (rc.exe/windres read \" literally). The
+              # 1.4.9 source already relies on this, e.g. Runner.rc's
+              # "#include ""winres.h""".
+              return value.replace("\\", "\\\\").replace('"', '""')
+
+          def escape_toml(value):
+              # TOML basic strings: a backslash is doubled and a double-quote is
+              # escaped with a backslash so the value cannot terminate the string
+              # literal it is inserted into.
               return value.replace("\\", "\\\\").replace('"', '\\"')
 
           def escape_dart(value):
@@ -1307,16 +1317,18 @@ jobs:
           website = validated("website_url", os.environ.get("RQS_WEBSITE_URL", ""), 2048)
           privacy = validated("privacy_policy_url", os.environ.get("RQS_PRIVACY_POLICY_URL", ""), 2048)
 
-          # company_name is inserted into double-quoted .rc/TOML literals AND into
-          # an interpolated Dart single-quoted literal, so keep both escaped forms.
-          companyQuoted = escape_quoted(company) if company else None
+          # company_name is inserted into double-quoted Windows .rc literals, into
+          # TOML basic strings, AND into an interpolated Dart single-quoted literal,
+          # so keep one escaped form per concrete insertion syntax.
+          companyRcQuoted = escape_rc(company) if company else None
+          companyTomlQuoted = escape_toml(company) if company else None
           companyDart = escape_dart(company) if company else None
           downloadDart = escape_dart(download) if download else None
           websiteDart = escape_dart(website) if website else None
           privacyDart = escape_dart(privacy) if privacy else None
-          companyCopyright = ("Copyright © 2026 " + companyQuoted + ". All rights reserved.").encode("utf-8") if company else None
-          companyCargoCopyright = ('LegalCopyright = "Copyright © 2026 ' + companyQuoted + '. All rights reserved."').encode("utf-8") if company else None
-          companyRcName = ('VALUE "CompanyName", "' + companyQuoted + '" "\\0"').encode("utf-8") if company else None
+          companyCopyright = ("Copyright © 2026 " + companyRcQuoted + ". All rights reserved.").encode("utf-8") if company else None
+          companyCargoCopyright = ('LegalCopyright = "Copyright © 2026 ' + companyTomlQuoted + '. All rights reserved."').encode("utf-8") if company else None
+          companyRcName = ('VALUE "CompanyName", "' + companyRcQuoted + '" "\\0"').encode("utf-8") if company else None
           companyCargoAnchor = 'LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."'.encode("utf-8")
 
           ANCHORS = {

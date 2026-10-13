@@ -11,9 +11,9 @@ Covers the review findings on the Windows branding workflow:
   F3  the per-field response cap is bound during transfer, independent of HTTP
       Content-Length and of the runner's curl version, so an oversized response
       never reaches the manifest or a downstream consumer;
-  F4  branding text is escaped for each concrete insertion syntax (Windows .rc /
-      TOML double-quoted strings vs interpolated Dart single-quoted literals), so
-      ordinary safe punctuation is accepted instead of blanket-rejected.
+  F4  branding text is escaped for each concrete insertion syntax (Windows .rc vs
+      TOML basic strings vs interpolated Dart single-quoted literals), so ordinary
+      safe punctuation is accepted instead of blanket-rejected.
 
 Run with:  python3 tests/test_branding_contract.py
 """
@@ -709,11 +709,41 @@ class BrandingEscapeTests(unittest.TestCase):
         result, out = self._run(company=value)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rc = out["flutter/windows/runner/Runner.rc"]
-        self.assertIn('"He said \\"hi\\" \\\\ $cash"', rc)
+        # Windows .rc: embedded double quote is a doubled quote, backslash doubled.
+        self.assertIn('"He said ""hi"" \\\\ $cash"', rc)
+        self.assertNotIn('He said \\"hi\\"', rc)
         toml = out["Cargo.toml"]
+        # TOML basic string: embedded double quote keeps the backslash escape.
         self.assertIn('He said \\"hi\\" \\\\ $cash. All rights reserved.', toml)
+        self.assertNotIn("He said \"\"hi\"\"", toml)
         dart = out["flutter/lib/desktop/pages/desktop_setting_page.dart"]
         self.assertIn('He said "hi" \\\\ \\$cash', dart)
+
+    def test_embedded_quote_uses_rc_doubled_quotes_and_toml_backslash_escape(self):
+        # Discriminating case for the separated escaping rules: the same company_name
+        # containing a double quote must become `""` in the Windows .rc CompanyName and
+        # LegalCopyright values (RC has no \" escape) but `\"` in the TOML basic-string
+        # LegalCopyright values. Dart single-quoted literals need no quote escape.
+        company = 'Northwind "The Best" Traders'
+        result, out = self._run(company=company)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rc = out["flutter/windows/runner/Runner.rc"]
+        self.assertIn('VALUE "CompanyName", "Northwind ""The Best"" Traders" "\\0"', rc)
+        self.assertIn(
+            'VALUE "LegalCopyright", "Copyright \u00a9 2026 Northwind ""The Best"" Traders. All rights reserved." "\\0"',
+            rc,
+        )
+        self.assertNotIn('Northwind \\"The Best\\" Traders', rc)
+        for rel in ("Cargo.toml", "libs/portable/Cargo.toml"):
+            toml = out[rel]
+            self.assertIn(
+                'LegalCopyright = "Copyright \u00a9 2026 Northwind \\"The Best\\" Traders. All rights reserved."',
+                toml,
+            )
+            self.assertNotIn('Northwind ""The Best"" Traders', toml)
+        dart = out["flutter/lib/desktop/pages/desktop_setting_page.dart"]
+        self.assertIn('Northwind "The Best" Traders', dart)
+        self.assertNotIn('Northwind \\"The Best\\" Traders', dart)
 
     def test_url_fields_escape_dart_literals(self):
         result, out = self._run(
