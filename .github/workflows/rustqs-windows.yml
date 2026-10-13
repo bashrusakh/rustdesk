@@ -251,10 +251,13 @@ jobs:
           the first IDAT, required for indexed colour and permitted as a suggested palette
           for truecolour 2/6 but forbidden for 0/4; tRNS exactly once and before the first
           IDAT, and for indexed colour after PLTE; consecutive IDAT chunks; no unknown
-          critical chunk), a valid per-colour-type tRNS transparency sample, allowed
-          compression/filter/interlace flags, bounded and exact decompression of the IDAT
-          stream (never more than the IHDR-implied scanline byte count, and no trailing
-          decompressed payload), and a full scanline/filter traversal.
+          critical chunk), a valid per-colour-type tRNS transparency sample, the
+          compression/filter method flags pinned to 0, every bit depth the PNG
+          specification permits for the colour type, either interlace method (none or
+          Adam7), bounded and exact decompression of the IDAT stream (never more than the
+          scanline byte count the IHDR and interlace layout imply, and neither trailing
+          decompressed nor trailing compressed payload), and a full per-pass
+          scanline/filter traversal canonicalised to 8-bit BGRA for every consumer.
           """
 
           import hashlib
@@ -266,8 +269,27 @@ jobs:
 
           PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
-          # Colour type -> samples per pixel for the accepted non-interlaced 8-bit PNG.
+          # Colour type -> samples per pixel. The decoded raster is canonicalised to 8 bits
+          # per sample, so this is also the canonical channel count for every source depth.
           _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+          # Colour type -> the bit depths the PNG specification permits for it (PNG 1.2
+          # 4.1.2 / 11.2.2): greyscale 1/2/4/8/16, truecolour and the two alpha types
+          # 8/16, indexed colour 1/2/4/8 but never 16.
+          _DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+
+          # Adam7 interlace passes as (xstart, ystart, xstep, ystep) (PNG 1.2 8.2).
+          _ADAM7_PASSES = (
+              (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+              (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
+          )
+
+          # Number of pixels along one axis for an interlace pass; zero means the pass
+          # carries no data at all (no scanlines, hence no filter byte).
+          def _pass_extent(size, start, step):
+              if size <= start:
+                  return 0
+              return (size - start + step - 1) // step
 
           # PNG chunk types are exactly four ASCII letters A-Z / a-z (PNG 1.2 section
           # 5.3). A byte outside that set is a malformed chunk, not an ignorable
@@ -308,17 +330,26 @@ jobs:
 
 
           class Png:
-              """A validated, fully decoded 8-bit non-interlaced PNG."""
+              """A validated, fully decoded 8-bit canonical PNG.
 
-              __slots__ = ("width", "height", "color_type", "pixels", "plte", "trns")
+              The raster in :attr:`pixels` is always 8 bits per sample regardless of the source
+              bit depth (a 16-bit sample keeps its most significant byte, a sub-byte sample is
+              expanded, an indexed sample stays a palette index), and any Adam7 interlace has
+              been expanded into the full raster.
+              """
 
-              def __init__(self, width, height, color_type, pixels, plte, trns):
+              __slots__ = ("width", "height", "color_type", "pixels", "plte", "trns", "transparency")
+
+              def __init__(self, width, height, color_type, pixels, plte, trns, transparency=None):
                   self.width = width
                   self.height = height
                   self.color_type = color_type
-                  self.pixels = pixels  # unfiltered scanlines, filter byte removed
+                  self.pixels = pixels  # unfiltered 8-bit scanlines, filter byte removed
                   self.plte = plte
                   self.trns = trns
+                  # Per-pixel alpha (0 or 255) for a greyscale/truecolour tRNS sample, decided
+                  # at the source sample width; ``None`` when tRNS does not apply.
+                  self.transparency = transparency
 
               def bgra(self):
                   """Return ``(BGRA bytes, width, height)``; > 256px is downscaled to 256."""
@@ -327,17 +358,13 @@ jobs:
                   height = self.height
                   stride = width * channels
                   pixels = self.pixels
+                  transparency = self.transparency
                   screen = bytearray(width * height * 4)
                   # tRNS names exactly one fully transparent sample: a 2-byte gray value
-                  # (color type 0) or a 6-byte RGB value (color type 2); every other pixel
-                  # stays opaque. Indexed transparency is the per-entry alpha table used
-                  # below. The alpha color types (4/6) never carry tRNS (load() rejects it).
-                  transparent_gray = None
-                  transparent_rgb = None
-                  if self.trns is not None and self.color_type == 0:
-                      (transparent_gray,) = struct.unpack(">H", self.trns)
-                  elif self.trns is not None and self.color_type == 2:
-                      transparent_rgb = struct.unpack(">HHH", self.trns)
+                  # (color type 0) or a 6-byte RGB value (color type 2); it was compared at
+                  # the source sample width in load() and is precomputed into ``transparency``.
+                  # Indexed transparency is the per-entry alpha table used below. The alpha
+                  # color types (4/6) never carry tRNS (load() rejects it).
                   for y in range(height):
                       base = y * width * 4
                       row = pixels[y * stride:(y + 1) * stride]
@@ -349,9 +376,7 @@ jobs:
                                   row[sx + 2], row[sx + 1], row[sx], row[sx + 3],
                               )
                           elif self.color_type == 2:
-                              alpha = 0 if transparent_rgb is not None and (
-                                  row[sx], row[sx + 1], row[sx + 2]
-                              ) == transparent_rgb else 255
+                              alpha = transparency[y * width + x] if transparency is not None else 255
                               screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
                                   row[sx + 2], row[sx + 1], row[sx], alpha,
                               )
@@ -360,7 +385,7 @@ jobs:
                                   row[sx], row[sx], row[sx], row[sx + 1],
                               )
                           elif self.color_type == 0:
-                              alpha = 0 if transparent_gray is not None and row[sx] == transparent_gray else 255
+                              alpha = transparency[y * width + x] if transparency is not None else 255
                               screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
                                   row[sx], row[sx], row[sx], alpha,
                               )
@@ -391,6 +416,35 @@ jobs:
 
           def _fail(message):
               raise PngError(message)
+
+
+          def _unfilter_scanline(raw, offset, row_bytes, bpp, previous, label):
+              """Undo one PNG scanline filter; return ``(unfiltered row, next offset)``.
+
+              ``bpp`` is the filter byte stride (the pixel size in bytes, at least one), which
+              is what makes packed sub-byte samples filter correctly. ``previous`` is the
+              previously reconstructed scanline of the same interlace pass, or zeros.
+              """
+              ftype = raw[offset]
+              row = bytearray(raw[offset + 1:offset + 1 + row_bytes])
+              for i in range(row_bytes):
+                  a_ = row[i - bpp] if i >= bpp else 0
+                  b_ = previous[i]
+                  c_ = previous[i - bpp] if i >= bpp else 0
+                  if ftype == 1:
+                      row[i] = (row[i] + a_) & 0xFF
+                  elif ftype == 2:
+                      row[i] = (row[i] + b_) & 0xFF
+                  elif ftype == 3:
+                      row[i] = (row[i] + (a_ + b_) // 2) & 0xFF
+                  elif ftype == 4:
+                      p_ = a_ + b_ - c_
+                      pa, pb, pc = abs(p_ - a_), abs(p_ - b_), abs(p_ - c_)
+                      pr = a_ if pa <= pb and pa <= pc else (b_ if pb <= pc else c_)
+                      row[i] = (row[i] + pr) & 0xFF
+                  elif ftype != 0:
+                      _fail(label + " uses an unknown scanline filter")
+              return row, offset + 1 + row_bytes
 
 
           def load(data, label="PNG", max_width=4096, max_height=4096, max_bytes=None,
@@ -449,15 +503,22 @@ jobs:
               )
               if width == 0 or height == 0:
                   _fail(label + " has a zero dimension")
-              if interlace != 0:
-                  _fail(label + " is an interlaced PNG; only non-interlaced PNG is supported")
-              if depth != 8:
-                  _fail(label + " uses unsupported PNG bit depth " + str(depth) + "; 8-bit PNG is required")
               if compression != 0 or filter_method != 0:
                   _fail(label + " uses unsupported compression/filter method flags")
+              if interlace not in (0, 1):
+                  _fail(
+                      label + " uses unsupported PNG interlace method " + str(interlace)
+                      + " (only non-interlaced or Adam7 interlaced PNG is supported)"
+                  )
               channels = _CHANNELS.get(color_type)
               if channels is None:
                   _fail(label + " uses unsupported PNG color type " + str(color_type))
+              if depth not in _DEPTHS[color_type]:
+                  _fail(
+                      label + " uses a PNG bit depth " + str(depth) + " that is invalid for color type "
+                      + str(color_type) + " (allowed: "
+                      + "/".join(str(value) for value in _DEPTHS[color_type]) + ")"
+                  )
               if not 1 <= width <= max_width or not 1 <= height <= max_height:
                   _fail(
                       label + " has out-of-range dimensions " + str(width) + "x" + str(height)
@@ -536,11 +597,25 @@ jobs:
                   _fail(label + " has no image data")
 
               idat = b"".join(idat_parts)
-              stride = width * channels
-              expected = height * (stride + 1)
-              # Bounded decompression: never ask zlib for more than one byte beyond the
-              # IHDR-implied scanline stream, so a decompression bomb cannot allocate
-              # meaningfully more than the declared image size.
+              # Scanline layout: the non-interlaced image is one pass; otherwise the seven
+              # Adam7 passes. Each pass is an independent reduced image with its own row width,
+              # filter stride and previous scanline, and a pass with no columns carries no
+              # scanlines at all (no filter byte) per PNG 1.2 8.2.
+              passes = ((0, 0, 1, 1),) if interlace == 0 else _ADAM7_PASSES
+              bpp = (channels * depth + 7) // 8
+              layout = []
+              expected = 0
+              for xstart, ystart, xstep, ystep in passes:
+                  pass_width = _pass_extent(width, xstart, xstep)
+                  if pass_width == 0:
+                      continue
+                  pass_height = _pass_extent(height, ystart, ystep)
+                  row_bytes = (pass_width * channels * depth + 7) // 8
+                  expected += pass_height * (row_bytes + 1)
+                  layout.append((pass_width, pass_height, row_bytes, xstart, ystart, xstep, ystep))
+              # Bounded decompression: never ask zlib for more than one byte beyond the exact
+              # scanline stream the IHDR and interlace layout imply, so a decompression bomb
+              # cannot allocate meaningfully more than the declared image size.
               try:
                   decompressor = zlib.decompressobj()
                   raw = decompressor.decompress(idat, expected + 1)
@@ -551,42 +626,108 @@ jobs:
                       label + " image data contains more scanline bytes than the IHDR dimensions"
                       " allow (extra or trailing pixel data)"
                   )
-              if not decompressor.eof or decompressor.unconsumed_tail:
+              if not decompressor.eof or decompressor.unconsumed_tail or decompressor.unused_data:
+                  # unused_data is payload after the zlib end marker: a decoder must not accept
+                  # a trailing byte stream once the compressed image data has ended.
                   _fail(label + " image data stream is incomplete or has trailing data")
               if len(raw) != expected:
                   _fail(label + " image data is incomplete (truncated)")
 
-              # Full scanline/filter traversal: unfilter every row, rejecting unknown
-              # filter types, and keep the unfiltered pixels for raster consumers.
+              # Canonical 8-bit raster: unfilter every scanline of every pass, expand packed
+              # sub-byte samples, and keep the most significant byte of each 16-bit sample, so
+              # every consumer sees one 8-bit channel layout regardless of the source format.
+              stride = width * channels
               pixels = bytearray(height * stride)
-              prev = bytearray(stride)
-              off = 0
-              poff = 0
-              for _row in range(height):
-                  ftype = raw[off]
-                  off += 1
-                  row = bytearray(raw[off:off + stride])
-                  off += stride
-                  for i in range(stride):
-                      a_ = row[i - channels] if i >= channels else 0
-                      b_ = prev[i]
-                      c_ = prev[i - channels] if i >= channels else 0
-                      if ftype == 1:
-                          row[i] = (row[i] + a_) & 0xFF
-                      elif ftype == 2:
-                          row[i] = (row[i] + b_) & 0xFF
-                      elif ftype == 3:
-                          row[i] = (row[i] + (a_ + b_) // 2) & 0xFF
-                      elif ftype == 4:
-                          p_ = a_ + b_ - c_
-                          pa, pb, pc = abs(p_ - a_), abs(p_ - b_), abs(p_ - c_)
-                          pr = a_ if pa <= pb and pa <= pc else (b_ if pb <= pc else c_)
-                          row[i] = (row[i] + pr) & 0xFF
-                      elif ftype != 0:
-                          _fail(label + " uses an unknown scanline filter")
-                  pixels[poff:poff + stride] = row
-                  poff += stride
-                  prev = row
+              max_value = (1 << depth) - 1
+              # tRNS on greyscale/truecolour names one fully transparent sample: a 2-byte gray
+              # value (color type 0) or a 6-byte RGB value (color type 2). It is compared at the
+              # source sample width, so a 16-bit value is not collapsed to its top byte before
+              # the comparison. The alpha color types (4/6) never carry tRNS (rejected above).
+              transparent_gray = None
+              transparent_rgb = None
+              if trns is not None and color_type == 0:
+                  (transparent_gray,) = struct.unpack(">H", trns)
+              elif trns is not None and color_type == 2:
+                  transparent_rgb = struct.unpack(">HHH", trns)
+              transparency = None
+              if transparent_gray is not None or transparent_rgb is not None:
+                  transparency = bytearray(b"\xff" * (width * height))
+              offset = 0
+              if interlace == 0 and depth == 8:
+                  # Fast path: the unfiltered scanlines are already the canonical 8-bit raster
+                  # (byte-identical to the original decoder).
+                  previous = bytearray(stride)
+                  for y in range(height):
+                      row, offset = _unfilter_scanline(raw, offset, stride, channels, previous, label)
+                      pixels[y * stride:(y + 1) * stride] = row
+                      previous = row
+                      if transparency is not None:
+                          row_base = y * width
+                          if color_type == 0:
+                              for x in range(width):
+                                  if row[x] == transparent_gray:
+                                      transparency[row_base + x] = 0
+                          else:
+                              for x in range(width):
+                                  sx = x * 3
+                                  if (row[sx], row[sx + 1], row[sx + 2]) == transparent_rgb:
+                                      transparency[row_base + x] = 0
+              else:
+                  for pass_width, pass_height, row_bytes, xstart, ystart, xstep, ystep in layout:
+                      previous = bytearray(row_bytes)
+                      for row_index in range(pass_height):
+                          row, offset = _unfilter_scanline(raw, offset, row_bytes, bpp, previous, label)
+                          previous = row
+                          y = ystart + row_index * ystep
+                          for column in range(pass_width):
+                              x = xstart + column * xstep
+                              destination = (y * width + x) * channels
+                              if depth == 8:
+                                  base = column * channels
+                                  for channel in range(channels):
+                                      pixels[destination + channel] = row[base + channel]
+                                  if transparency is not None:
+                                      if color_type == 0:
+                                          if row[base] == transparent_gray:
+                                              transparency[y * width + x] = 0
+                                      elif (row[base], row[base + 1], row[base + 2]) == transparent_rgb:
+                                          transparency[y * width + x] = 0
+                              elif depth == 16:
+                                  base = column * channels * 2
+                                  if color_type == 0:
+                                      if transparency is not None and ((row[base] << 8) | row[base + 1]) == transparent_gray:
+                                          transparency[y * width + x] = 0
+                                      pixels[destination] = row[base]
+                                  elif color_type == 2:
+                                      if transparency is not None:
+                                          red = (row[base] << 8) | row[base + 1]
+                                          green = (row[base + 2] << 8) | row[base + 3]
+                                          blue = (row[base + 4] << 8) | row[base + 5]
+                                          if (red, green, blue) == transparent_rgb:
+                                              transparency[y * width + x] = 0
+                                      pixels[destination] = row[base]
+                                      pixels[destination + 1] = row[base + 2]
+                                      pixels[destination + 2] = row[base + 4]
+                                  elif color_type == 4:
+                                      pixels[destination] = row[base]
+                                      pixels[destination + 1] = row[base + 2]
+                                  else:
+                                      pixels[destination] = row[base]
+                                      pixels[destination + 1] = row[base + 2]
+                                      pixels[destination + 2] = row[base + 4]
+                                      pixels[destination + 3] = row[base + 6]
+                              else:
+                                  # Packed 1/2/4-bit sample, MSB-first within each byte.
+                                  bit = column * depth
+                                  value = (row[bit >> 3] >> (8 - depth - (bit & 7))) & max_value
+                                  if color_type == 0:
+                                      # Greyscale scales to the full 8-bit range (PNG 1.2 13.12).
+                                      pixels[destination] = value * (255 // max_value)
+                                      if transparency is not None and value == transparent_gray:
+                                          transparency[y * width + x] = 0
+                                  else:
+                                      # Indexed colour: the packed value is the palette index.
+                                      pixels[destination] = value
               # Indexed colour: every decoded pixel must address a real palette entry, and a
               # tRNS alpha table may not be longer than the palette it decorates. The raster
               # consumer (Png.bgra) already rejects an out-of-range index, but load() is what
@@ -598,7 +739,7 @@ jobs:
                   for index in pixels:
                       if index >= entries:
                           _fail(label + " contains a palette index that is out of range")
-              return Png(width, height, color_type, bytes(pixels), plte, trns)
+              return Png(width, height, color_type, bytes(pixels), plte, trns, transparency)
 
 
           def prepare(staging):

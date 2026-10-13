@@ -204,6 +204,141 @@ def make_png(
     return bytes(out)
 
 
+# Adam7 interlace passes as (xstart, ystart, xstep, ystep) (PNG 1.2 8.2).
+_ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+          (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def pass_extent(size, start, step):
+    """Number of pixels along one axis of an Adam7 pass; zero means no data."""
+    if size <= start:
+        return 0
+    return (size - start + step - 1) // step
+
+
+def pack_samples(samples, depth):
+    """Pack native sample values MSB-first into PNG row bytes (PNG 1.2 4.1.2)."""
+    if depth == 8:
+        return bytes(value & 0xFF for value in samples)
+    if depth == 16:
+        out = bytearray()
+        for value in samples:
+            out += struct.pack(">H", value & 0xFFFF)
+        return bytes(out)
+    mask = (1 << depth) - 1
+    out = bytearray()
+    accumulator = 0
+    bits = 0
+    for value in samples:
+        accumulator = (accumulator << depth) | (value & mask)
+        bits += depth
+        while bits >= 8:
+            bits -= 8
+            out.append((accumulator >> bits) & 0xFF)
+    if bits:
+        out.append((accumulator << (8 - bits)) & 0xFF)
+    return bytes(out)
+
+
+def encode_filter(raw_row, prev_row, bpp, filter_type):
+    """Apply one PNG scanline filter to ``raw_row`` with byte stride ``bpp``."""
+    encoded = bytearray(len(raw_row))
+    for i, value in enumerate(raw_row):
+        a = raw_row[i - bpp] if i >= bpp else 0
+        b = prev_row[i]
+        c = prev_row[i - bpp] if i >= bpp else 0
+        if filter_type == 1:
+            predictor = a
+        elif filter_type == 2:
+            predictor = b
+        elif filter_type == 3:
+            predictor = (a + b) // 2
+        elif filter_type == 4:
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            predictor = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+        else:
+            predictor = 0
+        encoded[i] = (value - predictor) & 0xFF
+    return bytes(encoded)
+
+
+def png_bytes(width, height, color_type, depth, pixel_fn, *, interlace=0, filter_type=0,
+              plte=None, trns=None):
+    """Build a real PNG from a per-pixel native-sample function at any legal depth/interlace."""
+    channels = _CHANNELS[color_type]
+    bpp = max(1, (channels * depth + 7) // 8)
+    passes = ((0, 0, 1, 1),) if interlace == 0 else _ADAM7
+    raw = bytearray()
+    for xstart, ystart, xstep, ystep in passes:
+        pass_width = pass_extent(width, xstart, xstep)
+        if pass_width == 0:
+            continue
+        pass_height = pass_extent(height, ystart, ystep)
+        row_bytes = (pass_width * channels * depth + 7) // 8
+        prev = bytearray(row_bytes)
+        for row_index in range(pass_height):
+            y = ystart + row_index * ystep
+            samples = []
+            for column in range(pass_width):
+                x = xstart + column * xstep
+                samples.extend(pixel_fn(x, y))
+            raw_row = pack_samples(samples, depth)
+            raw.append(filter_type)
+            raw.extend(encode_filter(raw_row, prev, bpp, filter_type))
+            prev = raw_row
+    return make_png(
+        width, height, color_type, depth=depth, interlace=interlace,
+        plte=plte, trns=trns, raw=bytes(raw),
+    )
+
+
+def native_bgra(width, height, color_type, depth, pixel_fn, *, plte=None, trns=None):
+    """Independent reference decode straight from the native sample domain."""
+    channels = _CHANNELS[color_type]
+    max_value = (1 << depth) - 1
+    transparent_gray = None
+    transparent_rgb = None
+    if trns is not None and color_type == 0:
+        (transparent_gray,) = struct.unpack(">H", trns)
+    elif trns is not None and color_type == 2:
+        transparent_rgb = struct.unpack(">HHH", trns)
+    screen = bytearray(width * height * 4)
+    for y in range(height):
+        for x in range(width):
+            native = pixel_fn(x, y)
+            destination = (y * width + x) * 4
+            if color_type == 0:
+                gray = native[0]
+                scaled = gray if depth == 8 else (gray >> 8 if depth == 16 else gray * (255 // max_value))
+                alpha = 0 if transparent_gray is not None and gray == transparent_gray else 255
+                screen[destination:destination + 4] = bytes([scaled, scaled, scaled, alpha])
+            elif color_type == 2:
+                red, green, blue = native
+                red8 = red if depth == 8 else red >> 8
+                green8 = green if depth == 8 else green >> 8
+                blue8 = blue if depth == 8 else blue >> 8
+                alpha = 0 if transparent_rgb is not None and (red, green, blue) == transparent_rgb else 255
+                screen[destination:destination + 4] = bytes([blue8, green8, red8, alpha])
+            elif color_type == 4:
+                gray, alpha = native
+                gray8 = gray if depth == 8 else gray >> 8
+                alpha8 = alpha if depth == 8 else alpha >> 8
+                screen[destination:destination + 4] = bytes([gray8, gray8, gray8, alpha8])
+            elif color_type == 6:
+                red, green, blue, alpha = native
+                if depth == 16:
+                    red, green, blue, alpha = red >> 8, green >> 8, blue >> 8, alpha >> 8
+                screen[destination:destination + 4] = bytes([blue, green, red, alpha])
+            else:
+                index = native[0]
+                alpha = trns[index] if trns is not None and index < len(trns) else 255
+                screen[destination:destination + 4] = bytes([
+                    plte[index * 3 + 2], plte[index * 3 + 1], plte[index * 3], alpha,
+                ])
+    return bytes(screen), width, height
+
+
 def zeros_stream(total, block_size=1 << 20):
     compressor = zlib.compressobj(9)
     parts = []
@@ -555,10 +690,29 @@ class ValidatorTests(unittest.TestCase):
         ihdr = struct.pack(">IIBBBBB", 8, 8, 8, 1, 0, 0, 0)
         self.assert_reject(make_png(8, 8, 6, ihdr_override=ihdr), "color type")
 
-    def test_rejects_interlace_and_bit_depth_and_methods(self):
-        self.assert_reject(make_png(interlace=1), "interlaced")
-        self.assert_reject(make_png(depth=16), "bit depth")
+    def test_rejects_unsupported_method_flags_and_interlace_method(self):
+        # compression and filter method flags are pinned to 0; the only interlace methods are
+        # 0 (none) and 1 (Adam7).
         self.assert_reject(make_png(compression=1), "compression/filter method")
+        self.assert_reject(make_png(filter_method=1), "compression/filter method")
+        self.assert_reject(make_png(interlace=2), "interlace method")
+
+    def test_rejects_bit_depth_illegal_for_color_type(self):
+        # Every legal depth is accepted, but a depth the spec forbids for the colour type
+        # stays rejected: 1/2/4-bit truecolour and alpha types, 16-bit indexed colour, and
+        # 3/5-bit greyscale are all outside the PNG spec.
+        for color_type, depth in (
+            (2, 1), (2, 4), (6, 4), (4, 4), (3, 16), (0, 3), (0, 5),
+        ):
+            with self.subTest(color_type=color_type, depth=depth):
+                self.assert_reject(make_png(4, 4, color_type, depth=depth), "bit depth")
+
+    def test_rejects_payload_after_the_zlib_end_marker(self):
+        # The decompressed scanline count can be exactly right while the compressed stream
+        # carries bytes after the zlib end marker; those must be rejected, not ignored.
+        raw = filtered_rows(4, 4, 4, 0)
+        trailing = make_png(4, 4, 6, 0, idat_zlib=zlib.compress(raw) + b"TRAILING")
+        self.assert_reject(trailing, "trailing data")
 
     def test_rejects_trailing_decompressed_payload(self):
         raw = filtered_rows(8, 8, 4, 0) + b"\xAA" * (256 * 1024)
@@ -603,6 +757,216 @@ class ValidatorTests(unittest.TestCase):
         got = self.module.load(big, "x.png").bgra()
         self.assertEqual(got[1:], (256, 256))
         self.assertEqual(len(got[0]), 256 * 256 * 4)
+
+    def test_accepts_every_legal_bit_depth_and_matches_native_reference(self):
+        # Every bit depth the PNG spec permits for a colour type must decode, and the
+        # canonical 8-bit BGRA must equal an independent native-domain decode.
+        cases = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+
+        def make_fn(color_type, depth):
+            max_value = (1 << depth) - 1
+            if color_type == 0:
+                return lambda x, y: ((x * 7 + y * 5) % (max_value + 1),)
+            if color_type == 3:
+                return lambda x, y: ((x * 3 + y * 5) % (1 << depth),)
+            if color_type == 2:
+                return lambda x, y: (
+                    (x * 13 + 1) % (max_value + 1),
+                    (x * 7 + y * 3) % (max_value + 1),
+                    (x * 5 + y * 11) % (max_value + 1),
+                )
+            if color_type == 4:
+                return lambda x, y: (
+                    (x * 7 + y * 5) % (max_value + 1),
+                    (x * 3 + y * 2) % (max_value + 1),
+                )
+            return lambda x, y: (
+                (x * 13 + 1) % (max_value + 1),
+                (x * 7 + y * 3) % (max_value + 1),
+                (x * 5 + y * 11) % (max_value + 1),
+                (x * 3 + y * 2) % (max_value + 1),
+            )
+
+        for color_type, depths in cases.items():
+            for depth in depths:
+                with self.subTest(color_type=color_type, depth=depth):
+                    pixel_fn = make_fn(color_type, depth)
+                    plte = None
+                    if color_type == 3:
+                        plte = bytes((i * 9 + 3) % 256 for i in range((1 << depth) * 3))
+                    data = png_bytes(7, 5, color_type, depth, pixel_fn, plte=plte)
+                    image = self.assert_ok(data)
+                    self.assertEqual(
+                        image.bgra(),
+                        native_bgra(7, 5, color_type, depth, pixel_fn, plte=plte),
+                    )
+
+    def test_16bit_samples_keep_their_most_significant_byte(self):
+        # 16-bit samples decode to the 8-bit output by their most significant byte, the rule
+        # libpng's strip_16 uses for the ICO raster (not a full-range rescale).
+        def rgb_fn(x, y):
+            return [(0x1234, 0x5678, 0x9ABC), (0xFF00, 0x00FF, 0x8000)][x]
+
+        bgra, width, height = self.assert_ok(png_bytes(2, 1, 2, 16, rgb_fn)).bgra()
+        self.assertEqual((width, height), (2, 1))
+        self.assertEqual(bgra, bytes([0x9A, 0x56, 0x12, 0xFF, 0x80, 0x00, 0xFF, 0xFF]))
+        self.assertEqual((bgra, width, height), native_bgra(2, 1, 2, 16, rgb_fn))
+
+        def rgba_fn(x, y):
+            return [(0x0102, 0x0304, 0x0506, 0x0708), (0xFFFE, 0xFDEC, 0xFBD8, 0xFA00)][x]
+
+        bgra, width, height = self.assert_ok(png_bytes(2, 1, 6, 16, rgba_fn)).bgra()
+        self.assertEqual(bgra, bytes([0x05, 0x03, 0x01, 0x07, 0xFB, 0xFD, 0xFF, 0xFA]))
+        self.assertEqual((bgra, width, height), native_bgra(2, 1, 6, 16, rgba_fn))
+
+    def test_sub_byte_grayscale_scales_to_the_full_8bit_range(self):
+        cases = {
+            1: ([0, 1], [0, 255]),
+            2: ([0, 1, 2, 3], [0, 85, 170, 255]),
+            4: ([0, 1, 5, 15], [0, 17, 85, 255]),
+            16: ([0x0000, 0x1234, 0xFFFF], [0x00, 0x12, 0xFF]),
+        }
+        for depth, (samples, expected) in cases.items():
+            with self.subTest(depth=depth):
+                def pixel_fn(x, y, samples=samples):
+                    return (samples[x],)
+                bgra, width, height = self.assert_ok(
+                    png_bytes(len(samples), 1, 0, depth, pixel_fn)
+                ).bgra()
+                self.assertEqual([bgra[i * 4] for i in range(len(samples))], expected, depth)
+                self.assertEqual([bgra[i * 4 + 3] for i in range(len(samples))], [255] * len(samples))
+                self.assertEqual(
+                    (bgra, width, height), native_bgra(len(samples), 1, 0, depth, pixel_fn)
+                )
+
+    def test_sub_byte_indexed_uses_unscaled_palette_indices(self):
+        # Indexed samples are palette indices, not intensities: 1/2/4-bit values must NOT be
+        # scaled by 255/(2^depth-1) before the palette lookup.
+        for depth in (1, 2, 4):
+            with self.subTest(depth=depth):
+                entries = 1 << depth
+                plte = bytes((i * 11 + 1) % 256 for i in range(entries * 3))
+
+                def pixel_fn(x, y, entries=entries):
+                    return ((x + y) % entries,)
+
+                bgra, width, height = self.assert_ok(
+                    png_bytes(entries, 1, 3, depth, pixel_fn, plte=plte)
+                ).bgra()
+                self.assertEqual(
+                    (bgra, width, height),
+                    native_bgra(entries, 1, 3, depth, pixel_fn, plte=plte),
+                )
+                # Pixel (1, 0) is palette index 1; its BGR bytes come straight from the palette.
+                self.assertEqual(bgra[4:7], bytes([plte[5], plte[4], plte[3]]))
+
+    def test_adam7_interlaced_decodes_identically_to_noninterlaced(self):
+        # The same logical image encoded interlaced and non-interlaced must decode to the same
+        # BGRA, for a non-indexed (incl. 16-bit) and an indexed image, across sizes that
+        # exercise empty and partial Adam7 passes.
+        def rgba_fn(x, y):
+            return (
+                (x * 13 + y * 7 + 1) % 256,
+                (x * 3 + y * 11 + 2) % 256,
+                (x * 5 + y * 2 + 3) % 256,
+                (x * 9 + y * 4 + 5) % 256,
+            )
+
+        def rgba16_fn(x, y):
+            return tuple(value * 257 % 65536 for value in rgba_fn(x, y))
+
+        for color_type, depth, pixel_fn in (
+            (6, 8, rgba_fn),
+            (6, 16, rgba16_fn),
+        ):
+            for width, height in ((1, 7), (5, 1), (13, 9), (8, 8)):
+                with self.subTest(color_type=color_type, size=(width, height)):
+                    plain = png_bytes(width, height, color_type, depth, pixel_fn, interlace=0)
+                    interlaced = png_bytes(width, height, color_type, depth, pixel_fn, interlace=1)
+                    self.assertEqual(
+                        self.assert_ok(interlaced).bgra(),
+                        self.assert_ok(plain).bgra(),
+                        (width, height),
+                    )
+                    self.assertEqual(
+                        self.assert_ok(interlaced).bgra(),
+                        native_bgra(width, height, color_type, depth, pixel_fn),
+                    )
+
+        entries = 16
+        plte = bytes((i * 7 + 2) % 256 for i in range(entries * 3))
+
+        def index_fn(x, y):
+            return ((x * 3 + y) % entries,)
+
+        for width, height in ((1, 9), (6, 5), (11, 4)):
+            with self.subTest(color_type=3, size=(width, height)):
+                plain = png_bytes(width, height, 3, 4, index_fn, interlace=0, plte=plte)
+                interlaced = png_bytes(width, height, 3, 4, index_fn, interlace=1, plte=plte)
+                self.assertEqual(
+                    self.assert_ok(interlaced).bgra(),
+                    self.assert_ok(plain).bgra(),
+                    (width, height),
+                )
+
+    def test_16bit_trns_is_compared_at_full_sample_width(self):
+        # A 16-bit tRNS sample is compared against the full 16-bit pixel value, not its most
+        # significant byte: two pixels sharing every high byte but differing in the low bytes
+        # are not both transparent.
+        trns = struct.pack(">HHH", 0x1234, 0x5678, 0x9ABC)
+
+        def truecolor_fn(x, y):
+            return [(0x1234, 0x5678, 0x9ABC), (0x12FF, 0x5678, 0x9ABC)][x]
+
+        bgra, width, height = self.assert_ok(
+            png_bytes(2, 1, 2, 16, truecolor_fn, trns=trns)
+        ).bgra()
+        self.assertEqual(bgra[3], 0)        # exact 16-bit match -> transparent
+        self.assertEqual(bgra[4 + 3], 255)  # low-byte difference -> opaque
+        self.assertEqual((bgra, width, height), native_bgra(2, 1, 2, 16, truecolor_fn, trns=trns))
+
+        gray_trns = struct.pack(">H", 0xABCD)
+
+        def gray_fn(x, y):
+            return ([0xABCD, 0xAB00][x],)
+
+        bgra, width, height = self.assert_ok(
+            png_bytes(2, 1, 0, 16, gray_fn, trns=gray_trns)
+        ).bgra()
+        self.assertEqual(bgra[3], 0)
+        self.assertEqual(bgra[4 + 3], 255)
+        self.assertEqual((bgra, width, height), native_bgra(2, 1, 0, 16, gray_fn, trns=gray_trns))
+
+    def test_legacy_8bit_noninterlaced_output_is_byte_identical(self):
+        # BGRA digests captured from the pre-change decoder. Widening the accepted input
+        # domain must not alter a single output byte for an input the old validator accepted.
+        plte = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
+        fixtures = {
+            "rgba-f0": make_png(12, 7, 6, 0),
+            "rgba-f4": make_png(12, 7, 6, 4),
+            "grayscale-f2": make_png(9, 5, 0, 2),
+            "grayalpha-f3": make_png(9, 5, 4, 3),
+            "truecolor-trns": make_png(4, 4, 2, 0, trns=struct.pack(">HHH", 5, 18, 31)),
+            "grayscale-trns": make_png(4, 4, 0, 0, trns=struct.pack(">H", 5)),
+            "indexed8": make_png(4, 4, 3, 0, raw=filtered_rows(4, 4, 1, 0, modulo=3), plte=plte),
+            "indexed8-trns": make_png(4, 4, 3, 0, raw=filtered_rows(4, 4, 1, 0, modulo=3), plte=plte, trns=b"\x80\x40\x20"),
+            "suggested-plte": make_png(6, 5, 2, 0, plte=bytes([10, 20, 30, 40, 50, 60, 70, 80, 90])),
+        }
+        expected = {
+            "rgba-f0": "0ae98ea9beb39d98681d3c389eb5c2dca414bd63af1ce1017d6e0d9c1d71b316",
+            "rgba-f4": "0ae98ea9beb39d98681d3c389eb5c2dca414bd63af1ce1017d6e0d9c1d71b316",
+            "grayscale-f2": "90bfe10eefdcbd8f0311dd8009eda1fec98e97ea7faf9115eb2b7cdadbdfac33",
+            "grayalpha-f3": "b24673a2677288167caedf0e4618a28453d5d791c2241b3a0209bc61bfdaab6a",
+            "truecolor-trns": "64b47ace73fc2c889dd92b554f0d0e5375e80b7d226f53d376b2c92ff05dd12c",
+            "grayscale-trns": "93dd0609b1cfbc5ba59418ee706d2b5a1b6ef7a896cf2bde40ff7ffa93dea5c7",
+            "indexed8": "68b76511025879c85afadac4d1914bcac0c5b71c8ba2083a192ed0e3cb384d6a",
+            "indexed8-trns": "90a5e0558fd3d318d80b10006539230f4e70661b6277c126425f7eb60f886f3f",
+            "suggested-plte": "fa25bbcc684534a2e7f92bd3d70c4de444997ea444c55a7c8ace7d190430e2b8",
+        }
+        for name, data in fixtures.items():
+            with self.subTest(name=name):
+                bgra, _, _ = self.assert_ok(data).bgra()
+                self.assertEqual(hashlib.sha256(bgra).hexdigest(), expected[name], name)
 
     def test_cli_verify_and_prepare_modes(self):
         valid = make_png(16, 16, 6, 0)
@@ -1181,6 +1545,21 @@ class BuildConsumerTests(unittest.TestCase):
         branded = (repo / "res/icon.ico").read_bytes()
         self.assertNotEqual(branded, PLACEHOLDER_ICO)
         self.assertEqual(branded[:4], b"\x00\x00\x01\x00")
+
+    def test_generated_ico_is_byte_identical_to_the_pre_change_baseline(self):
+        # A digest of the ICO the unchanged build consumer generates from a fixed 32x32
+        # 8-bit non-interlaced icon, captured before the decoder was widened. The generated
+        # ICO is a deterministic function of the decoded BGRA, so this pins the whole
+        # validator->ICO path to byte-identical output for an already-accepted input.
+        artifact = make_branding_artifact(icon=make_png(32, 32, 6, 0))
+        repo = make_icon_repo()
+        result = self._run(artifact, repo)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        ico = (repo / "res/icon.ico").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(ico).hexdigest(),
+            "179486104c98c321d91cc7dd807e514531a3d0c3c2756f92e1fe7c1dc8cacb01",
+        )
 
     def test_digest_mismatch_fails_closed(self):
         icon = make_png(32, 32, 6, 0)
