@@ -169,6 +169,7 @@ def make_png(
     compression=0,
     filter_method=0,
     plte=None,
+    trns=None,
     raw=None,
     idat_zlib=None,
     corrupt_idat_crc=False,
@@ -189,6 +190,8 @@ def make_png(
     out += _chunk(b"IHDR", ihdr)
     if plte is not None:
         out += _chunk(b"PLTE", plte)
+    if trns is not None:
+        out += _chunk(b"tRNS", trns)
     idat = _chunk(b"IDAT", idat_zlib)
     if corrupt_idat_crc:
         idat = idat[:-1] + bytes([idat[-1] ^ 0xFF])
@@ -314,8 +317,29 @@ class ValidatorTests(unittest.TestCase):
     def test_accepts_valid_indexed_with_plte(self):
         plte = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255])
         raw = filtered_rows(4, 4, 1, 0, modulo=3)
-        image = self.assert_ok(make_png(4, 4, 3, raw=raw, plte=plte))
+        data = make_png(4, 4, 3, raw=raw, plte=plte)
+        image = self.assert_ok(data)
         self.assertEqual(image.color_type, 3)
+        # A valid indexed PNG must still rasterize to the reviewed BGRA contract.
+        self.assertEqual(image.bgra(), reference_bgra(self.module, data))
+
+    def test_rejects_indexed_palette_index_out_of_range(self):
+        # A colour-type-3 PNG whose pixel index exceeds its palette is not decodable.
+        # load() must reject it exactly like the raster consumer already does, because
+        # the logo and privacy consumers trust load()/the CLI only and would otherwise
+        # declare an undecodable PNG acceptable and copy it downstream.
+        plte = bytes([255, 0, 0])  # one entry -> only palette index 0 is valid
+        raw = filtered_rows(2, 2, 1, 0)  # first unfiltered sample is index 5
+        self.assert_reject(make_png(2, 2, 3, raw=raw, plte=plte), "palette index")
+
+    def test_rejects_trns_longer_than_palette(self):
+        plte = bytes([255, 0, 0])  # one entry
+        raw = filtered_rows(2, 2, 1, 0, modulo=1)  # all indices 0 (in range)
+        self.assert_reject(
+            make_png(2, 2, 3, raw=raw, plte=plte, trns=b"\x00\x00"), "tRNS"
+        )
+        # A tRNS of exactly the palette length is valid and must stay accepted.
+        self.assert_ok(make_png(2, 2, 3, raw=raw, plte=plte, trns=b"\x80"))
 
     def test_rejects_header_only(self):
         ihdr = struct.pack(">IIBBBBB", 16, 16, 8, 6, 0, 0, 0)
@@ -729,6 +753,41 @@ class BrandingEscapeTests(unittest.TestCase):
 
     def test_anchor_mismatch_fails_closed(self):
         result, _ = self._run(company="X", mutate={"Cargo.toml": "LegalCopyright = \"changed\"\n"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("anchor mismatch", result.stdout)
+
+    def test_replacement_containing_default_literal_applies(self):
+        # DeskForge accepts any company name within a length/control-character bound, so a
+        # value may legitimately extend the 1.4.9 default literal. The escaped replacement
+        # then still contains the anchor bytes as a substring; the old post-apply rule
+        # (`anchor in data`) aborted such an accepted value. The corrected rule compares
+        # the on-disk bytes to the exact expected post-replacement content instead.
+        value = "Purslane Tech Pte. Ltd. (Singapore)"
+        result, out = self._run(company=value)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("post-apply verification failed", result.stdout)
+        self.assertIn("applied to", result.stdout)
+        for rel in (
+            "flutter/windows/runner/Runner.rc",
+            "Cargo.toml",
+            "libs/portable/Cargo.toml",
+            "flutter/lib/desktop/pages/desktop_setting_page.dart",
+        ):
+            self.assertIn(value, out[rel], rel)
+        # The bare 1.4.9 copyright literal is replaced, not merely embedded.
+        self.assertNotIn(
+            'LegalCopyright = "Copyright \u00a9 2026 Purslane Tech Pte. Ltd. All rights reserved."',
+            out["Cargo.toml"],
+        )
+
+    def test_genuine_anchor_mismatch_still_fails_closed(self):
+        # Guard the drift direction of the post-apply change: a source file that no longer
+        # carries the anchored literal must still abort, so the corrected verification did
+        # not weaken fail-closed behavior for a substring-containing branding value.
+        result, _ = self._run(
+            company="Purslane Tech Pte. Ltd. (Singapore)",
+            mutate={"Cargo.toml": "LegalCopyright = \"changed\"\n"},
+        )
         self.assertEqual(result.returncode, 1)
         self.assertIn("anchor mismatch", result.stdout)
 

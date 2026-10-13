@@ -507,6 +507,19 @@ jobs:
                   pixels[poff:poff + stride] = row
                   poff += stride
                   prev = row
+              # Indexed colour: every decoded pixel must address a real palette entry, and a
+              # tRNS alpha table may not be longer than the palette it decorates. The raster
+              # consumer (Png.bgra) already rejects an out-of-range index, but load() is what
+              # every declared-acceptable check (logo and privacy consumers use load()/the CLI
+              # only) trusts, so the same range rule must hold here: a PNG the validator
+              # accepts must actually be decodable by every consumer.
+              if color_type == 3:
+                  entries = len(plte) // 3
+                  if len(trns) > entries:
+                      _fail(label + " tRNS chunk is longer than the palette")
+                  for index in pixels:
+                      if index >= entries:
+                          _fail(label + " contains a palette index that is out of range")
               return Png(width, height, color_type, bytes(pixels), plte, trns)
 
 
@@ -1359,32 +1372,31 @@ jobs:
                       + " the client source changed since the anchored branding table was written; build aborted"
                   )
               data_by_path[path] = data
-          # Phase 2: apply all verified replacements sequentially per file.
+          # Phase 2: apply all verified replacements sequentially per file, building the
+          # exact expected post-apply content for each file from the Phase 1 snapshot.
+          expected_by_path = dict(data_by_path)
           for key, (path, anchor, replacement) in sorted(pending.items()):
-              data = data_by_path[path]
+              data = expected_by_path[path]
               if data.count(anchor) != EXPECTED_COUNTS[key]:
                   fail(key + ": anchor count changed while applying " + path)
-              data_by_path[path] = data.replace(anchor, replacement)
-          # Phase 3: post-verify per file (no anchor survives, replacement landed),
-          # then write once per file.
-          for path in sorted(data_by_path):
+              expected_by_path[path] = data.replace(anchor, replacement)
+          # Phase 3: write each file once, then verify its on-disk bytes equal the exact
+          # expected post-replacement content. This replaces the earlier
+          # `anchor in data or replacement not in data` rule, which was not a sound
+          # post-apply check: a legitimate replacement may itself contain the anchor
+          # bytes (for example a company name that extends the 1.4.9 default literal), so
+          # a correct apply still left the anchor present and aborted the build. Byte
+          # equality accepts every legitimate replacement, including the anchor==
+          # replacement no-op (whose expected content equals its source), while still
+          # failing closed when a replacement did not land or post-apply drift changed
+          # the file. Source drift is still caught by the Phase 1 anchor-count check.
+          for path in sorted(expected_by_path):
               with open(path, "wb") as handle:
-                  handle.write(data_by_path[path])
-          for key, (path, anchor, replacement) in sorted(pending.items()):
+                  handle.write(expected_by_path[path])
+          for key, (path, _anchor, _replacement) in sorted(pending.items()):
               with open(path, "rb") as handle:
                   data = handle.read()
-              if anchor == replacement:
-                  # The branding value equals the current 1.4.9 default, so the
-                  # escaped replacement is byte-identical to the anchor and the
-                  # apply is a legitimate no-op: `anchor` cannot leave the file and
-                  # `replacement` cannot be observed as a distinct token. Verify
-                  # the expected occurrence count of the bytes survives instead of
-                  # reporting the no-op as a failed replacement.
-                  if data.count(anchor) != EXPECTED_COUNTS[key]:
-                      fail(key + ": post-apply verification failed for " + path)
-              elif anchor in data or replacement not in data:
-                  # Real post-apply drift (the anchor survived) or a replacement
-                  # that failed to land still aborts.
+              if data != expected_by_path[path]:
                   fail(key + ": post-apply verification failed for " + path)
               print("L3 brand: " + key + " applied to " + path)
           PY
