@@ -1405,6 +1405,8 @@ class _FetchServer(socketserver.ThreadingTCPServer):
         self.redirect_forbidden = ""
         self.redirect_ftp = ""
         self.redirect_loop = ""
+        self.redirect_port = ""
+        self.host_headers = []
         self.stream_done = threading.Event()
         self.stream_completed = False
         self.stream_bytes = 0
@@ -1420,6 +1422,10 @@ class _FetchServer(socketserver.ThreadingTCPServer):
     def note_request(self):
         with self.lock:
             self.requests += 1
+
+    def note_host_header(self, value):
+        with self.lock:
+            self.host_headers.append(value)
 
     def snapshot(self):
         with self.lock:
@@ -1523,6 +1529,7 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.note_request()
+        self.server.note_host_header(self.headers.get("Host") or "")
         path = self.path.split("?", 1)[0]
         if path == "/image.png":
             self._respond(REFERENCE_PNG)
@@ -1547,6 +1554,8 @@ class _BrandingFetchHandler(BaseHTTPRequestHandler):
             self._redirect(self.server.redirect_forbidden)
         elif path == "/redirect-ftp":
             self._redirect(self.server.redirect_ftp)
+        elif path == "/redirect-port":
+            self._redirect(self.server.redirect_port)
         elif path == "/loop":
             self._redirect(self.server.redirect_loop)
         elif path == "/trickle-status":
@@ -2478,6 +2487,288 @@ class DestinationPinnedFetchTests(unittest.TestCase):
             str(error), self.module._failure_message("app_logo_url", 1024 * 1024)
         )
         self._assert_no_output(out)
+
+    # 13. a present port is the port actually fetched: the consumer mirrors the
+    #     producer's 1..65535 rule instead of substituting the scheme default.
+
+    PORT_SPELLINGS = ("0", "00000", "65536", "99999", "065536")
+
+    def test_present_port_outside_1_65535_is_refused_in_the_initial_url(self):
+        # A present port of 0 used to fall back to the scheme default: the URL still
+        # said ":0" and the Host header still carried ":0", but the resolver was given
+        # port 80.  The producer refuses a port outside 1..65535, so every spelling of
+        # such a port -- including the leading-zero forms, however they parse -- must be
+        # unusable here too, refused with the same deterministic per-field message a
+        # malformed port gets, and before anything is fetched.
+        expected = self.module._refused_message(
+            "app_logo_url", "provider URL is not a usable absolute http(s) URL"
+        )
+        before = self.main.snapshot()
+        for spelling in self.PORT_SPELLINGS:
+            with self.subTest(port=spelling):
+                out, error = self._run(
+                    "http://127.0.0.1:%s/image.png" % spelling, policy=self.policy
+                )
+                self.assertIsNotNone(error, "the port %s URL was accepted" % spelling)
+                self.assertEqual(
+                    str(error),
+                    expected,
+                    "the port %s URL was not refused by the helper's own port rule"
+                    % spelling,
+                )
+                self._assert_no_output(out)
+        self.assertEqual(
+            self.main.snapshot(), before, "a refused port URL was connected to"
+        )
+
+    def test_present_port_outside_1_65535_in_a_redirect_is_refused(self):
+        # The same rule on a provider-controlled redirect Location.  The resolver is
+        # recorded, so the refused redirect hop provably never reaches resolution: the
+        # initial hop is the only lookup of the whole fetch.
+        expected = self.module._refused_message(
+            "app_logo_url", "provider URL is not a usable absolute http(s) URL"
+        )
+        calls = []
+        real_getaddrinfo = self.module.socket.getaddrinfo
+
+        def recording_getaddrinfo(host, port, **kwargs):
+            calls.append((host, port))
+            return real_getaddrinfo(host, port, **kwargs)
+
+        self.module.socket.getaddrinfo = recording_getaddrinfo
+        try:
+            for spelling in self.PORT_SPELLINGS:
+                with self.subTest(port=spelling):
+                    calls.clear()
+                    self.main.redirect_port = (
+                        "http://127.0.0.1:%s/image.png" % spelling
+                    )
+                    out, error = self._run(
+                        self.main_url + "/redirect-port", policy=self.policy
+                    )
+                    self.assertIsNotNone(
+                        error, "the redirect port %s URL was accepted" % spelling
+                    )
+                    self.assertEqual(
+                        str(error),
+                        expected,
+                        "the redirect port %s URL was not refused by the helper's own "
+                        "port rule" % spelling,
+                    )
+                    self.assertEqual(
+                        calls,
+                        [("127.0.0.1", self.main.server_address[1])],
+                        "the refused redirect hop was resolved",
+                    )
+                    self._assert_no_output(out)
+        finally:
+            self.main.redirect_port = ""
+            self.module.socket.getaddrinfo = real_getaddrinfo
+
+    def test_present_ports_inside_1_65535_fetch_that_port_with_a_matching_host_header(self):
+        # Port 1 and port 65535 stay usable, and the fetched port is exactly the port
+        # the URL names: the resolver is given it, the connection is built for it and
+        # the request's Host header carries it.  What this proves: _parse_hop keeps both
+        # ports, the resolution and the connection use the URL's port, and the Host
+        # header matches it.  What it does not prove: that a real TCP connect to the
+        # privileged port 1 succeeds -- binding it needs privileges this suite does not
+        # have -- so the seam redirects only the TCP destination to the fixture while
+        # the port under test stays in the URL and in the Host header.
+        for port in (1, 65535):
+            with self.subTest(port=port):
+                recorded = []
+                real_connect = self.module._connect_pinned
+
+                def connect_to_fixture(addresses, watchdog, port=port):
+                    recorded.append(addresses)
+                    return real_connect(
+                        [(socket.AF_INET, (FIXTURE_ADDRESS, self.main.server_address[1]))],
+                        watchdog,
+                    )
+
+                self.module._connect_pinned = connect_to_fixture
+                try:
+                    self.main.host_headers[:] = []
+                    out, error = self._run(
+                        "http://127.0.0.1:%d/image.png" % port, policy=self.policy
+                    )
+                finally:
+                    self.module._connect_pinned = real_connect
+                self.assertIsNone(error, "the port %d URL was refused" % port)
+                self.assertEqual(out.read_bytes(), REFERENCE_PNG)
+                self.assertEqual(
+                    recorded,
+                    [[(socket.AF_INET, (FIXTURE_ADDRESS, port))]],
+                    "the fetch did not resolve/connect to the port the URL names",
+                )
+                self.assertEqual(
+                    self.main.host_headers,
+                    ["127.0.0.1:%d" % port],
+                    "the Host header does not match the fetched port",
+                )
+
+    def test_absent_port_uses_the_scheme_default(self):
+        # No port in the URL means no port in the Host header while the connection is
+        # built for the scheme default.  The https half of the same rule is covered by
+        # the TLS test below.
+        recorded = []
+        real_connect = self.module._connect_pinned
+
+        def connect_to_fixture(addresses, watchdog):
+            recorded.append(addresses)
+            return real_connect(
+                [(socket.AF_INET, (FIXTURE_ADDRESS, self.main.server_address[1]))],
+                watchdog,
+            )
+
+        self.module._connect_pinned = connect_to_fixture
+        try:
+            self.main.host_headers[:] = []
+            out, error = self._run("http://127.0.0.1/image.png", policy=self.policy)
+        finally:
+            self.module._connect_pinned = real_connect
+        self.assertIsNone(error)
+        self.assertEqual(out.read_bytes(), REFERENCE_PNG)
+        self.assertEqual(
+            recorded,
+            [[(socket.AF_INET, (FIXTURE_ADDRESS, 80))]],
+            "an absent port did not use the http scheme default",
+        )
+        self.assertEqual(self.main.host_headers, ["127.0.0.1"])
+
+    @unittest.skipUnless(HAS_OPENSSL, "openssl CLI required to mint the TLS fixture certificate")
+    def test_absent_port_uses_the_443_default_over_tls(self):
+        # The other half of the scheme default: an https URL without a port is fetched
+        # on 443.  The seam redirects only the TCP destination to the TLS fixture, so
+        # the 443 in the URL and in the Host header is what is asserted.
+        cert, key = tls_fixture_certificate("127.0.0.1")
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(str(cert), str(key))
+        server = _TlsFetchServer(("127.0.0.1", 0), server_context)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        recorded = []
+        real_connect = self.module._connect_pinned
+        real_create = self.module.ssl.create_default_context
+
+        def connect_to_fixture(addresses, watchdog):
+            recorded.append(addresses)
+            return real_connect(
+                [(socket.AF_INET, (FIXTURE_ADDRESS, server.server_address[1]))], watchdog
+            )
+
+        self.module._connect_pinned = connect_to_fixture
+        # Only the trust anchor is injected: check_hostname and certificate
+        # verification stay on, against the URL hostname (server_hostname).
+        self.module.ssl.create_default_context = (
+            lambda *args, **kwargs: real_create(cafile=str(cert))
+        )
+        try:
+            server.host_headers[:] = []
+            out, error = self._run("https://127.0.0.1/image.png", policy=self.policy)
+        finally:
+            self.module._connect_pinned = real_connect
+            self.module.ssl.create_default_context = real_create
+            server.shutdown()
+            server.server_close()
+        self.assertIsNone(error)
+        self.assertEqual(out.read_bytes(), REFERENCE_PNG)
+        self.assertEqual(
+            recorded,
+            [[(socket.AF_INET, (FIXTURE_ADDRESS, 443))]],
+            "an absent https port did not use the 443 scheme default",
+        )
+        self.assertEqual(server.host_headers, ["127.0.0.1"])
+
+    # 14. the per-attempt wall-clock bound covers the resolution phase
+
+    def test_blocked_resolver_is_bounded_by_the_current_attempt_budget(self):
+        # socket.getaddrinfo cannot be interrupted in-process, so the helper runs the
+        # lookup on a daemon thread and waits only for the attempt's *current* remaining
+        # budget, failing the hop as the same retryable timeout a stalled socket gets.
+        # The pre-fix helper calls the resolver inline, so this case cannot be run
+        # in-process: a lookup that blocks below Python keeps the whole process alive
+        # and the failure is a hang, not an error.  The child therefore runs the shipped
+        # helper copy through its own main() (a driver imports the copy and replaces
+        # socket.getaddrinfo with a call that waits on an event that is never set) under
+        # a 30 s outer deadline, with the attempt bound shortened to 1 s; the retry
+        # constants stay as shipped (2 retries), so the failure must be classified as the
+        # existing transient timeout and the lookup must be attempted exactly 3 times;
+        # the child reports its lookup count on stderr for the test to assert.
+        # What it proves: a resolver that never returns makes an attempt end within the
+        # budget and the shipped helper exits after its bounded attempts with exactly the
+        # deterministic per-field timeout message and no output file.  What it does not
+        # prove: that the abandoned resolver thread itself stops -- it cannot be killed
+        # and lives until the process exits (bounded by the unchanged retry count), which
+        # is why the shell wrapper keeps its process-level timeout as the outermost
+        # backstop.
+        directory = Path(tempfile.mkdtemp(prefix="branding-fetch-dns-"))
+        helper = directory / "fetch_branding_image.py"
+        source = fetcher_source()
+        helper.write_text(
+            source.replace("FETCH_MAX_TIME = 120.0", "FETCH_MAX_TIME = 1.0").replace(
+                "FETCH_RETRY_DELAY = 2.0", "FETCH_RETRY_DELAY = 0.0"
+            ),
+            encoding="utf-8",
+        )
+        driver = directory / "blocked_resolver_driver.py"
+        driver.write_text(
+            "import importlib.util\n"
+            "import sys\n"
+            "import threading\n"
+            "spec = importlib.util.spec_from_file_location('branding_fetch', sys.argv[1])\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "blocked = threading.Event()\n"
+            "lookups = []\n"
+            "def hanging_getaddrinfo(*args, **kwargs):\n"
+            "    lookups.append(1)\n"
+            "    blocked.wait()\n"
+            "module.socket.getaddrinfo = hanging_getaddrinfo\n"
+            "code = module.main([\n"
+            "    'app_logo_url',\n"
+            "    'http://blocked.example/icon.png',\n"
+            "    sys.argv[2],\n"
+            "    str(1024 * 1024),\n"
+            "])\n"
+            "print('resolver_lookups=%d' % len(lookups), file=sys.stderr)\n"
+            "sys.exit(code)\n",
+            encoding="utf-8",
+        )
+        out = directory / "image.png"
+        start = time.monotonic()
+        try:
+            result = subprocess.run(
+                [sys.executable, str(driver), str(helper), str(out)],
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "a blocked resolver kept the helper alive past the attempt budget "
+                "(the pre-fix behaviour is a hang, not an error)"
+            )
+        elapsed = time.monotonic() - start
+        expected = self.module._failure_message("app_logo_url", 1024 * 1024)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.count("::error::"), 1, result.stdout)
+        self.assertEqual(result.stdout.strip(), "::error::" + expected)
+        self.assertNotIn("blocked.example", result.stdout)
+        self.assertNotIn("http://", result.stdout)
+        self.assertEqual(
+            result.stderr.strip(),
+            "resolver_lookups=3",
+            "the blocked resolver was not retried as the existing transient timeout: the "
+            "shipped retry count must stay at 3 bounded attempts",
+        )
+        self.assertLess(
+            elapsed,
+            10.0,
+            "the blocked resolver extended the fetch past its bounded attempts "
+            "(%.1f s elapsed for 3 x 1 s attempts)" % elapsed,
+        )
+        self.assertFalse(out.exists(), "a blocked resolver left an output file")
+        self.assertFalse(Path(str(out) + ".part").exists())
 
 
 # --------------------------------------------------------------------------- #

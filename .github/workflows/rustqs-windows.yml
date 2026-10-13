@@ -1060,26 +1060,30 @@ jobs:
               failures curl retries as transient (a timeout, or an HTTP 408/429/500/
               502/503/504 response);
             * ``--max-time 120``: each attempt is bounded by a wall-clock deadline that
-              covers its connection, its TLS handshake and every redirect hop of that
-              attempt.  The deadline is re-checked between operations, the socket timeout
-              is re-armed from the remaining budget immediately before the handshake, and
-              a watchdog shuts down the attempt's live socket when the deadline expires,
-              so a peer that delivers a byte inside every read timeout -- during the
-              status line, the headers, an interim 1xx response, the handshake or the
-              body -- cannot extend the attempt past the bound;
+              covers its resolution, its connection, its TLS handshake and every redirect
+              hop of that attempt.  The deadline is re-checked between operations, the
+              socket timeout is re-armed from the remaining budget immediately before the
+              handshake, and a watchdog shuts down the attempt's live socket when the
+              deadline expires, so a peer that delivers a byte inside every read timeout --
+              during the status line, the headers, an interim 1xx response, the handshake or
+              the body -- cannot extend the attempt past the bound;
             * the download is written to ``<out>.part`` and renamed to ``<out>`` only
               after it was received completely within the cap, so any failure leaves no
               output file behind, and the framing is verified before the rename: a body
               shorter than its declared Content-Length, or a chunked body that never
               reaches its terminating chunk, is a failed fetch.
 
-          One blocking call cannot be interrupted in-process: a resolver call that
-          blocks below Python (for example a hung ``getaddrinfo``).  The workflow shell
-          wrapper runs the whole helper under a process-level ``timeout`` as the backstop
-          for that case and prints the same deterministic per-field ``::error::`` itself
-          on that timeout path (GNU ``timeout`` exit status 124, or 137 when the
-          kill-after signal was needed), which also keeps a normal helper failure from
-          being reported twice.
+          A resolver call that blocks below Python (for example a hung ``getaddrinfo``)
+          cannot be interrupted: the thread running it can only be abandoned, and the
+          retry loop stays bounded as it is, so at most one abandoned daemon thread per
+          attempt lives on until the process exits.  The attempt itself never waits past
+          its budget for that case: the lookup is joined with the attempt's *current*
+          remaining time and a lookup that misses it fails the hop as the same retryable
+          timeout a stalled socket produces.  The workflow shell wrapper still runs the
+          whole helper under a process-level ``timeout`` as the outermost backstop and
+          prints the same deterministic per-field ``::error::`` itself on that timeout
+          path (GNU ``timeout`` exit status 124, or 137 when the kill-after signal was
+          needed), which also keeps a normal helper failure from being reported twice.
 
           Reviewer assumption recorded here: address pinning applies to the connections
           this helper makes.  ``http.client`` and the pinned sockets never consult
@@ -1370,8 +1374,11 @@ jobs:
               closes that gap: it fires once at the deadline and shuts down the socket the
               attempt is currently using, so a blocked read or write fails immediately
               instead of waiting for the next check.  A resolver call that blocks below
-              Python (for example a hung ``getaddrinfo``) cannot be interrupted this way;
-              the shell wrapper's process-level ``timeout`` backstops that case.
+              Python (for example a hung ``getaddrinfo``) cannot be interrupted this way
+              either; ``_resolve`` bounds that phase by joining a daemon resolver thread
+              with the current remaining budget and abandoning the thread (which cannot
+              be killed and lives until the process exits), while the shell wrapper's
+              process-level ``timeout`` remains the outermost backstop.
               """
 
               def __init__(self, max_time):
@@ -1425,7 +1432,7 @@ jobs:
               """Parse one hop URL; refuse anything that is not a safe absolute http(s) URL."""
               try:
                   parsed = urlsplit(url)
-                  parsed.port  # raises ValueError for a malformed port
+                  port = parsed.port  # raises ValueError for a malformed or out-of-range port
                   host = parsed.hostname
               except ValueError as exc:
                   raise _Abort(
@@ -1433,6 +1440,15 @@ jobs:
                   ) from exc
               if parsed.scheme not in ("http", "https") or not host:
                   raise _Abort(message=_refused_message(field, "only absolute http(s) URLs are fetched"))
+              if port is not None and not 1 <= port <= 65535:
+                  # Mirror the producer's port rule instead of retargeting the hop: a
+                  # present port outside 1..65535 (including 0, however the digits are
+                  # spelled) makes the URL unusable.  Substituting the scheme default
+                  # would fetch a different port than the URL names while the Host
+                  # header still carried the provider's port.
+                  raise _Abort(
+                      message=_refused_message(field, "provider URL is not a usable absolute http(s) URL")
+                  )
               target = parsed.path or "/"
               if parsed.query:
                   target += "?" + parsed.query
@@ -1475,16 +1491,42 @@ jobs:
               return parsed, host, target
 
 
-          def _resolve(host, port, allow_address, field):
-              """Resolve ``host`` once and return only validated destinations.
+          def _resolve(host, port, allow_address, field, watchdog):
+              """Resolve ``host`` once, bounded by the attempt's current budget.
+
+              The lookup runs on a daemon thread because a resolver call that blocks
+              below Python cannot be interrupted or killed in-process.  The attempt
+              joins that thread only for its *current* remaining budget: a lookup that
+              misses the budget fails the hop as the same retryable timeout a stalled
+              socket produces, and the abandoned thread -- which cannot be killed --
+              lives on until the process exits (the retry loop is unchanged, so at most
+              one abandoned thread per bounded attempt).  The shell wrapper's
+              process-level ``timeout`` stays the outermost backstop.
 
               Raises before any connection when the resolution contains any address the
               policy refuses, so a refused hop is never contacted at all.
               """
-              try:
-                  infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-              except socket.gaierror as exc:
-                  raise _Abort() from exc
+              outcome = {}
+
+              def _lookup():
+                  try:
+                      outcome["infos"] = socket.getaddrinfo(
+                          host, port, type=socket.SOCK_STREAM
+                      )
+                  except BaseException as exc:  # re-raised on the attempt thread
+                      outcome["error"] = exc
+
+              worker = threading.Thread(target=_lookup, daemon=True)
+              worker.start()
+              worker.join(max(0.0, watchdog.remaining()))
+              if worker.is_alive():
+                  raise _Abort(retryable=True)
+              if "error" in outcome:
+                  error = outcome["error"]
+                  if isinstance(error, socket.gaierror):
+                      raise _Abort() from error
+                  raise error
+              infos = outcome["infos"]
               addresses = []
               seen = set()
               try:
@@ -1704,8 +1746,11 @@ jobs:
                   redirects = 0
                   while True:
                       parsed, host, target = _parse_hop(current, field)
+                      # An already-expired attempt fails before a resolver thread is
+                      # started for a hop it can no longer fetch.
+                      watchdog.check()
                       port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                      addresses = _resolve(host, port, allow_address, field)
+                      addresses = _resolve(host, port, allow_address, field, watchdog)
                       watchdog.check()
                       conn, response = _open(
                           parsed, host, target, port, addresses, watchdog, field, cap
@@ -1848,9 +1893,11 @@ jobs:
             # deterministic per-field ::error:: text itself; the exit code fails
             # this step under set -e.
             #
-            # Process-level backstop for the one blocking call the helper cannot
-            # interrupt in-process (a hung resolver call): the bound is above the
-            # helper's own worst case (3 attempts x 120 s + 2 x 2 s retry delay).
+            # Outermost backstop for a blocking call below Python that the helper cannot
+            # end in-process (a hung resolver call is bounded per attempt by a daemon
+            # thread the helper abandons, but that thread cannot be killed): the bound is
+            # above the helper's own worst case (3 attempts x 120 s + 2 x 2 s retry delay),
+            # and an abandoned resolver thread never extends an attempt past its budget.
             # Only the timeout exit status gets a message from this wrapper, so an
             # ordinary helper failure is never reported twice.
             local process_timeout=420
