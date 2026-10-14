@@ -67,18 +67,1917 @@ jobs:
       workflow_sha: ${{ inputs.workflow_sha }}
     secrets: inherit
 
+  prepare_branding_assets:
+    # DeskForge #80 branding images (app_icon_url / app_logo_url / privacy_screen_url):
+    # resolve once here so both the privacy-mode DLL build (third-party workflow) and
+    # the client build consume verified local files instead of re-fetching. Only
+    # absolute http(s) URLs are accepted here and in the resolve step; each image is
+    # fetched under its per-field byte cap and validated by the single shared PNG
+    # validator, which is shipped inside this artifact so every consumer runs the
+    # same code. Empty payload fields skip the whole stage.
+    outputs:
+      branding_assets_artifact: ${{ steps.fetch_branding.outputs.branding_assets_artifact }}
+      privacy_image_artifact: ${{ steps.fetch_branding.outputs.privacy_image_artifact }}
+    needs: verify_workflow_identity
+    permissions: {}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 'Resolve and fetch branded images'
+        id: fetch_branding
+        env:
+          ENC: ${{ inputs.enc_payload }}
+          PAYLOAD_KEY: ${{ secrets.WORKFLOW_PAYLOAD_KEY }}
+          OUTER_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
+          EXECUTION_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          RQS_PAYLOAD_MODE=encrypted
+          if [ -z "${ENC:-}" ]; then
+            echo "::error::manual/direct runs require an authenticated DFP1 payload; no build is permitted"
+            exit 1
+          fi
+          if [ -z "${PAYLOAD_KEY:-}" ]; then
+              echo "::error::enc_payload provided but secret WORKFLOW_PAYLOAD_KEY is not set in this repo"
+              exit 1
+            fi
+            # DFP1 is authenticated encrypt-then-MAC; legacy/open envelopes are
+            # intentionally rejected by the active build workflow.
+            decrypt_payload() {
+              local payload_dir magic material aes_key aes_iv ciphertext
+              payload_dir=$(mktemp -d)
+              magic=$(printf '%s' "$ENC" | base64 -d | dd bs=1 count=4 status=none)
+              if [ "$magic" = "DFP1" ]; then
+                ciphertext="$payload_dir/ciphertext"
+                if ! material=$(PAYLOAD_KEY="$PAYLOAD_KEY" ENC="$ENC" python3 - "$ciphertext" <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import os
+          import pathlib
+          import sys
+
+          raw = base64.b64decode(os.environ["ENC"], validate=True)
+          if len(raw) <= 4 + 16 + 32:
+              raise SystemExit("authenticated payload is truncated")
+          ciphertext = raw[20:-32]
+          if not ciphertext or len(ciphertext) % 16:
+              raise SystemExit("authenticated payload ciphertext is invalid")
+          derived = hashlib.pbkdf2_hmac("sha256", os.environ["PAYLOAD_KEY"].encode(), raw[4:20], 100000, 80)
+          expected = hmac.new(derived[48:], raw[:-32], hashlib.sha256).digest()
+          if not hmac.compare_digest(expected, raw[-32:]):
+              raise SystemExit("authenticated payload integrity check failed")
+          pathlib.Path(sys.argv[1]).write_bytes(ciphertext)
+          print(derived[:32].hex())
+          print(derived[32:48].hex())
+          PY
+                ); then
+                  rm -rf "$payload_dir"
+                  return 1
+                fi
+                aes_key=$(printf '%s\n' "$material" | sed -n '1p')
+                aes_iv=$(printf '%s\n' "$material" | sed -n '2p')
+                if ! openssl enc -d -aes-256-cbc -K "$aes_key" -iv "$aes_iv" -in "$ciphertext"; then
+                  rm -rf "$payload_dir"
+                  return 1
+                fi
+              else
+                echo "::error::enc_payload must use the authenticated DFP1 envelope" >&2
+                rm -rf "$payload_dir"
+                return 1
+              fi
+              rm -rf "$payload_dir"
+            }
+            validate_authenticated_workflow_identity() {
+              local decrypted="$1" inner_workflow_sha
+              if ! printf '%s' "$decrypted" | jq -e 'type == "object"' >/dev/null; then
+                echo "::error::authenticated payload must be an object"
+                exit 1
+              fi
+              if ! printf '%s' "$decrypted" | jq -e 'has("workflow_sha") and (.workflow_sha | type == "string")' >/dev/null; then
+                echo "::error::authenticated workflow_sha must be a string"
+                exit 1
+              fi
+              inner_workflow_sha=$(printf '%s' "$decrypted" | jq -r '.workflow_sha')
+              if [[ ! "$inner_workflow_sha" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+                echo "::error::authenticated workflow_sha must be a 40-64 character hexadecimal SHA"
+                exit 1
+              fi
+              if [ "$inner_workflow_sha" != "$OUTER_WORKFLOW_SHA" ] || [ "$inner_workflow_sha" != "$EXECUTION_WORKFLOW_SHA" ]; then
+                echo "::error::authenticated workflow_sha does not match outer workflow_sha and github.sha"
+                exit 1
+              fi
+            }
+            decrypted=$(decrypt_payload)
+            validate_authenticated_workflow_identity "$decrypted"
+            RQS_WORKFLOW_REPO=$(printf '%s' "$decrypted" | jq -r '.workflow_repo // ""')
+            if ! printf '%s' "$decrypted" | jq -e '
+              (.workflow_repo | type == "string") and
+              (.app_icon_url == null or (.app_icon_url | type == "string")) and
+              (.app_logo_url == null or (.app_logo_url | type == "string")) and
+              (.privacy_screen_url == null or (.privacy_screen_url | type == "string"))
+            ' >/dev/null; then
+              echo "::error::encrypted payload branding image fields must be strings"
+              exit 1
+            fi
+            if [ "${RQS_WORKFLOW_REPO,,}" != "${GITHUB_REPOSITORY,,}" ]; then
+              echo "::error::authenticated workflow repository does not match this fork"
+              exit 1
+            fi
+          reject_control_chars() {
+            local field="$1" value="$2"
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]] || LC_ALL=C printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+              echo "::error::$field contains unsafe control characters"
+              exit 1
+            fi
+          }
+          validate_branding_url() {
+            local field="$1" value="$2"
+            if [ -z "$value" ]; then return 0; fi
+            case "$value" in
+              http://*|https://*) ;;
+              *)
+                echo "::error::$field must be an absolute http(s) URL; relative URLs (for example '/upload/...') cannot be fetched by this workflow and fail the build"
+                exit 1 ;;
+            esac
+            if printf '%s' "$value" | grep -q '[[:space:]]'; then
+              echo "::error::$field contains whitespace characters"
+              exit 1
+            fi
+          }
+          RQS_APP_ICON_URL=$(printf '%s' "$decrypted" | jq -r '.app_icon_url // ""')
+          RQS_APP_LOGO_URL=$(printf '%s' "$decrypted" | jq -r '.app_logo_url // ""')
+          RQS_PRIVACY_SCREEN_URL=$(printf '%s' "$decrypted" | jq -r '.privacy_screen_url // ""')
+          reject_control_chars RQS_APP_ICON_URL "$RQS_APP_ICON_URL"
+          reject_control_chars RQS_APP_LOGO_URL "$RQS_APP_LOGO_URL"
+          reject_control_chars RQS_PRIVACY_SCREEN_URL "$RQS_PRIVACY_SCREEN_URL"
+          validate_branding_url app_icon_url "$RQS_APP_ICON_URL"
+          validate_branding_url app_logo_url "$RQS_APP_LOGO_URL"
+          validate_branding_url privacy_screen_url "$RQS_PRIVACY_SCREEN_URL"
+
+          staging="${RUNNER_TEMP}/deskforge-branding-assets"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+
+          # Single authoritative PNG validator. It is written here once and shipped
+          # inside the one deskforge-branding-assets artifact, so the build-job
+          # icon/logo consumers and the third-party privacy-screen consumer all run
+          # byte-identical validation code. This job has no repository checkout
+          # (permissions: {} and no actions/checkout), so the module cannot be read
+          # from the repo; the build job's source checkout also replaces the tree, so
+          # a repo file would not survive to the build consumers either.
+          validator="${RUNNER_TEMP}/validate_branding_png.py"
+          cat > "$validator" <<'PY'
+          #!/usr/bin/env python3
+          """Single authoritative validator for DeskForge branding PNG images.
+
+          One implementation is used everywhere a branding PNG is accepted or consumed:
+
+            * ``prepare_branding_assets`` writes it, runs it over the staging directory
+              and ships it inside the single ``deskforge-branding-assets`` artifact;
+            * the Windows client build (icon + logo consumers) and the third-party
+              privacy-mode overlay consumer import it from that same artifact.
+
+          The prepare job has no repository checkout (``permissions: {}`` and no
+          ``actions/checkout``) and the build job's source checkout replaces the whole
+          tree, so a repository file cannot be reached from every consumer.  Defining the
+          contract once here and carrying it with the one branding artifact keeps every
+          consumer on identical code.
+
+          A branding PNG is accepted only when it is structurally whole and decodable:
+          complete chunk stream (IHDR first, per-chunk CRC, mandatory IEND, no data after
+          IEND), four-letter chunk types, spec chunk ordering (PLTE exactly once and before
+          the first IDAT, required for indexed colour and permitted as a suggested palette
+          for truecolour 2/6 but forbidden for 0/4; tRNS exactly once and before the first
+          IDAT, and for indexed colour after PLTE; consecutive IDAT chunks; no unknown
+          critical chunk), a valid per-colour-type tRNS transparency sample, the
+          compression/filter method flags pinned to 0, every bit depth the PNG
+          specification permits for the colour type, either interlace method (none or
+          Adam7), bounded and exact decompression of the IDAT stream (never more than the
+          scanline byte count the IHDR and interlace layout imply, and neither trailing
+          decompressed nor trailing compressed payload), a full per-pass scanline/filter
+          traversal canonicalised to 8-bit BGRA, and a canonical 8-bit non-interlaced
+          RGB/RGBA PNG re-encode that every consumer receives instead of the raw download.
+          """
+
+          import hashlib
+          import json
+          import pathlib
+          import struct
+          import sys
+          import zlib
+
+          PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+          # Colour type -> samples per pixel. The decoded raster is canonicalised to 8 bits
+          # per sample, so this is also the canonical channel count for every source depth.
+          _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+          # Colour type -> the bit depths the PNG specification permits for it (PNG 1.2
+          # 4.1.2 / 11.2.2): greyscale 1/2/4/8/16, truecolour and the two alpha types
+          # 8/16, indexed colour 1/2/4/8 but never 16.
+          _DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+
+          # Adam7 interlace passes as (xstart, ystart, xstep, ystep) (PNG 1.2 8.2).
+          _ADAM7_PASSES = (
+              (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+              (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
+          )
+
+          # Number of pixels along one axis for an interlace pass; zero means the pass
+          # carries no data at all (no scanlines, hence no filter byte).
+          def _pass_extent(size, start, step):
+              if size <= start:
+                  return 0
+              return (size - start + step - 1) // step
+
+          # PNG chunk types are exactly four ASCII letters A-Z / a-z (PNG 1.2 section
+          # 5.3). A byte outside that set is a malformed chunk, not an ignorable
+          # ancillary chunk: the ancillary/critical distinction only exists for a valid
+          # type, so a non-letter type must be rejected rather than silently skipped.
+          def _valid_chunk_type(chunk_type):
+              return len(chunk_type) == 4 and all(
+                  0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A for byte in chunk_type
+              )
+
+          # prepare_branding_assets field rules: name -> (max_w, max_h, max_bytes,
+          # require_square, square_hint).  Kept exactly at the reviewed 1.4.9 gate.
+          _STAGING_RULES = {
+              # app-icon dimension rule lives in ONE layer: this prepare gate accepts any
+              # square PNG up to 4096px (format/shape gate only); the build job's ICO
+              # converter owns the final icon constraint (square, 16..256, with
+              # nearest-neighbour downscale to 256 for larger provider icons).
+              "app-icon.png": (
+                  4096,
+                  4096,
+                  10 * 1024 * 1024,
+                  True,
+                  "must be square (used for exe/tray icon resources; larger square icons are downscaled to 256 px for the Windows ICO resources in the build job)",
+              ),
+              "app-logo.png": (4096, 4096, 10 * 1024 * 1024, False, ""),
+              "privacy-screen.png": (
+                  4096,
+                  4096,
+                  20 * 1024 * 1024,
+                  False,
+                  "(renders fullscreen while privacy mode is active)",
+              ),
+          }
+
+
+          class PngError(Exception):
+              """Raised when a branding PNG fails the shared validation contract."""
+
+
+          class Png:
+              """A validated, fully decoded 8-bit canonical PNG.
+
+              The raster in :attr:`pixels` is always 8 bits per sample regardless of the source
+              bit depth (a 16-bit sample keeps its most significant byte, a sub-byte sample is
+              expanded, an indexed sample stays a palette index), and any Adam7 interlace has
+              been expanded into the full raster.
+              """
+
+              __slots__ = ("width", "height", "color_type", "pixels", "plte", "trns", "transparency")
+
+              def __init__(self, width, height, color_type, pixels, plte, trns, transparency=None):
+                  self.width = width
+                  self.height = height
+                  self.color_type = color_type
+                  self.pixels = pixels  # unfiltered 8-bit scanlines, filter byte removed
+                  self.plte = plte
+                  self.trns = trns
+                  # Per-pixel alpha (0 or 255) for a greyscale/truecolour tRNS sample, decided
+                  # at the source sample width; ``None`` when tRNS does not apply.
+                  self.transparency = transparency
+
+              def bgra(self):
+                  """Return ``(BGRA bytes, width, height)``; > 256px is downscaled to 256."""
+                  channels = _CHANNELS[self.color_type]
+                  width = self.width
+                  height = self.height
+                  stride = width * channels
+                  pixels = self.pixels
+                  transparency = self.transparency
+                  screen = bytearray(width * height * 4)
+                  # tRNS names exactly one fully transparent sample: a 2-byte gray value
+                  # (color type 0) or a 6-byte RGB value (color type 2); it was compared at
+                  # the source sample width in load() and is precomputed into ``transparency``.
+                  # Indexed transparency is the per-entry alpha table used below. The alpha
+                  # color types (4/6) never carry tRNS (load() rejects it).
+                  for y in range(height):
+                      base = y * width * 4
+                      row = pixels[y * stride:(y + 1) * stride]
+                      for x in range(width):
+                          sx = x * channels
+                          dx = base + x * 4
+                          if self.color_type == 6:
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx + 2], row[sx + 1], row[sx], row[sx + 3],
+                              )
+                          elif self.color_type == 2:
+                              alpha = transparency[y * width + x] if transparency is not None else 255
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx + 2], row[sx + 1], row[sx], alpha,
+                              )
+                          elif self.color_type == 4:
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx], row[sx], row[sx], row[sx + 1],
+                              )
+                          elif self.color_type == 0:
+                              alpha = transparency[y * width + x] if transparency is not None else 255
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  row[sx], row[sx], row[sx], alpha,
+                              )
+                          else:
+                              index = row[sx]
+                              if index * 3 + 2 >= len(self.plte):
+                                  raise PngError("PNG palette index is out of range")
+                              alpha = self.trns[index] if self.trns is not None and index < len(self.trns) else 255
+                              screen[dx], screen[dx + 1], screen[dx + 2], screen[dx + 3] = (
+                                  self.plte[index * 3 + 2],
+                                  self.plte[index * 3 + 1],
+                                  self.plte[index * 3],
+                                  alpha,
+                              )
+                  if width > 256 or height > 256:
+                      # exe resource icons must stay <= 256px: nearest-neighbour downscale.
+                      target = 256
+                      scaled = bytearray(target * target * 4)
+                      for ty in range(target):
+                          source_row = (ty * height // target) * width * 4
+                          for tx in range(target):
+                              source = source_row + (tx * width // target) * 4
+                              dest = (ty * target + tx) * 4
+                              scaled[dest:dest + 4] = screen[source:source + 4]
+                      return bytes(scaled), target, target
+                  return bytes(screen), width, height
+
+
+          def _fail(message):
+              raise PngError(message)
+
+
+          def _unfilter_scanline(raw, offset, row_bytes, bpp, previous, label):
+              """Undo one PNG scanline filter; return ``(unfiltered row, next offset)``.
+
+              ``bpp`` is the filter byte stride (the pixel size in bytes, at least one), which
+              is what makes packed sub-byte samples filter correctly. ``previous`` is the
+              previously reconstructed scanline of the same interlace pass, or zeros.
+              """
+              ftype = raw[offset]
+              row = bytearray(raw[offset + 1:offset + 1 + row_bytes])
+              for i in range(row_bytes):
+                  a_ = row[i - bpp] if i >= bpp else 0
+                  b_ = previous[i]
+                  c_ = previous[i - bpp] if i >= bpp else 0
+                  if ftype == 1:
+                      row[i] = (row[i] + a_) & 0xFF
+                  elif ftype == 2:
+                      row[i] = (row[i] + b_) & 0xFF
+                  elif ftype == 3:
+                      row[i] = (row[i] + (a_ + b_) // 2) & 0xFF
+                  elif ftype == 4:
+                      p_ = a_ + b_ - c_
+                      pa, pb, pc = abs(p_ - a_), abs(p_ - b_), abs(p_ - c_)
+                      pr = a_ if pa <= pb and pa <= pc else (b_ if pb <= pc else c_)
+                      row[i] = (row[i] + pr) & 0xFF
+                  elif ftype != 0:
+                      _fail(label + " uses an unknown scanline filter")
+              return row, offset + 1 + row_bytes
+
+
+          def load(data, label="PNG", max_width=4096, max_height=4096, max_bytes=None,
+                   require_square=False, square_hint=""):
+              """Validate one branding PNG and return a decoded :class:`Png`.
+
+              Raises :class:`PngError` for any structural, digest-independent defect.
+              """
+              if max_bytes is not None and len(data) > max_bytes:
+                  _fail(label + " exceeds the byte cap (" + str(max_bytes) + ")")
+              if len(data) < 33:
+                  _fail(label + " is too small to be a PNG image")
+              if data[:8] != PNG_SIGNATURE:
+                  _fail(label + " is not a PNG image; provider image URLs must point to .png files")
+
+              size = len(data)
+              pos = 8
+              count = 0
+              ihdr = None
+              chunks = []
+              ended = False
+              # Full structural walk of the chunk stream (fail on any truncation).
+              while pos < size:
+                  if ended:
+                      _fail(label + " has data after IEND")
+                  if size - pos < 8:
+                      _fail(label + " ends inside a chunk header (truncated)")
+                  (length,) = struct.unpack(">I", data[pos:pos + 4])
+                  ctype = data[pos + 4:pos + 8]
+                  if pos + 12 + length > size:
+                      _fail(label + " chunk extends past its declared length (truncated)")
+                  chunk = data[pos + 8:pos + 8 + length]
+                  (crc,) = struct.unpack(">I", data[pos + 8 + length:pos + 12 + length])
+                  if (zlib.crc32(ctype + chunk) & 0xFFFFFFFF) != crc:
+                      _fail(label + " chunk CRC mismatch")
+                  if count == 0 and ctype != b"IHDR":
+                      _fail(label + " first chunk is not IHDR")
+                  if ctype == b"IHDR":
+                      if count != 0 or ihdr is not None:
+                          _fail(label + " has an invalid IHDR placement")
+                      ihdr = chunk
+                  elif ctype == b"IEND":
+                      if length != 0:
+                          _fail(label + " has a malformed IEND chunk")
+                      ended = True
+                  chunks.append((ctype, chunk))
+                  pos += 12 + length
+                  count += 1
+
+              if not ended:
+                  _fail(label + " is truncated (no IEND chunk)")
+              if ihdr is None or len(ihdr) != 13:
+                  _fail(label + " has an unreadable IHDR chunk")
+              width, height, depth, color_type, compression, filter_method, interlace = struct.unpack(
+                  ">IIBBBBB", ihdr
+              )
+              if width == 0 or height == 0:
+                  _fail(label + " has a zero dimension")
+              if compression != 0 or filter_method != 0:
+                  _fail(label + " uses unsupported compression/filter method flags")
+              if interlace not in (0, 1):
+                  _fail(
+                      label + " uses unsupported PNG interlace method " + str(interlace)
+                      + " (only non-interlaced or Adam7 interlaced PNG is supported)"
+                  )
+              channels = _CHANNELS.get(color_type)
+              if channels is None:
+                  _fail(label + " uses unsupported PNG color type " + str(color_type))
+              if depth not in _DEPTHS[color_type]:
+                  _fail(
+                      label + " uses a PNG bit depth " + str(depth) + " that is invalid for color type "
+                      + str(color_type) + " (allowed: "
+                      + "/".join(str(value) for value in _DEPTHS[color_type]) + ")"
+                  )
+              if not 1 <= width <= max_width or not 1 <= height <= max_height:
+                  _fail(
+                      label + " has out-of-range dimensions " + str(width) + "x" + str(height)
+                      + " (max " + str(max_width) + "x" + str(max_height) + ")"
+                  )
+              if require_square and width != height:
+                  _fail(label + " " + square_hint if square_hint else label + " must be square")
+              # Chunk-order and chunk-type rules (PNG 1.2 sections 3.3 / 4.1.2 / 5.3 / 5.6).
+              # A structurally whole stream is not necessarily a decodable one: every chunk
+              # type must be four ASCII letters, PLTE must precede the first IDAT and appear
+              # at most once, tRNS must precede the first IDAT, follow PLTE for indexed
+              # colour, and appear at most once, the IDAT chunks must be consecutive, and an
+              # unknown critical chunk must never be silently ignored.
+              plte = None
+              trns = None
+              idat_parts = []
+              saw_idat = False
+              previous_type = b"IHDR"
+              for chunk_type, chunk in chunks:
+                  if not _valid_chunk_type(chunk_type):
+                      _fail(label + " has a malformed chunk type " + chunk_type.decode("latin-1"))
+                  if chunk_type == b"PLTE":
+                      if plte is not None:
+                          _fail(label + " has more than one PLTE chunk")
+                      if saw_idat:
+                          _fail(label + " has a PLTE chunk after the first IDAT")
+                      plte = chunk
+                  elif chunk_type == b"tRNS":
+                      if trns is not None:
+                          _fail(label + " has more than one tRNS chunk")
+                      if saw_idat:
+                          _fail(label + " has a tRNS chunk after the first IDAT")
+                      if color_type == 3 and plte is None:
+                          _fail(label + " has a tRNS chunk before its PLTE chunk")
+                      trns = chunk
+                  elif chunk_type == b"IDAT":
+                      if saw_idat and previous_type != b"IDAT":
+                          _fail(label + " has non-consecutive IDAT chunks")
+                      saw_idat = True
+                      idat_parts.append(chunk)
+                  elif chunk_type in (b"IHDR", b"IEND"):
+                      pass
+                  elif chunk_type[0:1].isupper():
+                      _fail(label + " contains an unknown critical chunk " + chunk_type.decode("latin-1"))
+                  previous_type = chunk_type
+              # PLTE is required exactly once for indexed colour (3). PNG 1.2 4.1.2 forbids
+              # it for grayscale (0) and grayscale+alpha (4), but permits it for truecolour
+              # (2) and truecolour+alpha (6) as a *suggested* palette that a decoder may
+              # ignore -- the raster consumer does not use it for those types, so the
+              # decoded output is unchanged. Whenever PLTE is present its structure must be
+              # a valid palette (a multiple of three bytes, 1..256 entries).
+              if plte is not None:
+                  if color_type in (0, 4):
+                      _fail(
+                          label + " has a PLTE chunk but color type " + str(color_type)
+                          + " forbids one (only indexed colour 3, or truecolour 2/6 as a"
+                          " suggested palette, may carry PLTE)"
+                      )
+                  if len(plte) % 3 != 0 or not 1 <= len(plte) // 3 <= 256:
+                      _fail(label + " has an invalid PLTE chunk")
+              elif color_type == 3:
+                  _fail(label + " palette PNG is missing its PLTE chunk")
+              if trns is not None:
+                  if color_type == 3:
+                      if len(trns) > len(plte) // 3:
+                          _fail(label + " tRNS chunk is longer than the palette")
+                  elif color_type == 0:
+                      if len(trns) != 2:
+                          _fail(label + " grayscale tRNS chunk must be exactly 2 bytes")
+                  elif color_type == 2:
+                      if len(trns) != 6:
+                          _fail(label + " truecolor tRNS chunk must be exactly 6 bytes")
+                  else:
+                      _fail(label + " alpha color type " + str(color_type) + " must not carry a tRNS chunk")
+              if not saw_idat:
+                  _fail(label + " has no image data")
+
+              idat = b"".join(idat_parts)
+              # Scanline layout: the non-interlaced image is one pass; otherwise the seven
+              # Adam7 passes. Each pass is an independent reduced image with its own row width,
+              # filter stride and previous scanline, and a pass with no columns carries no
+              # scanlines at all (no filter byte) per PNG 1.2 8.2.
+              passes = ((0, 0, 1, 1),) if interlace == 0 else _ADAM7_PASSES
+              bpp = (channels * depth + 7) // 8
+              layout = []
+              expected = 0
+              for xstart, ystart, xstep, ystep in passes:
+                  pass_width = _pass_extent(width, xstart, xstep)
+                  if pass_width == 0:
+                      continue
+                  pass_height = _pass_extent(height, ystart, ystep)
+                  row_bytes = (pass_width * channels * depth + 7) // 8
+                  expected += pass_height * (row_bytes + 1)
+                  layout.append((pass_width, pass_height, row_bytes, xstart, ystart, xstep, ystep))
+              # Bounded decompression: never ask zlib for more than one byte beyond the exact
+              # scanline stream the IHDR and interlace layout imply, so a decompression bomb
+              # cannot allocate meaningfully more than the declared image size.
+              try:
+                  decompressor = zlib.decompressobj()
+                  raw = decompressor.decompress(idat, expected + 1)
+              except zlib.error as exc:
+                  _fail(label + " image data is corrupt: " + str(exc))
+              if len(raw) > expected:
+                  _fail(
+                      label + " image data contains more scanline bytes than the IHDR dimensions"
+                      " allow (extra or trailing pixel data)"
+                  )
+              if not decompressor.eof or decompressor.unconsumed_tail or decompressor.unused_data:
+                  # unused_data is payload after the zlib end marker: a decoder must not accept
+                  # a trailing byte stream once the compressed image data has ended.
+                  _fail(label + " image data stream is incomplete or has trailing data")
+              if len(raw) != expected:
+                  _fail(label + " image data is incomplete (truncated)")
+
+              # Canonical 8-bit raster: unfilter every scanline of every pass, expand packed
+              # sub-byte samples, and keep the most significant byte of each 16-bit sample, so
+              # every consumer sees one 8-bit channel layout regardless of the source format.
+              stride = width * channels
+              pixels = bytearray(height * stride)
+              max_value = (1 << depth) - 1
+              # tRNS on greyscale/truecolour names one fully transparent sample: a 2-byte gray
+              # value (color type 0) or a 6-byte RGB value (color type 2). It is compared at the
+              # source sample width, so a 16-bit value is not collapsed to its top byte before
+              # the comparison. The alpha color types (4/6) never carry tRNS (rejected above).
+              transparent_gray = None
+              transparent_rgb = None
+              if trns is not None and color_type == 0:
+                  (transparent_gray,) = struct.unpack(">H", trns)
+              elif trns is not None and color_type == 2:
+                  transparent_rgb = struct.unpack(">HHH", trns)
+              transparency = None
+              if transparent_gray is not None or transparent_rgb is not None:
+                  transparency = bytearray(b"\xff" * (width * height))
+              offset = 0
+              if interlace == 0 and depth == 8:
+                  # Fast path: the unfiltered scanlines are already the canonical 8-bit raster
+                  # (byte-identical to the original decoder).
+                  previous = bytearray(stride)
+                  for y in range(height):
+                      row, offset = _unfilter_scanline(raw, offset, stride, channels, previous, label)
+                      pixels[y * stride:(y + 1) * stride] = row
+                      previous = row
+                      if transparency is not None:
+                          row_base = y * width
+                          if color_type == 0:
+                              for x in range(width):
+                                  if row[x] == transparent_gray:
+                                      transparency[row_base + x] = 0
+                          else:
+                              for x in range(width):
+                                  sx = x * 3
+                                  if (row[sx], row[sx + 1], row[sx + 2]) == transparent_rgb:
+                                      transparency[row_base + x] = 0
+              else:
+                  for pass_width, pass_height, row_bytes, xstart, ystart, xstep, ystep in layout:
+                      previous = bytearray(row_bytes)
+                      for row_index in range(pass_height):
+                          row, offset = _unfilter_scanline(raw, offset, row_bytes, bpp, previous, label)
+                          previous = row
+                          y = ystart + row_index * ystep
+                          for column in range(pass_width):
+                              x = xstart + column * xstep
+                              destination = (y * width + x) * channels
+                              if depth == 8:
+                                  base = column * channels
+                                  for channel in range(channels):
+                                      pixels[destination + channel] = row[base + channel]
+                                  if transparency is not None:
+                                      if color_type == 0:
+                                          if row[base] == transparent_gray:
+                                              transparency[y * width + x] = 0
+                                      elif (row[base], row[base + 1], row[base + 2]) == transparent_rgb:
+                                          transparency[y * width + x] = 0
+                              elif depth == 16:
+                                  base = column * channels * 2
+                                  if color_type == 0:
+                                      if transparency is not None and ((row[base] << 8) | row[base + 1]) == transparent_gray:
+                                          transparency[y * width + x] = 0
+                                      pixels[destination] = row[base]
+                                  elif color_type == 2:
+                                      if transparency is not None:
+                                          red = (row[base] << 8) | row[base + 1]
+                                          green = (row[base + 2] << 8) | row[base + 3]
+                                          blue = (row[base + 4] << 8) | row[base + 5]
+                                          if (red, green, blue) == transparent_rgb:
+                                              transparency[y * width + x] = 0
+                                      pixels[destination] = row[base]
+                                      pixels[destination + 1] = row[base + 2]
+                                      pixels[destination + 2] = row[base + 4]
+                                  elif color_type == 4:
+                                      pixels[destination] = row[base]
+                                      pixels[destination + 1] = row[base + 2]
+                                  else:
+                                      pixels[destination] = row[base]
+                                      pixels[destination + 1] = row[base + 2]
+                                      pixels[destination + 2] = row[base + 4]
+                                      pixels[destination + 3] = row[base + 6]
+                              else:
+                                  # Packed 1/2/4-bit sample, MSB-first within each byte.
+                                  bit = column * depth
+                                  value = (row[bit >> 3] >> (8 - depth - (bit & 7))) & max_value
+                                  if color_type == 0:
+                                      # Greyscale scales to the full 8-bit range (PNG 1.2 13.12).
+                                      pixels[destination] = value * (255 // max_value)
+                                      if transparency is not None and value == transparent_gray:
+                                          transparency[y * width + x] = 0
+                                  else:
+                                      # Indexed colour: the packed value is the palette index.
+                                      pixels[destination] = value
+              # Indexed colour: every decoded pixel must address a real palette entry, and a
+              # tRNS alpha table may not be longer than the palette it decorates. The raster
+              # consumer (Png.bgra) already rejects an out-of-range index, but load() is what
+              # every declared-acceptable check (logo and privacy consumers use load()/the CLI
+              # only) trusts, so the same range rule must hold here: a PNG the validator
+              # accepts must actually be decodable by every consumer.
+              if color_type == 3:
+                  entries = len(plte) // 3
+                  for index in pixels:
+                      if index >= entries:
+                          _fail(label + " contains a palette index that is out of range")
+              return Png(width, height, color_type, bytes(pixels), plte, trns, transparency)
+
+
+          def _png_chunk(chunk_type, payload):
+              return (
+                  struct.pack(">I", len(payload))
+                  + chunk_type
+                  + payload
+                  + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+              )
+
+
+          def _paeth(a, b, c):
+              p = a + b - c
+              pa = abs(p - a)
+              pb = abs(p - b)
+              pc = abs(p - c)
+              if pa <= pb and pa <= pc:
+                  return a
+              if pb <= pc:
+                  return b
+              return c
+
+
+          def _filter_row(row, previous, bpp, filter_type):
+              filtered = bytearray(len(row))
+              for i in range(len(row)):
+                  a = row[i - bpp] if i >= bpp else 0
+                  b = previous[i]
+                  c = previous[i - bpp] if i >= bpp else 0
+                  if filter_type == 1:
+                      predictor = a
+                  elif filter_type == 2:
+                      predictor = b
+                  elif filter_type == 3:
+                      predictor = (a + b) // 2
+                  elif filter_type == 4:
+                      predictor = _paeth(a, b, c)
+                  else:
+                      predictor = 0
+                  filtered[i] = (row[i] - predictor) & 0xFF
+              return filtered
+
+
+          def _filter_cost(filtered):
+              # Minimum sum of absolute differences (libpng's default heuristic). It is a pure
+              # function of the reconstructed raster, so re-encoding a canonical image reproduces
+              # the same per-scanline filter choices and therefore the same bytes.
+              return sum(value if value < 128 else 256 - value for value in filtered)
+
+
+          def encode(image):
+              """Re-encode a decoded :class:`Png` as a canonical 8-bit non-interlaced PNG.
+
+              Emits only IHDR, IDAT and IEND with correct CRCs and one valid zlib stream, at
+              colour type 2 (RGB) for a fully opaque raster or 6 (RGBA) when the source carried
+              an alpha channel or a tRNS sample, so alpha is preserved. Dimensions are kept
+              exactly. The result is deterministic and idempotent.
+              """
+              width = image.width
+              height = image.height
+              source_channels = _CHANNELS[image.color_type]
+              source_stride = width * source_channels
+              pixels = image.pixels
+              transparency = image.transparency
+              preserve_alpha = image.color_type in (4, 6) or image.trns is not None
+              channels = 4 if preserve_alpha else 3
+              stride = width * channels
+              raster = bytearray(height * stride)
+              for y in range(height):
+                  source_base = y * source_stride
+                  base = y * stride
+                  row_base = y * width
+                  for x in range(width):
+                      sx = source_base + x * source_channels
+                      dx = base + x * channels
+                      if image.color_type == 6:
+                          raster[dx:dx + 3] = pixels[sx:sx + 3]
+                          raster[dx + 3] = pixels[sx + 3]
+                      elif image.color_type == 2:
+                          raster[dx:dx + 3] = pixels[sx:sx + 3]
+                          if preserve_alpha:
+                              raster[dx + 3] = transparency[row_base + x] if transparency is not None else 255
+                      elif image.color_type == 4:
+                          raster[dx] = pixels[sx]
+                          raster[dx + 1] = pixels[sx]
+                          raster[dx + 2] = pixels[sx]
+                          raster[dx + 3] = pixels[sx + 1]
+                      elif image.color_type == 0:
+                          raster[dx] = pixels[sx]
+                          raster[dx + 1] = pixels[sx]
+                          raster[dx + 2] = pixels[sx]
+                          if preserve_alpha:
+                              raster[dx + 3] = transparency[row_base + x] if transparency is not None else 255
+                      else:
+                          index = pixels[sx]
+                          raster[dx] = image.plte[index * 3]
+                          raster[dx + 1] = image.plte[index * 3 + 1]
+                          raster[dx + 2] = image.plte[index * 3 + 2]
+                          if preserve_alpha:
+                              raster[dx + 3] = image.trns[index] if image.trns is not None and index < len(image.trns) else 255
+              raw = bytearray()
+              previous = bytearray(stride)
+              for y in range(height):
+                  row = raster[y * stride:(y + 1) * stride]
+                  best_type = 0
+                  best = _filter_row(row, previous, channels, 0)
+                  best_cost = _filter_cost(best)
+                  for filter_type in range(1, 5):
+                      candidate = _filter_row(row, previous, channels, filter_type)
+                      cost = _filter_cost(candidate)
+                      if cost < best_cost:
+                          best_type = filter_type
+                          best = candidate
+                          best_cost = cost
+                  raw.append(best_type)
+                  raw.extend(best)
+                  previous = row
+              color_type = 6 if preserve_alpha else 2
+              ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+              return (
+                  PNG_SIGNATURE
+                  + _png_chunk(b"IHDR", ihdr)
+                  + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+                  + _png_chunk(b"IEND", b"")
+              )
+
+
+          # Upper bound on the byte size of ``encode(image)`` for a decoded image whose
+          # geometry already passed the gates.  The canonical re-encode is an 8-bit
+          # non-interlaced PNG whose only variable-length chunk is one IDAT payload produced
+          # by ``zlib.compress(raw, 9)``: zlib guarantees that output is never larger than
+          # ``compressBound(n)`` for an n-byte input, where n is the filter-byte-per-scanline
+          # raster the geometry and canonical channel count imply.  The fixed overhead is the
+          # 8-byte signature plus IHDR (12+13), IDAT framing (12) and IEND (12) -- 57 bytes --
+          # and zlib's bound adds n + (n>>12) + (n>>14) + (n>>25) + 13.  This depends only on
+          # the validated width/height and channel count, never on the download cap, so a
+          # canonical re-encode of any accepted input always satisfies it; it exists solely so
+          # an encoder bug fails closed here instead of shipping an oversized or malformed file.
+          def canonical_byte_bound(image):
+              channels = 4 if (image.color_type in (4, 6) or image.trns is not None) else 3
+              raw = image.height * (1 + image.width * channels)
+              return 57 + raw + (raw >> 12) + (raw >> 14) + (raw >> 25) + 13
+
+
+          def prepare(staging):
+              """Canonicalise every staged branding image and write branding_manifest.json."""
+              staging = pathlib.Path(staging)
+              prepared = []
+              for name, (max_w, max_h, max_bytes, require_square, square_hint) in _STAGING_RULES.items():
+                  path = staging / name
+                  if not path.is_file():
+                      continue
+                  data = path.read_bytes()
+                  try:
+                      image = load(
+                          data,
+                          name,
+                          max_width=max_w,
+                          max_height=max_h,
+                          max_bytes=max_bytes,
+                          require_square=require_square,
+                          square_hint=square_hint,
+                      )
+                  except PngError as exc:
+                      print("::error::" + str(exc))
+                      return 1
+                  canonical = encode(image)
+                  # Consumers receive the canonical re-encode, never the raw downloaded bytes, so a
+                  # 16-bit or interlaced source cannot reach the build as-is. A locally generated
+                  # canonical file is not a downloaded response, so the per-field download cap does
+                  # not apply to it: an indexed source can legitimately re-encode to RGB bytes far
+                  # larger than the fetch cap while still being a valid in-domain image. The
+                  # canonical bytes are therefore re-validated against the geometry-derived bound
+                  # (never the download cap) plus the same structural, decode, dimension and square
+                  # gates, so an encoder bug fails closed without rejecting a valid input.
+                  try:
+                      load(
+                          canonical,
+                          name,
+                          max_width=max_w,
+                          max_height=max_h,
+                          max_bytes=canonical_byte_bound(image),
+                          require_square=require_square,
+                          square_hint=square_hint,
+                      )
+                  except PngError as exc:
+                      print("::error::" + name + " canonical re-encode failed validation: " + str(exc))
+                      return 1
+                  prepared.append((name, path, image, canonical))
+              images = {}
+              for name, path, image, canonical in prepared:
+                  path.write_bytes(canonical)
+                  images[name] = {
+                      "sha256": hashlib.sha256(canonical).hexdigest(),
+                      "bytes": len(canonical),
+                      "width": image.width,
+                      "height": image.height,
+                  }
+              if images:
+                  (staging / "branding_manifest.json").write_text(
+                      json.dumps({"images": images}), encoding="utf-8"
+                  )
+              print("branding assets staged: " + (", ".join(images) if images else "none"))
+              return 0
+
+
+          def main(argv):
+              if not argv:
+                  sys.stderr.write(
+                      "usage: validate_branding_png.py <png-or-staging-dir>"
+                      " [--label L] [--max-width N] [--max-height N] [--max-bytes N] [--require-square]\n"
+                  )
+                  return 2
+              target = pathlib.Path(argv[0])
+              label = None
+              max_width = 4096
+              max_height = 4096
+              max_bytes = None
+              require_square = False
+              index = 1
+              while index < len(argv):
+                  option = argv[index]
+                  if option == "--require-square":
+                      require_square = True
+                      index += 1
+                      continue
+                  if option in ("--label", "--max-width", "--max-height", "--max-bytes") and index + 1 < len(argv):
+                      value = argv[index + 1]
+                      if option == "--label":
+                          label = value
+                      elif option == "--max-width":
+                          max_width = int(value)
+                      elif option == "--max-height":
+                          max_height = int(value)
+                      else:
+                          max_bytes = int(value)
+                      index += 2
+                      continue
+                  sys.stderr.write("unknown argument: " + option + "\n")
+                  return 2
+              if target.is_dir():
+                  return prepare(target)
+              if not target.is_file():
+                  print("::error::" + str(target) + " is missing")
+                  return 1
+              name = label or target.name
+              try:
+                  image = load(
+                      target.read_bytes(),
+                      name,
+                      max_width=max_width,
+                      max_height=max_height,
+                      max_bytes=max_bytes,
+                      require_square=require_square,
+                  )
+              except PngError as exc:
+                  print("::error::" + str(exc))
+                  return 1
+              print(
+                  name + " verified: structurally complete and decodable "
+                  + str(image.width) + "x" + str(image.height)
+              )
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv[1:]))
+          PY
+          chmod 700 "$validator"
+
+          # Destination-pinned downloader for the provider-supplied branding images.
+          # This job has permissions: {} and no checkout, so like the validator this
+          # helper is written from the workflow and used from RUNNER_TEMP. The prepare
+          # step is the only branding fetch boundary; both consumer jobs read the
+          # verified files from the one branding artifact and never fetch a URL.
+          # Address pinning applies to the connections this helper makes: http.client
+          # and the pinned sockets do not consult http_proxy/https_proxy/ALL_PROXY.
+          # Migration caution -- proxy-aware tooling would connect to the proxy
+          # instead of the validated address and bypass the policy (recorded in the
+          # helper docstring too).
+          fetcher="${RUNNER_TEMP}/fetch_branding_image.py"
+          cat > "$fetcher" <<'PY'
+          #!/usr/bin/env python3
+          """Destination-pinned, bounded HTTP(S) fetcher for DeskForge branding images.
+
+          This module is the fetch boundary for the provider-supplied branding image URLs
+          (``app_icon_url`` / ``app_logo_url`` / ``privacy_screen_url``).  A provider URL
+          and any address it redirects to are untrusted input, so a check of the URL
+          string is not enough: the runner must never open a connection to a loopback,
+          private, link-local or otherwise non-public destination.
+
+          The invariant enforced here is that *every* connection this fetcher makes --
+          the initial request and every redirect hop -- uses only a validated public
+          destination (for IPv6, inside a prefix the IANA Global Unicast Address
+          Assignments registry currently lists as ALLOCATED and outside every range
+          those registries mark reserved or not globally reachable; for IPv4, outside
+          the special-purpose ranges).  For each hop the hostname is
+          resolved exactly once, every
+          resolved address is checked against the address policy, and the connection is
+          then made to a validated address rather than to the hostname.  Nothing can
+          re-resolve between the check and the connect, and a hop whose resolution
+          contains any non-public address is refused in full before any connection is
+          attempted (fail closed).  TLS still protects the URL hostname: the handshake
+          uses the hostname for SNI and certificate verification (``server_hostname``)
+          while the TCP connection goes to the validated address.
+
+          Each hop's hostname is canonicalized once at that boundary: exactly one
+          terminal root dot (the DNS root label) is removed, and the resolution, the
+          ``Host`` header and the TLS ``server_hostname`` are all derived from that one
+          canonical name.  Python/OpenSSL does not strip the root dot when it matches a
+          handshake hostname against a certificate, so without canonicalization
+          ``example.com.`` would fail verification against a certificate for
+          ``example.com`` while a TLS stack that does strip it would accept the same
+          hop -- the outcome must not depend on the stack.  A host with any other empty
+          label (a second trailing dot included) is refused before resolution.
+
+          Preserved behaviour, matching the curl pipeline this replaces:
+
+            * http(s) only, for the initial URL and for every redirect target;
+            * the per-field byte cap is bound *during* transfer: the body is read in
+              ``FETCH_CHUNK`` (64 KiB) pieces and the transfer is aborted as soon as the
+              total received exceeds ``cap``, independent of HTTP Content-Length (chunked
+              bodies included) and of the runner's curl version.  At most ``cap + 64 KiB``
+              bytes are received before the abort, an oversized body is never renamed to
+              the output path, and no output file is produced on failure;
+            * ``--retry 2 --retry-delay 2``: up to two retries two seconds apart for the
+              failures curl retries as transient (a timeout, or an HTTP 408/429/500/
+              502/503/504 response);
+            * ``--max-time 120``: each attempt is bounded by a wall-clock deadline that
+              covers its resolution, its connection, its TLS handshake and every redirect
+              hop of that attempt.  The deadline is re-checked between operations, the
+              socket timeout is re-armed from the remaining budget immediately before the
+              handshake, and a watchdog shuts down the attempt's live socket when the
+              deadline expires, so a peer that delivers a byte inside every read timeout --
+              during the status line, the headers, an interim 1xx response, the handshake or
+              the body -- cannot extend the attempt past the bound;
+            * the download is written to ``<out>.part`` and renamed to ``<out>`` only
+              after it was received completely within the cap, so any failure leaves no
+              output file behind, and the framing is verified before the rename: a body
+              shorter than its declared Content-Length, or a chunked body that never
+              reaches its terminating chunk, is a failed fetch.
+
+          A resolver call that blocks below Python (for example a hung ``getaddrinfo``)
+          cannot be interrupted: the thread running it can only be abandoned, and the
+          retry loop stays bounded as it is, so at most one abandoned daemon thread per
+          attempt lives on until the process exits.  The attempt itself never waits past
+          its budget for that case: the lookup is joined with the attempt's *current*
+          remaining time and a lookup that misses it fails the hop as the same retryable
+          timeout a stalled socket produces.  The workflow shell wrapper still runs the
+          whole helper under a process-level ``timeout`` as the outermost backstop and
+          prints the same deterministic per-field ``::error::`` itself on that timeout
+          path (GNU ``timeout`` exit status 124, or 137 when the kill-after signal was
+          needed), which also keeps a normal helper failure from being reported twice.
+
+          Reviewer assumption recorded here: address pinning applies to the connections
+          this helper makes.  ``http.client`` and the pinned sockets never consult
+          ``http_proxy`` / ``https_proxy`` / ``ALL_PROXY``, so the environment cannot
+          redirect the connection today.  This is a migration caution, not current
+          behaviour: proxy-aware tooling (or any replacement that lets a proxy negotiate
+          the connection) would connect to the proxy instead of the validated address,
+          the proxy would resolve and reach the destination, and the policy below would
+          no longer bound the address actually connected to.  The GitHub-hosted prepare
+          job configures no environment proxy; revisit this if the fetch ever becomes
+          proxy-aware.
+
+          Command line:  fetch_branding_image.py FIELD URL OUT CAP
+          Failures print a deterministic ``::error::FIELD ...`` annotation on stdout and
+          exit non-zero.  Error text never contains the URL or its query string (a
+          provider URL may be signed); it names the field and, at most, the host.
+          """
+
+          from __future__ import annotations
+
+          import base64
+          import http.client
+          import ipaddress
+          import os
+          import socket
+          import ssl
+          import sys
+          import threading
+          import time
+          from urllib.parse import urljoin, urlsplit
+
+          FETCH_MAX_TIME = 120.0
+          FETCH_RETRIES = 2
+          FETCH_RETRY_DELAY = 2.0
+          FETCH_MAX_REDIRECTS = 50
+          FETCH_CHUNK = 64 * 1024
+          _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+          _RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+          # The one authoritative destination policy for this contract.  The IPv4 and
+          # IPv6 halves have different shapes:
+          #
+          #   * IPv4: the entries are the non-public special-purpose ranges, and their
+          #     complement is the ordinary IPv4 unicast space a fetch target lives in,
+          #     so no additional bound is needed.
+          #   * IPv6: the complement of a deny list is *not* public space.  The
+          #     assignable global-unicast space is 2000::/3 ([A]), and [C]'s registry
+          #     note reserves everything inside that block that has no ALLOCATED row
+          #     "for future allocation", so the gaps between the ALLOCATED rows are
+          #     reserved, not public.  A literal IPv6 address is therefore public only
+          #     when it falls inside an [C] row currently marked ALLOCATED
+          #     (_IPV6_ALLOCATED_PREFIXES below) and is not refused by the
+          #     special-purpose overlay (_NON_PUBLIC_NETWORKS).  Everything else --
+          #     every unlisted gap, every RESERVED row and everything outside 2000::/3
+          #     -- is refused.  This is deliberately not `is_global`, whose accepted
+          #     set is wider than the space the registries allocate for routing.
+          #
+          #     Maintenance property, fail-closed: _IPV6_ALLOCATED_PREFIXES is a
+          #     snapshot, not a live query.  A block IANA allocates after the snapshot
+          #     stays refused until the table below is refreshed; the policy never
+          #     admits a literal merely because it is inside 2000::/3 or not (yet)
+          #     listed as reserved.
+          #
+          # Registry sources, retrieved 2026-10-14:
+          #
+          #   [A] IANA IPv6 Address Space registry (last updated 2025-10-23): 2000::/3
+          #       is Global Unicast and IANA unicast assignments are limited to it;
+          #       400::/6, 800::/5, 1000::/4, 6000::/3, fe00::/9 and fec0::/10 are
+          #       Reserved by IETF.
+          #   [B] IANA IPv6 Special-Purpose Address Registry (last updated 2025-10-09).
+          #   [C] IANA IPv6 Global Unicast Address Assignments (last updated 2025-10-10),
+          #       CSV at https://www.iana.org/assignments/ipv6-unicast-address-assignments/
+          #       ipv6-unicast-address-assignments.csv: every row marked ALLOCATED is in
+          #       _IPV6_ALLOCATED_PREFIXES.  3ffe::/16 is RESERVED (the returned 6bone
+          #       allocation, RFC 5156) and the IANA-RESERVED tail 2d00::/8 .. 3ffc::/15
+          #       is RESERVED too, so neither is in the allow list.
+          #
+          # The 2001::/23 row needs care: [C] marks it ALLOCATED to IANA only
+          # partially, and [B] marks it Globally Reachable False "unless allowed by a
+          # more specific allocation", listing six reachable sub-blocks.  The parent is
+          # therefore *not* re-admitted as a whole: only those six more-specifics are
+          # in the allow list.  The non-reachable sub-blocks stay refused on top of the
+          # allow list -- 2001::/32 (Teredo, Globally Reachable "N/A"), 2001:2::/48
+          # (benchmarking), 2001:10::/28 (deprecated ORCHID, allocation terminated
+          # 2014-03) and 2001:20::/28 (ORCHIDv2, listed Globally Reachable True but
+          # non-routable at the IP layer by design, RFC 7343 section 1.2) -- as does
+          # 2001:db8::/32 (documentation), which falls inside the 2001:c00::/23
+          # ALLOCATED row.
+          #
+          # Transition/deprecated forms that embed an IPv4 destination -- ::/96
+          # (IPv4-compatible), 64:ff9b::/96 and 64:ff9b:1::/48 (NAT64), 2002::/16 (6to4),
+          # and ::ffff:0:0/96 (IPv4-mapped, unmapped in is_public_address before
+          # classification) -- stay refused on purpose even where [B]'s Globally
+          # Reachable column is True or "N/A": this literal policy cannot verify the
+          # embedded IPv4 destination, so it fails closed.
+          #
+          # A hop is refused when any address it resolves to falls outside 2000::/3,
+          # outside every ALLOCATED prefix above, or in any range below.  This policy is
+          # not an exhaustive implementation of Internet routing.
+          _IPV6_GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
+
+          # [C] Global Unicast Address Assignments rows currently marked ALLOCATED
+          # (retrieved 2026-10-14), the allow list is_public_address requires.  The
+          # 2001::/23 parent row is deliberately not listed as a whole: it is only
+          # partially allocated, so the six Globally Reachable more-specifics [B]
+          # lists under it stand in for its reachable part.  2002::/16 is the
+          # ALLOCATED 6to4 row and is refused by the special-purpose overlay.
+          _IPV6_ALLOCATED_PREFIXES = (
+              # [B] sub-blocks inside 2001::/23 listed as Globally Reachable.
+              ipaddress.ip_network("2001:1::1/128"),    # Port Control Protocol anycast
+              ipaddress.ip_network("2001:1::2/128"),    # TURN anycast
+              ipaddress.ip_network("2001:1::3/128"),    # DNS-SD SDP anycast
+              ipaddress.ip_network("2001:3::/32"),      # AMT
+              ipaddress.ip_network("2001:4:112::/48"),  # AS112-v6
+              ipaddress.ip_network("2001:30::/28"),     # Drone Remote ID DET prefix
+              # Remaining [C] ALLOCATED rows, in registry order.
+              ipaddress.ip_network("2001:200::/23"),
+              ipaddress.ip_network("2001:400::/23"),
+              ipaddress.ip_network("2001:600::/23"),
+              ipaddress.ip_network("2001:800::/22"),
+              ipaddress.ip_network("2001:c00::/23"),
+              ipaddress.ip_network("2001:e00::/23"),
+              ipaddress.ip_network("2001:1200::/23"),
+              ipaddress.ip_network("2001:1400::/22"),
+              ipaddress.ip_network("2001:1800::/23"),
+              ipaddress.ip_network("2001:1a00::/23"),
+              ipaddress.ip_network("2001:1c00::/22"),
+              ipaddress.ip_network("2001:2000::/19"),
+              ipaddress.ip_network("2001:4000::/23"),
+              ipaddress.ip_network("2001:4200::/23"),
+              ipaddress.ip_network("2001:4400::/23"),
+              ipaddress.ip_network("2001:4600::/23"),
+              ipaddress.ip_network("2001:4800::/23"),
+              ipaddress.ip_network("2001:4a00::/23"),
+              ipaddress.ip_network("2001:4c00::/23"),
+              ipaddress.ip_network("2001:5000::/20"),
+              ipaddress.ip_network("2001:8000::/19"),
+              ipaddress.ip_network("2001:a000::/20"),
+              ipaddress.ip_network("2001:b000::/20"),
+              ipaddress.ip_network("2002::/16"),        # 6to4; denied by the overlay
+              ipaddress.ip_network("2003::/18"),
+              ipaddress.ip_network("2400::/12"),
+              ipaddress.ip_network("2410::/12"),
+              ipaddress.ip_network("2600::/12"),
+              ipaddress.ip_network("2610::/23"),
+              ipaddress.ip_network("2620::/23"),
+              ipaddress.ip_network("2630::/12"),
+              ipaddress.ip_network("2800::/12"),
+              ipaddress.ip_network("2a00::/12"),
+              ipaddress.ip_network("2a10::/12"),
+              ipaddress.ip_network("2c00::/12"),
+          )
+
+          _NON_PUBLIC_NETWORKS = (
+              # IPv4 (complement: the ordinary unicast space).
+              ipaddress.ip_network("0.0.0.0/8"),
+              ipaddress.ip_network("127.0.0.0/8"),
+              ipaddress.ip_network("10.0.0.0/8"),
+              ipaddress.ip_network("172.16.0.0/12"),
+              ipaddress.ip_network("192.168.0.0/16"),
+              ipaddress.ip_network("169.254.0.0/16"),
+              ipaddress.ip_network("100.64.0.0/10"),
+              ipaddress.ip_network("192.0.0.0/24"),
+              ipaddress.ip_network("192.0.2.0/24"),
+              ipaddress.ip_network("198.18.0.0/15"),
+              ipaddress.ip_network("198.51.100.0/24"),
+              ipaddress.ip_network("203.0.113.0/24"),
+              ipaddress.ip_network("192.88.99.0/24"),
+              ipaddress.ip_network("224.0.0.0/4"),
+              ipaddress.ip_network("240.0.0.0/4"),
+              # IPv6, inside 2000::/3 ([B] and [C]).  The ALLOCATED allow list above
+              # already refuses every RESERVED row and every unlisted gap; the entries
+              # here are the special-purpose forms that stay refused on top of it, plus
+              # the [C] RESERVED rows repeated as a second line of defence.
+              ipaddress.ip_network("2001::/32"),        # Teredo ([B] Globally Reachable N/A)
+              ipaddress.ip_network("2001:2::/48"),      # Benchmarking
+              ipaddress.ip_network("2001:10::/28"),     # Deprecated ORCHID (terminated 2014-03)
+              ipaddress.ip_network("2001:20::/28"),     # ORCHIDv2 (non-routable by design)
+              ipaddress.ip_network("2001:db8::/32"),    # Documentation
+              ipaddress.ip_network("2002::/16"),        # 6to4 transition form
+              ipaddress.ip_network("3ffe::/16"),        # returned 6bone allocation
+              ipaddress.ip_network("3fff::/20"),        # Documentation (RFC 9637)
+              ipaddress.ip_network("2d00::/8"),         # [C] IANA-RESERVED tail,
+              ipaddress.ip_network("2e00::/7"),         #     not yet allocated
+              ipaddress.ip_network("3000::/5"),
+              ipaddress.ip_network("3800::/6"),
+              ipaddress.ip_network("3c00::/7"),
+              ipaddress.ip_network("3e00::/8"),
+              ipaddress.ip_network("3f00::/9"),
+              ipaddress.ip_network("3f80::/10"),
+              ipaddress.ip_network("3fc0::/11"),
+              ipaddress.ip_network("3fe0::/12"),
+              ipaddress.ip_network("3ff0::/13"),
+              ipaddress.ip_network("3ff8::/14"),
+              ipaddress.ip_network("3ffc::/15"),
+              # IPv6 outside 2000::/3, kept as explicit transition/deprecated
+              # refusals; the bound already refuses them.
+              ipaddress.ip_network("::/128"),
+              ipaddress.ip_network("::1/128"),
+              # Deprecated IPv4-compatible form (RFC 4291, section 2.5.5.1): not a
+              # routable public IPv6 destination, and it embeds an IPv4 destination
+              # this literal policy cannot verify.
+              ipaddress.ip_network("::/96"),
+              ipaddress.ip_network("fe80::/10"),
+              ipaddress.ip_network("fc00::/7"),
+              ipaddress.ip_network("ff00::/8"),
+              ipaddress.ip_network("100::/64"),
+              ipaddress.ip_network("100:0:0:1::/64"),  # Dummy IPv6 Prefix (RFC 9780)
+              ipaddress.ip_network("64:ff9b::/96"),
+              ipaddress.ip_network("64:ff9b:1::/48"),
+              ipaddress.ip_network("5f00::/16"),  # Segment Routing (SRv6) SIDs (RFC 9602)
+          )
+
+
+          class FetchError(Exception):
+              """A refused or failed fetch; str() is the deterministic error text."""
+
+
+          class _Abort(Exception):
+              """Internal: ends one attempt; retryable marks curl-transient failures."""
+
+              def __init__(self, message=None, retryable=False):
+                  super().__init__(message or "")
+                  self.message = message
+                  self.retryable = retryable
+
+
+          def is_public_address(address):
+              """True when ``address`` is a public destination inside the policy.
+
+              ``address`` may be a string or an ipaddress address object.  IPv4-mapped
+              IPv6 addresses are unmapped first and classified as their IPv4 address, so
+              ``::ffff:127.0.0.1`` is refused exactly like ``127.0.0.1``.  For IPv6 the
+              deny list alone is not the policy: a literal is public only when it falls
+              inside an ALLOCATED row of the IANA Global Unicast Address Assignments
+              registry and is not refused by the special-purpose overlay, so anything
+              outside 2000::/3 or inside a registry-reserved or unlisted gap is refused
+              even though it is not listed below.
+              """
+              candidate = address
+              if not isinstance(candidate, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+                  candidate = ipaddress.ip_address(candidate)
+              if isinstance(candidate, ipaddress.IPv6Address) and candidate.ipv4_mapped is not None:
+                  candidate = candidate.ipv4_mapped
+              if isinstance(candidate, ipaddress.IPv6Address):
+                  if candidate not in _IPV6_GLOBAL_UNICAST:
+                      return False
+                  if not any(candidate in network for network in _IPV6_ALLOCATED_PREFIXES):
+                      return False
+              return not any(candidate in network for network in _NON_PUBLIC_NETWORKS)
+
+
+          def _failure_message(field, cap):
+              # The exact message the curl pipeline printed for a failed fetch, kept so
+              # downstream expectations do not change.
+              return (
+                  field
+                  + " image fetch failed from the provider URL (absolute http(s) URL required; "
+                  + "the runner cannot fetch relative URLs; the response must stay within the "
+                  + str(cap)
+                  + "-byte cap)"
+              )
+
+
+          def _cap_message(field, cap):
+              return field + " image exceeds the per-field byte cap (" + str(cap) + " bytes)"
+
+
+          def _refused_message(field, detail):
+              return field + " image fetch refused: " + detail
+
+
+          def _remove(path):
+              try:
+                  os.remove(path)
+              except OSError:
+                  pass
+
+
+          class _AttemptDeadline:
+              """Wall-clock bound for one attempt, enforced across blocking socket I/O.
+
+              The named deadline checks alone cannot bound an attempt: one blocking socket
+              read cannot be interrupted by them, and the socket timeout is only a
+              *per-read* timeout, so a peer that delivers a byte inside every timeout
+              window (during the status line, the headers, an interim 1xx response or the
+              body) can keep one hop alive past any number of named checks.  The watchdog
+              closes that gap: it fires once at the deadline and shuts down the socket the
+              attempt is currently using, so a blocked read or write fails immediately
+              instead of waiting for the next check.  A resolver call that blocks below
+              Python (for example a hung ``getaddrinfo``) cannot be interrupted this way
+              either; ``_resolve`` bounds that phase by joining a daemon resolver thread
+              with the current remaining budget and abandoning the thread (which cannot
+              be killed and lives until the process exits), while the shell wrapper's
+              process-level ``timeout`` remains the outermost backstop.
+              """
+
+              def __init__(self, max_time):
+                  self._deadline = time.monotonic() + max_time
+                  self._socket = None
+                  self._fired = False
+                  self._lock = threading.Lock()
+                  timer = threading.Timer(max(0.0, max_time), self._expire)
+                  timer.daemon = True
+                  self._timer = timer
+                  timer.start()
+
+              def _expire(self):
+                  with self._lock:
+                      self._fired = True
+                      sock = self._socket
+                  if sock is not None:
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+
+              def remaining(self):
+                  return self._deadline - time.monotonic()
+
+              def expired(self):
+                  return self._fired or self.remaining() <= 0
+
+              def check(self):
+                  if self.expired():
+                      raise _Abort(retryable=True)
+
+              def hold(self, sock):
+                  """Register the attempt's live socket so the watchdog can end it."""
+                  with self._lock:
+                      self._socket = sock
+                      fired = self._fired
+                  if fired:
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+
+              def cancel(self):
+                  self._timer.cancel()
+                  with self._lock:
+                      self._socket = None
+
+
+          def _parse_hop(url, field):
+              """Parse one hop URL; refuse anything that is not a safe absolute http(s) URL."""
+              try:
+                  parsed = urlsplit(url)
+                  port = parsed.port  # raises ValueError for a malformed or out-of-range port
+                  host = parsed.hostname
+              except ValueError as exc:
+                  raise _Abort(
+                      message=_refused_message(field, "provider URL is not a usable absolute http(s) URL")
+                  ) from exc
+              if parsed.scheme not in ("http", "https") or not host:
+                  raise _Abort(message=_refused_message(field, "only absolute http(s) URLs are fetched"))
+              if port is not None and not 1 <= port <= 65535:
+                  # Mirror the producer's port rule instead of retargeting the hop: a
+                  # present port outside 1..65535 (including 0, however the digits are
+                  # spelled) makes the URL unusable.  Substituting the scheme default
+                  # would fetch a different port than the URL names while the Host
+                  # header still carried the provider's port.
+                  raise _Abort(
+                      message=_refused_message(field, "provider URL is not a usable absolute http(s) URL")
+                  )
+              target = parsed.path or "/"
+              if parsed.query:
+                  target += "?" + parsed.query
+              # Guard the request line and Host header against raw control characters or
+              # spaces; valid URLs encode those, malformed redirects must not be forwarded.
+              for value in (host, target):
+                  if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+                      raise _Abort(
+                          message=_refused_message(field, "provider URL is not a usable absolute http(s) URL")
+                      )
+              # Fail fast on the two inputs this fetcher cannot put on the wire: http.client
+              # encodes the request line and header values as ASCII (and the host as IDNA),
+              # so a raw non-ASCII byte in the host or in the request target only fails deep
+              # inside the stack, and a host with an empty DNS label only fails inside the
+              # resolver.  Only the field and, at most, the host are reported -- never the
+              # URL, the path or the query (a provider URL may be signed).
+              if any(ord(character) > 0x7F for character in host):
+                  raise _Abort(
+                      message=_refused_message(
+                          field, host + " is not an ASCII host name the fetcher can send"
+                      )
+                  )
+              if any(ord(character) > 0x7F for character in target):
+                  raise _Abort(
+                      message=_refused_message(
+                          field, host + " request target is not ASCII"
+                      )
+                  )
+              labels = host.split(".")
+              if labels and not labels[-1]:
+                  # A single trailing dot is the DNS root label; any other empty label
+                  # (including a second trailing dot) is not a host name.  Canonicalize
+                  # exactly that one terminal root dot away once the name is known to be
+                  # usable: the resolution, the Host header and the TLS server_hostname
+                  # must all use the same canonical name.  Python/OpenSSL does not strip
+                  # the root dot when it matches a handshake hostname against a
+                  # certificate (a certificate for "example.com" fails verification for
+                  # "example.com."), while some other TLS stacks do, so leaving it in
+                  # would make the outcome depend on the stack.
+                  labels = labels[:-1]
+                  if labels and all(labels):
+                      host = host[:-1]
+              if not labels or any(label == "" for label in labels):
+                  raise _Abort(
+                      message=_refused_message(
+                          field, host + " is not a usable DNS host name (empty label)"
+                      )
+                  )
+              return parsed, host, target
+
+
+          def _resolve(host, port, allow_address, field, watchdog):
+              """Resolve ``host`` once, bounded by the attempt's current budget.
+
+              The lookup runs on a daemon thread because a resolver call that blocks
+              below Python cannot be interrupted or killed in-process.  The attempt
+              joins that thread only for its *current* remaining budget: a lookup that
+              misses the budget fails the hop as the same retryable timeout a stalled
+              socket produces, and the abandoned thread -- which cannot be killed --
+              lives on until the process exits (the retry loop is unchanged, so at most
+              one abandoned thread per bounded attempt).  The shell wrapper's
+              process-level ``timeout`` stays the outermost backstop.
+
+              Raises before any connection when the resolution contains any address the
+              policy refuses, so a refused hop is never contacted at all.
+              """
+              outcome = {}
+
+              def _lookup():
+                  try:
+                      outcome["infos"] = socket.getaddrinfo(
+                          host, port, type=socket.SOCK_STREAM
+                      )
+                  except BaseException as exc:  # re-raised on the attempt thread
+                      outcome["error"] = exc
+
+              worker = threading.Thread(target=_lookup, daemon=True)
+              worker.start()
+              worker.join(max(0.0, watchdog.remaining()))
+              if worker.is_alive():
+                  raise _Abort(retryable=True)
+              if "error" in outcome:
+                  error = outcome["error"]
+                  if isinstance(error, socket.gaierror):
+                      raise _Abort() from error
+                  raise error
+              infos = outcome["infos"]
+              addresses = []
+              seen = set()
+              try:
+                  for _family, _type, _proto, _canonname, sockaddr in infos:
+                      address = ipaddress.ip_address(sockaddr[0])
+                      if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+                          address = address.ipv4_mapped
+                      if not allow_address(address):
+                          raise _Abort(
+                              message=_refused_message(
+                                  field,
+                                  host
+                                  + " resolves to a non-public address; the runner only connects "
+                                  + "to validated public destinations",
+                              )
+                          )
+                      key = str(address)
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      if address.version == 4:
+                          addresses.append((socket.AF_INET, (key, sockaddr[1])))
+                      else:
+                          addresses.append((socket.AF_INET6, (key, sockaddr[1], 0, 0)))
+              except ValueError as exc:
+                  raise _Abort() from exc
+              if not addresses:
+                  raise _Abort()
+              return addresses
+
+
+          def _connect_pinned(addresses, watchdog):
+              """Connect to the first validated address that accepts a connection.
+
+              ``addresses`` contains only addresses that already passed the policy, so
+              the destination actually connected to is exactly a validated destination.
+              """
+              timed_out = False
+              for family, sockaddr in addresses:
+                  remaining = watchdog.remaining()
+                  if remaining <= 0:
+                      timed_out = True
+                      break
+                  try:
+                      sock = socket.socket(family, socket.SOCK_STREAM)
+                  except OSError:
+                      continue
+                  try:
+                      sock.settimeout(remaining)
+                      sock.connect(sockaddr)
+                  except TimeoutError:
+                      timed_out = True
+                      sock.close()
+                      continue
+                  except OSError:
+                      sock.close()
+                      continue
+                  return sock
+              raise _Abort(retryable=timed_out)
+
+
+          class _PinnedHTTPConnection(http.client.HTTPConnection):
+              """HTTPConnection whose TCP connection goes to a pre-validated address."""
+
+              def __init__(self, host, port, addresses, watchdog):
+                  super().__init__(host, port, timeout=None)
+                  self._pinned_addresses = addresses
+                  self._watchdog = watchdog
+
+              def connect(self):
+                  self.sock = _connect_pinned(self._pinned_addresses, self._watchdog)
+                  self._watchdog.hold(self.sock)
+
+
+          class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+              """HTTPSConnection pinned to a validated address; TLS keeps the URL hostname."""
+
+              def __init__(self, host, port, addresses, watchdog, context):
+                  super().__init__(host, port, timeout=None, context=context)
+                  self._pinned_addresses = addresses
+                  self._watchdog = watchdog
+                  self._pinned_context = context
+
+              def connect(self):
+                  sock = _connect_pinned(self._pinned_addresses, self._watchdog)
+                  try:
+                      # SNI and certificate verification use the URL hostname while the TCP
+                      # connection uses the validated address.  The blocking handshake is
+                      # deferred: wrap_socket detaches the raw socket's descriptor into the
+                      # SSLSocket, so only the SSLSocket has a live handle the attempt
+                      # watchdog can shut down during the whole handshake.
+                      self.sock = self._pinned_context.wrap_socket(
+                          sock, server_hostname=self.host, do_handshake_on_connect=False
+                      )
+                  except BaseException:
+                      sock.close()
+                      raise
+                  try:
+                      # Register the wrapped socket with the watchdog before the handshake
+                      # begins, so a stalled handshake is ended at the attempt deadline, and
+                      # re-arm the timeout from the *current* remaining budget: the TCP
+                      # connect may have consumed most of it, and the pre-connect timeout
+                      # would otherwise bound the handshake well past that deadline.
+                      self._watchdog.hold(self.sock)
+                      self.sock.settimeout(max(0.001, self._watchdog.remaining()))
+                      self.sock.do_handshake()
+                  except BaseException:
+                      self.sock.close()
+                      raise
+                  # Re-register the wrapped socket: it stays held for the response and body.
+                  self._watchdog.hold(self.sock)
+
+
+          def _open(parsed, host, target, port, addresses, watchdog, field, cap):
+              """Open the pinned connection and send the GET; returns (connection, response)."""
+              if parsed.scheme == "https":
+                  conn = _PinnedHTTPSConnection(
+                      host, port, addresses, watchdog, ssl.create_default_context()
+                  )
+              else:
+                  conn = _PinnedHTTPConnection(host, port, addresses, watchdog)
+              display_host = "[" + host + "]" if ":" in host else host
+              if parsed.port is not None:
+                  display_host += ":" + str(parsed.port)
+              headers = {
+                  "Host": display_host,
+                  # The replaced pipeline fetched with the runner's curl; keep its request
+                  # identity so providers that key on the User-Agent are unaffected.
+                  "User-Agent": "curl/7.81.0",
+                  "Accept": "*/*",
+                  "Connection": "close",
+              }
+              if parsed.username is not None or parsed.password is not None:
+                  credentials = (parsed.username or "") + ":" + (parsed.password or "")
+                  headers["Authorization"] = "Basic " + base64.b64encode(
+                      credentials.encode("utf-8")
+                  ).decode("ascii")
+              try:
+                  conn.request("GET", target, headers=headers)
+                  response = conn.getresponse()
+              except _Abort:
+                  conn.close()
+                  raise
+              except TimeoutError as exc:
+                  conn.close()
+                  raise _Abort(retryable=True) from exc
+              except (OSError, http.client.HTTPException) as exc:
+                  conn.close()
+                  if watchdog.expired():
+                      # The watchdog ended the hop at the attempt deadline; its socket
+                      # shutdown surfaces as EOF or a stream error, not as TimeoutError.
+                      raise _Abort(retryable=True) from exc
+                  raise _Abort(message=_failure_message(field, cap)) from exc
+              return conn, response
+
+
+          def _download(response, conn, out_path, cap, watchdog, field):
+              """Stream the body to ``<out>.part`` with the cap bound during transfer."""
+              part = out_path + ".part"
+              _remove(part)
+              total = 0
+              try:
+                  with open(part, "wb") as handle:
+                      while True:
+                          watchdog.check()
+                          if conn.sock is not None:
+                              try:
+                                  conn.sock.settimeout(max(0.001, watchdog.remaining()))
+                              except OSError:
+                                  pass
+                          try:
+                              piece = response.read1(FETCH_CHUNK)
+                          except TimeoutError as exc:
+                              raise _Abort(retryable=True) from exc
+                          except (OSError, http.client.HTTPException) as exc:
+                              if watchdog.expired():
+                                  raise _Abort(retryable=True) from exc
+                              raise _Abort(message=_failure_message(field, cap)) from exc
+                          if not piece:
+                              break
+                          try:
+                              handle.write(piece)
+                          except OSError as exc:
+                              raise _Abort(message=_failure_message(field, cap)) from exc
+                          total += len(piece)
+                          # Bound during transfer: the body is read in FETCH_CHUNK pieces and
+                          # the transfer is aborted as soon as the total received exceeds the
+                          # cap, so an oversized body is refused without relying on
+                          # Content-Length and before it is renamed to the output path.  At
+                          # most cap + FETCH_CHUNK bytes are ever received.
+                          if total > cap:
+                              raise _Abort(message=_cap_message(field, cap))
+                  if watchdog.expired():
+                      # The watchdog ended the transfer at the attempt deadline; its socket
+                      # shutdown can look like a clean short EOF, so the bytes received so
+                      # far are not a complete response.
+                      raise _Abort(retryable=True)
+                  # Verify the framing before the rename: a body that ended early is a
+                  # failed fetch, not a short file.
+                  if response.length:
+                      # A declared length that was not fully received.
+                      raise _Abort(message=_failure_message(field, cap))
+                  if response.chunked and response.chunk_left is not None:
+                      # A chunked body that never reached its terminating chunk.
+                      raise _Abort(message=_failure_message(field, cap))
+              except BaseException:
+                  _remove(part)
+                  raise
+              os.replace(part, out_path)
+              return total
+
+
+          def _fetch_attempt(field, url, out_path, cap, *, allow_address, max_time, max_redirects):
+              watchdog = _AttemptDeadline(max_time)
+              try:
+                  current = url
+                  redirects = 0
+                  while True:
+                      parsed, host, target = _parse_hop(current, field)
+                      # An already-expired attempt fails before a resolver thread is
+                      # started for a hop it can no longer fetch.
+                      watchdog.check()
+                      port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                      addresses = _resolve(host, port, allow_address, field, watchdog)
+                      watchdog.check()
+                      conn, response = _open(
+                          parsed, host, target, port, addresses, watchdog, field, cap
+                      )
+                      try:
+                          if response.status in _REDIRECT_STATUSES:
+                              location = response.getheader("Location")
+                              if not location:
+                                  raise _Abort(message=_failure_message(field, cap))
+                              redirects += 1
+                              if redirects > max_redirects:
+                                  raise _Abort(
+                                      message=_refused_message(
+                                          field,
+                                          "more than "
+                                          + str(max_redirects)
+                                          + " redirects from "
+                                          + host,
+                                      )
+                                  )
+                              # Resolve the next hop against the current URL and repeat the
+                              # scheme check and the address policy on that hop.
+                              current = urljoin(current, location)
+                              continue
+                          if response.status in _RETRYABLE_STATUSES:
+                              raise _Abort(retryable=True)
+                          if not 200 <= response.status < 300:
+                              raise _Abort(message=_failure_message(field, cap))
+                          return _download(response, conn, out_path, cap, watchdog, field)
+                      finally:
+                          conn.close()
+              finally:
+                  watchdog.cancel()
+
+
+          def fetch_branding_image(
+              field,
+              url,
+              out_path,
+              cap,
+              *,
+              allow_address=is_public_address,
+              max_time=FETCH_MAX_TIME,
+              retries=FETCH_RETRIES,
+              retry_delay=FETCH_RETRY_DELAY,
+              max_redirects=FETCH_MAX_REDIRECTS,
+          ):
+              """Fetch ``url`` to ``out_path`` with destination pinning and a transfer cap.
+
+              ``allow_address`` is the address-policy seam: it receives every resolved
+              address (an ipaddress object, already IPv4-unmapped) and returns True only
+              for destinations the caller accepts.  It defaults to the production
+              ``is_public_address`` policy; tests inject a policy that additionally
+              permits exactly one local fixture address and defers every other address to
+              the production policy.
+
+              Returns the number of bytes written.  Raises FetchError (deterministic
+              message, never the URL) on any refusal or failure; no output or partial
+              file is left behind.
+              """
+              out_path = os.fspath(out_path)
+              if url == "":
+                  # An absent URL is a no-op, exactly as the shell guard treats it.
+                  return 0
+              attempt = 0
+              while True:
+                  try:
+                      return _fetch_attempt(
+                          field,
+                          url,
+                          out_path,
+                          cap,
+                          allow_address=allow_address,
+                          max_time=max_time,
+                          max_redirects=max_redirects,
+                      )
+                  except _Abort as abort:
+                      if abort.retryable and attempt < retries:
+                          attempt += 1
+                          time.sleep(retry_delay)
+                          continue
+                      raise FetchError(abort.message or _failure_message(field, cap)) from None
+
+
+          def main(argv):
+              if len(argv) != 4:
+                  print("::error::fetch_branding_image.py requires FIELD URL OUT CAP", flush=True)
+                  return 2
+              field, url, out_path, raw_cap = argv
+              try:
+                  cap = int(raw_cap)
+              except ValueError:
+                  print(
+                      "::error::"
+                      + field
+                      + " image fetch configuration error: the byte cap is not an integer",
+                      flush=True,
+                  )
+                  return 2
+              try:
+                  fetch_branding_image(field, url, out_path, cap)
+              except FetchError as exc:
+                  print("::error::" + str(exc), flush=True)
+                  return 1
+              except Exception:
+                  # Unexpected internal failure: keep the deterministic field-only message
+                  # and never print a traceback that could contain the URL.
+                  print("::error::" + _failure_message(field, cap), flush=True)
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv[1:]))
+          PY
+          chmod 700 "$fetcher"
+
+          # Per-field caps (DeskForge #80) and destination pinning. Every image is
+          # downloaded by the workflow-owned fetch_branding_image.py helper written
+          # above, which bounds the transfer during download: the body is read in
+          # 64 KiB pieces and the fetch aborts as soon as the total exceeds the cap,
+          # so an oversized body is refused at fetch and never reaches the manifest
+          # or any downstream consumer. That bound does not rely on HTTP
+          # Content-Length, and it no longer depends on the runner's curl version
+          # (curl --max-filesize only aborts an unknown-length body from curl 8.4.0
+          # on, while the ubuntu-22.04 runner ships curl 7.81.0). The same helper
+          # enforces the destination invariant: every connection it makes -- the
+          # initial request and every redirect hop -- repeats the http(s) scheme
+          # check and the non-public address policy, and connects to the validated
+          # address rather than to the hostname, so neither a provider URL nor a
+          # provider-controlled redirect can send the runner to a loopback, private,
+          # link-local or otherwise non-public destination.
+          fetch_branding_image() {
+            local field="$1" url="$2" out="$3" cap="$4"
+            # An absent URL stays a no-op: no fetch, no output, no new failure mode.
+            if [ -z "$url" ]; then return 0; fi
+            # The helper owns the whole fetch boundary (resolution, address policy,
+            # pinned connections, redirects, transfer-time cap, per-attempt
+            # wall-clock deadline and the .part -> final rename) and prints the
+            # deterministic per-field ::error:: text itself; the exit code fails
+            # this step under set -e.
+            #
+            # Outermost backstop for a blocking call below Python that the helper cannot
+            # end in-process (a hung resolver call is bounded per attempt by a daemon
+            # thread the helper abandons, but that thread cannot be killed): the bound is
+            # above the helper's own worst case (3 attempts x 120 s + 2 x 2 s retry delay),
+            # and an abandoned resolver thread never extends an attempt past its budget.
+            # Only the timeout exit status gets a message from this wrapper, so an
+            # ordinary helper failure is never reported twice.
+            local process_timeout=420
+            local rc=0
+            timeout --signal=TERM --kill-after=10 "$process_timeout" python3 "$fetcher" "$field" "$url" "$out" "$cap" || rc=$?
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              rm -f -- "$out.part"
+              echo "::error::${field} image fetch timed out after the ${process_timeout} s process bound"
+              return 1
+            fi
+            return "$rc"
+          }
+          fetch_branding_image app_icon_url "$RQS_APP_ICON_URL" "$staging/app-icon.png" $((10 * 1024 * 1024))
+          fetch_branding_image app_logo_url "$RQS_APP_LOGO_URL" "$staging/app-logo.png" $((10 * 1024 * 1024))
+          fetch_branding_image privacy_screen_url "$RQS_PRIVACY_SCREEN_URL" "$staging/privacy-screen.png" $((20 * 1024 * 1024))
+
+          # Validate every staged image and write branding_manifest.json with the same
+          # module that is shipped to the consumers.
+          if ! python3 "$validator" "$staging"; then
+            echo "::error::branding image sanity checks failed"
+            exit 1
+          fi
+          cp -- "$validator" "$staging/validate_branding_png.py"
+
+          if [ ! -f "$staging/branding_manifest.json" ]; then
+            echo "no DeskForge branding images requested; skipping"
+            exit 0
+          fi
+          {
+            echo "branding_assets_artifact=deskforge-branding-assets"
+            if [ -f "$staging/privacy-screen.png" ]; then
+              echo "privacy_image_artifact=deskforge-branding-assets"
+            else
+              echo "privacy_image_artifact="
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Upload branded image assets'
+        if: steps.fetch_branding.outputs.branding_assets_artifact != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deskforge-branding-assets
+          path: ${{ runner.temp }}/deskforge-branding-assets
+          if-no-files-found: error
+          retention-days: 7
+
   topmost:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
-    needs: bridge
+    needs: [bridge, prepare_branding_assets]
     with:
       upload-artifact: true
       target: windows-2022
       configuration: Release
       platform: x64
       target_version: Windows10
+      # DeskForge #80: brand the privacy-mode overlay image inside WindowInjection
+      # when DFP1 carries privacy_screen_url (artifact prepared by
+      # prepare_branding_assets; empty when the payload field is absent).
+      privacy-image-artifact: ${{ needs.prepare_branding_assets.outputs.privacy_image_artifact }}
 
   build:
-    needs: [verify_workflow_identity, bridge, topmost]
+    needs: [verify_workflow_identity, bridge, topmost, prepare_branding_assets]
     runs-on: windows-2022
     steps:
       # Resolve the authenticated DFP1 build config. The former open-input debug
@@ -177,11 +2076,31 @@ jobs:
             RQS_WORKFLOW_REPO=$(printf '%s' "$decrypted" | jq -r '.workflow_repo // ""')
             RQS_RELEASE_REPO=$(printf '%s' "$decrypted" | jq -r '.release_repo // ""')
             RQS_RELEASE_ASSETS=$(printf '%s' "$decrypted" | jq -c '.release_assets // empty')
+            # DeskForge DFP1 branding fields (DeskForge issue #80): optional snake_case
+            # strings, present in the encrypted payload only when non-empty. Text fields
+            # are applied by the anchored L3 branding step; the *_url image fields are
+            # fetched by prepare_branding_assets and consumed as sha256-verifiable
+            # artifacts. custom_txt still flows to custom_.txt unmodified (runtime
+            # identity), so these keys never enter custom_.txt.
+            RQS_COMPANY_NAME=$(printf '%s' "$decrypted" | jq -r '.company_name // ""')
+            RQS_DOWNLOAD_URL=$(printf '%s' "$decrypted" | jq -r '.download_url // ""')
+            RQS_WEBSITE_URL=$(printf '%s' "$decrypted" | jq -r '.website_url // ""')
+            RQS_PRIVACY_POLICY_URL=$(printf '%s' "$decrypted" | jq -r '.privacy_policy_url // ""')
+            RQS_APP_ICON_URL=$(printf '%s' "$decrypted" | jq -r '.app_icon_url // ""')
+            RQS_APP_LOGO_URL=$(printf '%s' "$decrypted" | jq -r '.app_logo_url // ""')
+            RQS_PRIVACY_SCREEN_URL=$(printf '%s' "$decrypted" | jq -r '.privacy_screen_url // ""')
             if ! printf '%s' "$decrypted" | jq -e '
               (.server == null or (.server | type == "string")) and
               (.key == null or (.key | type == "string")) and
               (.app_name == null or (.app_name | type == "string")) and
               (.custom_txt == null or (.custom_txt | type == "string")) and
+              (.company_name == null or (.company_name | type == "string")) and
+              (.download_url == null or (.download_url | type == "string")) and
+              (.website_url == null or (.website_url | type == "string")) and
+              (.privacy_policy_url == null or (.privacy_policy_url | type == "string")) and
+              (.app_icon_url == null or (.app_icon_url | type == "string")) and
+              (.app_logo_url == null or (.app_logo_url | type == "string")) and
+              (.privacy_screen_url == null or (.privacy_screen_url | type == "string")) and
               (.version == null or (.version | type == "string")) and
               (.source_sha == null or (.source_sha | type == "string")) and
               (.release_repo == null or (.release_repo | type == "string")) and
@@ -286,7 +2205,14 @@ jobs:
             "RQS_SOURCE_SHA=$RQS_SOURCE_SHA" \
             "RQS_WORKFLOW_REPO=$RQS_WORKFLOW_REPO" \
             "RQS_RELEASE_REPO=$RQS_RELEASE_REPO" \
-            "RQS_RELEASE_ASSETS=$RQS_RELEASE_ASSETS"; do
+            "RQS_RELEASE_ASSETS=$RQS_RELEASE_ASSETS" \
+            "RQS_COMPANY_NAME=$RQS_COMPANY_NAME" \
+            "RQS_DOWNLOAD_URL=$RQS_DOWNLOAD_URL" \
+            "RQS_WEBSITE_URL=$RQS_WEBSITE_URL" \
+            "RQS_PRIVACY_POLICY_URL=$RQS_PRIVACY_POLICY_URL" \
+            "RQS_APP_ICON_URL=$RQS_APP_ICON_URL" \
+            "RQS_APP_LOGO_URL=$RQS_APP_LOGO_URL" \
+            "RQS_PRIVACY_SCREEN_URL=$RQS_PRIVACY_SCREEN_URL"; do
             field_name=${field_value%%=*}
             field_value=${field_value#*=}
             reject_control_chars "$field_name" "$field_value"
@@ -298,6 +2224,39 @@ jobs:
           if [ -n "$RQS_VERSION" ]; then
             validate_version "$RQS_VERSION"
           fi
+          # Branding URL scheme gate (DeskForge #80): only absolute http(s) URLs can be
+          # fetched by this runner. Relative URLs (e.g. '/upload/...') are a provider
+          # boundary, not a valid image location; they fail the build with a clear
+          # message instead of being silently ignored.
+          validate_branding_url() {
+            local field="$1" value="$2"
+            if [ -z "$value" ]; then return 0; fi
+            case "$value" in
+              http://*|https://*) ;;
+              *)
+                echo "::error::$field must be an absolute http(s) URL; relative URLs (for example '/upload/...') cannot be fetched by this workflow and fail the build"
+                exit 1 ;;
+            esac
+            if printf '%s' "$value" | grep -q '[[:space:]]'; then
+              echo "::error::$field contains whitespace characters"
+              exit 1
+            fi
+          }
+          if [ -n "$RQS_COMPANY_NAME" ]; then
+            if [ "$(LC_ALL=C printf '%s' "$RQS_COMPANY_NAME" | wc -c)" -gt 256 ]; then
+              echo "::error::company_name must be at most 256 bytes"
+              exit 1
+            fi
+          fi
+          for branding_item in \
+            "RQS_DOWNLOAD_URL=$RQS_DOWNLOAD_URL" \
+            "RQS_WEBSITE_URL=$RQS_WEBSITE_URL" \
+            "RQS_PRIVACY_POLICY_URL=$RQS_PRIVACY_POLICY_URL" \
+            "RQS_APP_ICON_URL=$RQS_APP_ICON_URL" \
+            "RQS_APP_LOGO_URL=$RQS_APP_LOGO_URL" \
+            "RQS_PRIVACY_SCREEN_URL=$RQS_PRIVACY_SCREEN_URL"; do
+            validate_branding_url "${branding_item%%=*}" "${branding_item#*=}"
+          done
 
           if ! printf '%s' "$decrypted" | jq -e '.source_sha | type == "string"' >/dev/null; then
               echo "::error::encrypted payload source_sha must be a string"
@@ -369,6 +2328,13 @@ jobs:
           write_github_env RQS_WORKFLOW_REPO "$RQS_WORKFLOW_REPO"
           write_github_env RQS_RELEASE_REPO "$RQS_RELEASE_REPO"
           write_github_env RQS_RELEASE_ASSETS "$RQS_RELEASE_ASSETS"
+          write_github_env RQS_COMPANY_NAME "$RQS_COMPANY_NAME"
+          write_github_env RQS_DOWNLOAD_URL "$RQS_DOWNLOAD_URL"
+          write_github_env RQS_WEBSITE_URL "$RQS_WEBSITE_URL"
+          write_github_env RQS_PRIVACY_POLICY_URL "$RQS_PRIVACY_POLICY_URL"
+          write_github_env RQS_APP_ICON_URL "$RQS_APP_ICON_URL"
+          write_github_env RQS_APP_LOGO_URL "$RQS_APP_LOGO_URL"
+          write_github_env RQS_PRIVACY_SCREEN_URL "$RQS_PRIVACY_SCREEN_URL"
 
           # сводка (без значений): что задано, что пусто
           echo "config: server=$([ -n "$RQS_SERVER" ] && echo SET || echo empty)"
@@ -378,6 +2344,13 @@ jobs:
           echo "config: version=$([ -n "$RQS_VERSION" ] && echo "$RQS_VERSION" || echo empty)"
           echo "config: source_sha=SET"
           echo "config: release_repo=$([ -n "$RQS_RELEASE_REPO" ] && echo SET || echo empty)"
+          echo "config: company_name=$([ -n "$RQS_COMPANY_NAME" ] && echo SET || echo empty)"
+          echo "config: download_url=$([ -n "$RQS_DOWNLOAD_URL" ] && echo SET || echo empty)"
+          echo "config: website_url=$([ -n "$RQS_WEBSITE_URL" ] && echo SET || echo empty)"
+          echo "config: privacy_policy_url=$([ -n "$RQS_PRIVACY_POLICY_URL" ] && echo SET || echo empty)"
+          echo "config: app_icon_url=$([ -n "$RQS_APP_ICON_URL" ] && echo SET || echo empty)"
+          echo "config: app_logo_url=$([ -n "$RQS_APP_LOGO_URL" ] && echo SET || echo empty)"
+          echo "config: privacy_screen_url=$([ -n "$RQS_PRIVACY_SCREEN_URL" ] && echo SET || echo empty)"
 
       - name: Checkout source code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -511,7 +2484,7 @@ jobs:
           echo "L2: allowCustom applied (src/common.rs patched)"
           grep -c 'custom_\.txt' src/common.rs || true
 
-      # L3: брендинг RustDesk → app_name (sed по тем же файлам что rdgen + flutter CMakeLists)
+      # L3 brand: rename RustDesk → app_name (sed по тем же файлам что rdgen + flutter CMakeLists)
       - name: 'L3 brand: rename RustDesk → app_name'
         if: env.RQS_APP_NAME != ''
         shell: bash
@@ -542,6 +2515,340 @@ jobs:
           # отображения "rustqs" в свойствах файла. Финальный self-extract single-exe
           # переименовывается в "${appname}.exe" уже после packer'a (см. Portable-pack).
           echo "L3: brand → ${APP} (BINARY_NAME left as 'rustdesk' for packer)"
+
+      # DeskForge #80 branding images: restore the sha256-manifested artifact
+      # prepared by prepare_branding_assets and apply icon/logo assets to the
+      # 1.4.9 anchor slots (in-app icon/logo, runner + packer + tray ICOs).
+      - name: 'Restore branded image assets'
+        if: needs.prepare_branding_assets.outputs.branding_assets_artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deskforge-branding-assets
+          path: ${{ runner.temp }}/deskforge-branding-assets
+
+      # L3 brand (DeskForge #80): DFP1 payload keys company_name / download_url /
+      # website_url / privacy_policy_url, each applied ONLY when non-empty.
+      # Every replacement is anchored to the exact 1.4.9 source literals scoped to
+      # the file being branded; a missing or already-changed anchor aborts the build
+      # (fail-on-mismatch — no silent skips). Ordinary safe punctuation is supported
+      # by escaping the value for each concrete insertion syntax: Windows .rc values
+      # (backslash doubled, embedded quote written as a doubled quote), TOML basic
+      # strings (backslash doubled, embedded quote backslash-escaped), and
+      # interpolated Dart single-quoted literals (backslash, single quote and '$'
+      # escaped). Control characters are still rejected,
+      # so a value can never escape the literal it is inserted into. License/
+      # attribution text (res/msi License.rtf, code headers) is deliberately NOT
+      # touched.
+      - name: 'L3 brand: company name + branded About links'
+        if: env.RQS_COMPANY_NAME != '' || env.RQS_DOWNLOAD_URL != '' || env.RQS_WEBSITE_URL != '' || env.RQS_PRIVACY_POLICY_URL != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+
+          def fail(message):
+              print("::error::" + message)
+              raise SystemExit(1)
+
+          def validated(field, raw, max_bytes):
+              if not raw:
+                  return None
+              if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+                  fail(field + " contains control characters")
+              if len(raw.encode("utf-8")) > max_bytes:
+                  fail(field + " exceeds " + str(max_bytes) + " bytes")
+              return raw
+
+          def escape_rc(value):
+              # Windows .rc double-quoted values: a backslash is doubled, but an
+              # embedded double quote is written as a doubled quote `""` because RC
+              # has no backslash quote escape (rc.exe/windres read \" literally). The
+              # 1.4.9 source already relies on this, e.g. Runner.rc's
+              # "#include ""winres.h""".
+              return value.replace("\\", "\\\\").replace('"', '""')
+
+          def escape_toml(value):
+              # TOML basic strings: a backslash is doubled and a double-quote is
+              # escaped with a backslash so the value cannot terminate the string
+              # literal it is inserted into.
+              return value.replace("\\", "\\\\").replace('"', '\\"')
+
+          def escape_dart(value):
+              # Dart single-quoted literals are interpolated: a backslash and a single
+              # quote are escaped and '$' is escaped so it cannot start an
+              # interpolation expression.
+              return value.replace("\\", "\\\\").replace("'", "\\'").replace("$", "\\$")
+
+          company = validated("company_name", os.environ.get("RQS_COMPANY_NAME", ""), 256)
+          download = validated("download_url", os.environ.get("RQS_DOWNLOAD_URL", ""), 2048)
+          website = validated("website_url", os.environ.get("RQS_WEBSITE_URL", ""), 2048)
+          privacy = validated("privacy_policy_url", os.environ.get("RQS_PRIVACY_POLICY_URL", ""), 2048)
+
+          # company_name is inserted into double-quoted Windows .rc literals, into
+          # TOML basic strings, AND into an interpolated Dart single-quoted literal,
+          # so keep one escaped form per concrete insertion syntax.
+          companyRcQuoted = escape_rc(company) if company else None
+          companyTomlQuoted = escape_toml(company) if company else None
+          companyDart = escape_dart(company) if company else None
+          downloadDart = escape_dart(download) if download else None
+          websiteDart = escape_dart(website) if website else None
+          privacyDart = escape_dart(privacy) if privacy else None
+          companyCopyright = ("Copyright © 2026 " + companyRcQuoted + ". All rights reserved.").encode("utf-8") if company else None
+          companyCargoCopyright = ('LegalCopyright = "Copyright © 2026 ' + companyTomlQuoted + '. All rights reserved."').encode("utf-8") if company else None
+          companyRcName = ('VALUE "CompanyName", "' + companyRcQuoted + '" "\\0"').encode("utf-8") if company else None
+          companyCargoAnchor = 'LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."'.encode("utf-8")
+
+          ANCHORS = {
+              "company_runrc_name": ('flutter/windows/runner/Runner.rc', b'VALUE "CompanyName", "Purslane Tech Pte. Ltd." "\\0"', companyRcName),
+              "company_runrc_copyright": ('flutter/windows/runner/Runner.rc', 'Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved.'.encode("utf-8"), companyCopyright),
+              "company_cargo": ("Cargo.toml", companyCargoAnchor, companyCargoCopyright),
+              "company_packercargo": ("libs/portable/Cargo.toml", companyCargoAnchor, companyCargoCopyright),
+              "company_about_dart": ("flutter/lib/desktop/pages/desktop_setting_page.dart", 'Purslane Tech Pte. Ltd.'.encode("utf-8"), companyDart.encode("utf-8") if company else None),
+              "download_desktop": ("flutter/lib/desktop/pages/desktop_home_page.dart", b"'https://rustdesk.com/download'", ("'" + downloadDart + "'").encode("utf-8") if download else None),
+              "download_mobile": ("flutter/lib/mobile/pages/connection_page.dart", b"'https://rustdesk.com/download'", ("'" + downloadDart + "'").encode("utf-8") if download else None),
+              "website_about": ("flutter/lib/desktop/pages/desktop_setting_page.dart", b"launchUrlString('https://rustdesk.com');", ("launchUrlString('" + websiteDart + "');").encode("utf-8") if website else None),
+              "website_powered": ("flutter/lib/common.dart", b"launchUrl(Uri.parse('https://rustdesk.com'));", ("launchUrl(Uri.parse('" + websiteDart + "'));").encode("utf-8") if website else None),
+              "website_mobile": ("flutter/lib/mobile/pages/settings_page.dart", b"const url = 'https://rustdesk.com/';", ("const url = '" + websiteDart + "';").encode("utf-8") if website else None),
+              "privacy_about": ("flutter/lib/desktop/pages/desktop_setting_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacyDart + "'").encode("utf-8") if privacy else None),
+              "privacy_install": ("flutter/lib/desktop/pages/install_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacyDart + "'").encode("utf-8") if privacy else None),
+              "privacy_mobile": ("flutter/lib/mobile/pages/settings_page.dart", b"'https://rustdesk.com/privacy.html'", ("'" + privacyDart + "'").encode("utf-8") if privacy else None),
+          }
+          EXPECTED_COUNTS = {
+              "company_runrc_name": 1,
+              "company_runrc_copyright": 1,
+              "company_cargo": 1,
+              "company_packercargo": 1,
+              "company_about_dart": 1,
+              "download_desktop": 1,
+              "download_mobile": 1,
+              "website_about": 1,
+              "website_powered": 1,
+              "website_mobile": 2,
+              "privacy_about": 1,
+              "privacy_install": 2,
+              "privacy_mobile": 1,
+          }
+
+          pending = {key: ANCHORS[key] for key in ANCHORS if ANCHORS[key][2] is not None}
+          if not pending:
+              fail("branding step ran without any branding value to apply")
+
+          # Phase 1: verify every anchor on the checked-out source before mutating
+          # anything (fail-on-mismatch, no silent skips). Anchors are single-line,
+          # byte-exact and pairwise disjoint, so per-file edit order is irrelevant.
+          data_by_path = {}
+          for key, (path, anchor, _replacement) in pending.items():
+              try:
+                  with open(path, "rb") as handle:
+                      data = handle.read()
+              except OSError as exc:
+                  fail(key + ": cannot read " + path + ": " + str(exc))
+              expected = EXPECTED_COUNTS[key]
+              if data.count(anchor) != expected:
+                  fail(
+                      key + ": anchor mismatch in " + path
+                      + ": expected " + str(expected) + " occurrence(s) of the 1.4.9 anchor;"
+                      + " the client source changed since the anchored branding table was written; build aborted"
+                  )
+              data_by_path[path] = data
+          # Phase 2: apply all verified replacements against the immutable Phase 1
+          # snapshot. Every anchor occurrence is located by scanning that snapshot
+          # once per key, so each original occurrence is replaced exactly once and a
+          # replacement that itself contains or introduces a sibling anchor's bytes
+          # is never re-scanned: it cannot be double-replaced nor trip a sibling
+          # key's count guard (for example privacy_policy_url = https://rustdesk.com
+          # rewrites the about-page privacy line into the website anchor text, which
+          # is a legitimate DeskForge configuration). Anchors are single-line,
+          # byte-exact and pairwise disjoint in the snapshot, so their spans never
+          # overlap; an overlap is treated as source drift and aborts the build.
+          spans_by_path = {}
+          for key, (path, anchor, replacement) in pending.items():
+              data = data_by_path[path]
+              spans = []
+              start = data.find(anchor)
+              while start != -1:
+                  spans.append((start, start + len(anchor), replacement))
+                  start = data.find(anchor, start + len(anchor))
+              if len(spans) != EXPECTED_COUNTS[key]:
+                  fail(key + ": anchor count changed while applying " + path)
+              spans_by_path.setdefault(path, []).extend(spans)
+          expected_by_path = {}
+          for path, spans in spans_by_path.items():
+              data = data_by_path[path]
+              spans.sort(key=lambda span: span[0])
+              chunks = []
+              cursor = 0
+              for begin, end, replacement in spans:
+                  if begin < cursor:
+                      fail("overlapping branding anchors in " + path + "; build aborted")
+                  chunks.append(data[cursor:begin])
+                  chunks.append(replacement)
+                  cursor = end
+              chunks.append(data[cursor:])
+              expected_by_path[path] = b"".join(chunks)
+          # Phase 3: write each file once, then verify its on-disk bytes equal the exact
+          # expected post-replacement content. This replaces the earlier
+          # `anchor in data or replacement not in data` rule, which was not a sound
+          # post-apply check: a legitimate replacement may itself contain the anchor
+          # bytes (for example a company name that extends the 1.4.9 default literal), so
+          # a correct apply still left the anchor present and aborted the build. Byte
+          # equality accepts every legitimate replacement, including the anchor==
+          # replacement no-op (whose expected content equals its source), while still
+          # failing closed when a replacement did not land or post-apply drift changed
+          # the file. Source drift is still caught by the Phase 1 anchor-count check.
+          for path in sorted(expected_by_path):
+              with open(path, "wb") as handle:
+                  handle.write(expected_by_path[path])
+          for key, (path, _anchor, _replacement) in sorted(pending.items()):
+              with open(path, "rb") as handle:
+                  data = handle.read()
+              if data != expected_by_path[path]:
+                  fail(key + ": post-apply verification failed for " + path)
+              print("L3 brand: " + key + " applied to " + path)
+          PY
+
+      - name: 'L3 brand: apply branded icon + logo assets'
+        if: needs.prepare_branding_assets.outputs.branding_assets_artifact != ''
+        shell: bash
+        env:
+          BRANDED_ASSETS_DIR: ${{ runner.temp }}/deskforge-branding-assets
+        run: |
+          set -euo pipefail
+          python3 - "$BRANDED_ASSETS_DIR" <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import pathlib
+          import struct
+          import sys
+
+          assets_dir = pathlib.Path(sys.argv[1])
+
+          def fail(message):
+              print("::error::" + message)
+              raise SystemExit(1)
+
+          # Shared branding PNG validator: prepared once by the
+          # prepare_branding_assets job and shipped inside this same artifact,
+          # so the icon/logo consumers run byte-identical validation code.
+          validator_path = assets_dir / "validate_branding_png.py"
+          if not validator_path.is_file():
+              fail("branded assets artifact is missing the shared PNG validator (validate_branding_png.py)")
+          spec = importlib.util.spec_from_file_location("deskforge_validate_branding_png", validator_path)
+          if spec is None or spec.loader is None:
+              fail("shared PNG validator cannot be loaded from the branded assets artifact")
+          validator = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(validator)
+
+          manifest_path = assets_dir / "branding_manifest.json"
+          if not manifest_path.is_file():
+              fail("branded assets artifact is missing branding_manifest.json")
+          try:
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))["images"]
+          except Exception as exc:
+              fail("branded assets manifest is not readable: " + str(exc))
+
+          def source_bytes(name):
+              path = assets_dir / name
+              if not path.is_file():
+                  fail("branded asset '" + name + "' is missing from the deskforge-branding-assets artifact")
+              data = path.read_bytes()
+              want = manifest.get(name, {}).get("sha256")
+              if not want or hashlib.sha256(data).hexdigest() != want:
+                  fail("branded asset '" + name + "' digest does not match the prepared manifest")
+              return data
+
+          def check_anchor(path, anchor, expected):
+              data = pathlib.Path(path).read_bytes()
+              if data.count(anchor) != expected:
+                  fail(
+                      "anchor mismatch in " + path + ": expected "
+                      + str(expected) + " occurrence(s); the client source does not carry the anchored 1.4.9 branding target; build aborted"
+                  )
+
+          def ico_probe(data, label):
+              if len(data) < 22 or data[0:4] != b"\x00\x00\x01\x00" or data[4] < 1:
+                  fail("cannot replace " + label + ": existing file is not a valid ICO")
+
+          def png_to_ico(data, label):
+              # The shared validator owns all structure/decompression checks and the
+              # raster extraction; this build step only adds the ICO packaging.
+              # No byte cap: the per-field download cap bounds only the fetch-time
+              # response, never the canonical artifact. ``data`` is the canonical
+              # re-encode written by prepare_branding_assets, whose size is already
+              # bounded by the image geometry and pinned by the sha256 manifest entry
+              # verified in source_bytes(); re-applying the download cap here would
+              # reject a valid indexed/16-bit source whose RGB/RGBA re-encode
+              # legitimately exceeds it.
+              try:
+                  image = validator.load(data, label, max_width=4096, max_height=4096)
+                  bgra, width, height = image.bgra()
+              except validator.PngError as exc:
+                  fail(str(exc))
+              if width != height or not 16 <= width <= 256:
+                  fail(label + " must be square and between 16 and 256 px for the Windows icon resources (enforced for app_icon_url)")
+              mask_stride = ((width + 31) // 32) * 4
+              body = bytearray(40 + height * width * 4)
+              struct.pack_into("<IiiHHIIiiII", body, 0, 40, width, height * 2, 1, 32, 0, height * (width * 4 + mask_stride), 0, 0, 0, 0)
+              for y in range(height - 1, -1, -1):
+                  base = height - 1 - y
+                  body[40 + base * width * 4:40 + (base + 1) * width * 4] = bgra[y * width * 4:(y + 1) * width * 4]
+              body += bytes(mask_stride * height)
+              frame = bytes(body)
+              ico = struct.pack("<HHH", 0, 1, 1)
+              ico += struct.pack("<BBBBHHII", 0 if width == 256 else width, 0 if width == 256 else width, 0, 0, 1, 32, len(frame), 22)
+              ico += frame
+              return ico
+
+          plans = []
+          if "app-icon.png" in manifest:
+              icon_png = source_bytes("app-icon.png")
+              # 1.4.9 runtime anchor: loadIcon prefers assets/icon.png for the in-app and
+              # Windows tray icon (src/tray.rs load_icon_from_asset).
+              check_anchor("flutter/lib/common.dart", b"return Image.asset('assets/icon.png',", 1)
+              # 1.4.9 exe icon consumers: runner resource + main binary + portable packer icon.
+              check_anchor("flutter/windows/runner/Runner.rc", b"IDI_APP_ICON", 1)
+              check_anchor("build.rs", b'res.set_icon("res/icon.ico")', 1)
+              check_anchor("src/tray.rs", b'icon = include_bytes!("../res/tray-icon.ico");', 1)
+              ico_targets = ("flutter/windows/runner/resources/app_icon.ico", "res/icon.ico", "res/tray-icon.ico")
+              for target in ico_targets:
+                  if not pathlib.Path(target).is_file():
+                      fail("branded icon target anchor missing: " + target + " (expected present in the 1.4.9 client source)")
+                  ico_probe(pathlib.Path(target).read_bytes(), target)
+              branded_ico = png_to_ico(icon_png, "app-icon.png")
+              plans.append(("flutter/assets/icon.png", icon_png))
+              for target in ico_targets:
+                  plans.append((target, branded_ico))
+              print("app icon: assets/icon.png + exe/packer/tray icon resources prepared")
+          if "app-logo.png" in manifest:
+              logo_png = source_bytes("app-logo.png")
+              # 1.4.9 runtime anchor: _Logo/loadLogo renders assets/logo.png (max 300x60)
+              # on the desktop home page.
+              check_anchor("flutter/lib/common.dart", b"const _kDefaultLogoAsset = 'assets/logo.png';", 1)
+              # A digest match only proves the bytes are the ones we staged; run
+              # the shared structural validator so a corrupt/truncated logo fails
+              # here instead of being copied into the app assets. No byte cap: the
+              # canonical artifact is bounded by its geometry and pinned by the
+              # manifest digest, while the per-field download cap applies only at
+              # fetch time, so re-applying it would reject a valid in-domain image
+              # whose canonical re-encode is larger than the fetched source.
+              try:
+                  validator.load(logo_png, "app-logo.png", max_width=4096, max_height=4096)
+              except validator.PngError as exc:
+                  fail(str(exc))
+              plans.append(("flutter/assets/logo.png", logo_png))
+              print("app logo: flutter/assets/logo.png prepared")
+          for path, data in plans:
+              p = pathlib.Path(path)
+              if not p.parent.exists():
+                  # The asset subtree must exist in the checked-out client source;
+                  # creating directories here would hide a changed source layout.
+                  fail("branded asset directory is missing: " + str(p.parent))
+              p.write_bytes(data)
+              print("branded: " + path + " (" + str(len(data)) + " bytes)")
+          PY
 
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

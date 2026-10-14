@@ -26,6 +26,11 @@ on:
             required: true
             type: string
             default: 'Windows10'
+        privacy-image-artifact:
+            description: 'Name of a same-run artifact carrying privacy-screen.png + sha256 branding manifest (DeskForge #80). Empty keeps the pinned default overlay image.'
+            required: false
+            type: string
+            default: ''
 
 permissions:
   contents: read
@@ -65,6 +70,133 @@ jobs:
            if ($LASTEXITCODE -ne 0) {
              throw "RustDeskTempTopMostWindow ownership pin validation failed: expected record path and ref"
            }
+
+      # DeskForge #80 privacy_screen_url consumer: replace WindowInjection/img.cpp
+      # (the fullscreen overlay image g_img rendered while privacy mode is active)
+      # with the provider-supplied image. Runs AFTER the pinned-source validation so
+      # the pin still proves the pristine state; the patch itself re-asserts the
+      # exact img.cpp/img.h anchors and aborts the build on mismatch. The PNG is
+      # converted with the same mechanism the deskforge generator historically
+      # used (.github/patches/rdgen-privacyScreen.py) and the result is verified
+      # byte-for-byte by extracting the array again before it is copied over.
+      - name: Restore branded privacy screen image
+        if: ${{ inputs.privacy-image-artifact != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.privacy-image-artifact }}
+          path: ${{ runner.temp }}/deskforge-privacy-screen
+
+      - name: 'Brand privacy screen: replace WindowInjection img.cpp'
+        if: ${{ inputs.privacy-image-artifact != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          img_root=third_party/windows/RustDeskTempTopMostWindow/WindowInjection
+          img_cpp="$img_root/img.cpp"
+          img_h="$img_root/img.h"
+          if [ ! -f "$img_cpp" ]; then
+            echo "::error::privacy screen anchor missing: $img_cpp not found in the pinned source"
+            exit 1
+          fi
+          if [ ! -f "$img_h" ]; then
+            echo "::error::privacy screen anchor missing: $img_h not found in the pinned source"
+            exit 1
+          fi
+          if ! grep -F '#include "./img.h"' "$img_cpp" >/dev/null; then
+            echo "::error::privacy screen anchor mismatch in $img_cpp (img.h include missing or changed); build aborted"
+            exit 1
+          fi
+          if ! grep -F 'const unsigned char g_img[]' "$img_cpp" >/dev/null; then
+            echo "::error::privacy screen anchor mismatch in $img_cpp (g_img array missing or changed); build aborted"
+            exit 1
+          fi
+          if ! grep -F 'extern const unsigned char g_img' "$img_h" >/dev/null; then
+            echo "::error::privacy screen anchor mismatch in $img_h (g_img declaration missing or changed); build aborted"
+            exit 1
+          fi
+          privacy_png="${RUNNER_TEMP}/deskforge-privacy-screen/privacy-screen.png"
+          if [ ! -f "$privacy_png" ]; then
+            echo "::error::branded privacy screen image missing from the branding artifact (expected privacy-screen.png)"
+            exit 1
+          fi
+          manifest_json="${RUNNER_TEMP}/deskforge-privacy-screen/branding_manifest.json"
+          if [ ! -f "$manifest_json" ]; then
+            echo "::error::privacy screen branding manifest missing from the artifact (expected branding_manifest.json); build aborted"
+            exit 1
+          fi
+          validator="${RUNNER_TEMP}/deskforge-privacy-screen/validate_branding_png.py"
+          if [ ! -f "$validator" ]; then
+            echo "::error::shared branding PNG validator is missing from the artifact (expected validate_branding_png.py); build aborted"
+            exit 1
+          fi
+          # The third-party job trusts nothing between prepare and here: verify the
+          # sha256 manifest entry, then run the SAME shared validator the prepare job
+          # used (shipped inside this artifact). The overlay is replaced only when the
+          # image is structurally whole and fully decodable; a truncated/corrupt
+          # payload fails here instead of embedding undecodable bytes into g_img.
+          if ! python3 - "$privacy_png" "$manifest_json" <<'PY'
+          import hashlib
+          import json
+          import sys
+
+          def fail(message):
+              print("::error::" + message)
+              raise SystemExit(1)
+
+          data = open(sys.argv[1], "rb").read()
+          try:
+              manifest = json.loads(open(sys.argv[2], encoding="utf-8").read())["images"]
+          except Exception as exc:
+              fail("privacy screen branding manifest is not readable: " + str(exc))
+          entry = manifest.get("privacy-screen.png") or {}
+          if not entry.get("sha256"):
+              fail("branding manifest has no sha256 entry for privacy-screen.png; build aborted")
+          if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+              fail("privacy-screen.png digest does not match the prepared manifest; build aborted")
+          PY
+          then
+            echo "::error::privacy screen image digest verification failed"
+            exit 1
+          fi
+          # No --max-bytes here: that cap is a fetch-time bound on the downloaded
+          # response only. The canonical privacy-screen.png was already bounded by its
+          # geometry in prepare and is pinned by the sha256 manifest check above, so
+          # re-applying the download cap would reject a valid indexed/16-bit source
+          # whose RGB/RGBA re-encode legitimately exceeds it.
+          if ! python3 "$validator" "$privacy_png" --label privacy-screen.png --max-width 4096 --max-height 4096; then
+            echo "::error::privacy screen image sanity checks failed"
+            exit 1
+          fi
+          convert_dir="$RUNNER_TEMP/deskforge-privacy-convert"
+          rm -rf "$convert_dir"
+          mkdir -p "$convert_dir"
+          patch_script="$(pwd)/.github/patches/rdgen-privacyScreen.py"
+          if [ ! -f "$patch_script" ]; then
+            echo "::error::workflow-owned privacy screen converter is missing: .github/patches/rdgen-privacyScreen.py"
+            exit 1
+          fi
+          cp -- "$privacy_png" "$convert_dir/privacy.png"
+          (cd "$convert_dir" && python3 "$patch_script") || { echo "::error::privacy screen img.cpp conversion failed"; exit 1; }
+          if ! python3 - "$convert_dir/img.cpp" "$privacy_png" <<'PY'
+          # Verify the generated img.cpp embeds exactly the provider image bytes.
+          import re
+          import sys
+          import binascii
+          data = open(sys.argv[1], "r", encoding="ascii", errors="strict").read()
+          match = re.search(r"const unsigned char g_img\[\] = \{(.*?)\};", data, re.DOTALL)
+          if not match:
+              print("::error::converted img.cpp has no g_img array"); raise SystemExit(1)
+          hexbytes = re.findall(r"0x[0-9a-fA-F]{2}", match.group(1))
+          wanted = open(sys.argv[2], "rb").read()
+          if [int(h, 16) for h in hexbytes] != list(wanted):
+              print("::error::converted img.cpp does not round-trip to the provider image bytes"); raise SystemExit(1)
+          PY
+          then
+            echo "::error::privacy screen img.cpp round-trip check failed"
+            exit 1
+          fi
+          cp -- "$convert_dir/img.cpp" "$img_cpp"
+          echo "privacy screen image replaced: $img_cpp ($(wc -c < "$img_cpp") bytes)"
 
       - name: Build the project
         run: |
