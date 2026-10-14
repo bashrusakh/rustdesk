@@ -41,6 +41,14 @@ Covers the review findings on the Windows branding workflow:
       closed), and a resolution that mixes public and non-public addresses is
       refused in full before any connection.
 
+  F8  each hop's hostname is canonicalized exactly once at the point the hop's
+      host is derived: one terminal root dot (the DNS root label) is removed,
+      and the resolution, the Host header and the TLS server_hostname all use
+      that canonical name, so certificate verification does not depend on
+      whether the local TLS stack strips the root dot. A host with any other
+      empty label (a second trailing dot included) is still refused before
+      resolution.
+
 Run with:  python3 tests/test_branding_contract.py
 """
 
@@ -1644,15 +1652,15 @@ _TLS_CERTIFICATES = {}
 _TLS_CERTIFICATES_LOCK = threading.Lock()
 
 
-def tls_fixture_certificate(ip):
-    """Self-signed cert/key for one IP SAN, minted once per process.
+def _tls_fixture_certificate(san, common_name):
+    """Self-signed cert/key for one SAN entry, minted once per process.
 
     Needs an OpenSSL CLI new enough for ``-addext`` (1.1.1+).  The certificate
     is only a fixture: the fetch under test injects the trust anchor, so this
     changes trust, never verification or SNI.
     """
     with _TLS_CERTIFICATES_LOCK:
-        if ip not in _TLS_CERTIFICATES:
+        if san not in _TLS_CERTIFICATES:
             directory = Path(tempfile.mkdtemp(prefix="branding-tls-cert-"))
             cert = directory / "cert.pem"
             key = directory / "key.pem"
@@ -1660,13 +1668,23 @@ def tls_fixture_certificate(ip):
                 [
                     "openssl", "req", "-x509", "-newkey", "rsa:2048",
                     "-nodes", "-days", "1", "-keyout", str(key),
-                    "-out", str(cert), "-subj", "/CN=" + ip,
-                    "-addext", "subjectAltName=IP:" + ip,
+                    "-out", str(cert), "-subj", "/CN=" + common_name,
+                    "-addext", "subjectAltName=" + san,
                 ],
                 check=True, capture_output=True,
             )
-            _TLS_CERTIFICATES[ip] = (cert, key)
-        return _TLS_CERTIFICATES[ip]
+            _TLS_CERTIFICATES[san] = (cert, key)
+        return _TLS_CERTIFICATES[san]
+
+
+def tls_fixture_certificate(ip):
+    """Self-signed cert/key for one IP SAN."""
+    return _tls_fixture_certificate("IP:" + ip, ip)
+
+
+def tls_fixture_dns_certificate(hostname):
+    """Self-signed cert/key for one DNS SAN."""
+    return _tls_fixture_certificate("DNS:" + hostname, hostname)
 
 
 class _TlsFetchServer(_FetchServer):
@@ -2295,11 +2313,12 @@ class DestinationPinnedFetchTests(unittest.TestCase):
     def test_host_with_an_empty_dns_label_is_refused_before_resolution(self):
         # A host with an empty DNS label only fails later in getaddrinfo; the
         # fetcher must refuse it deterministically, including a second trailing
-        # dot (the single trailing root dot stays usable).
+        # dot (the single trailing root dot stays usable and is canonicalized).
         for url in (
             "http://127.0.0.1..:80/image.png",
             "http://.example.com/image.png",
             "http://example..com/image.png",
+            "http://example.com../image.png",
         ):
             with self.subTest(url=url):
                 out, error = self._run_with_resolver_guard(url, "empty DNS label")
@@ -2311,11 +2330,12 @@ class DestinationPinnedFetchTests(unittest.TestCase):
 
     def test_fail_fast_guard_keeps_wire_safe_hosts_and_targets(self):
         # Bracketed IPv6 literals, IDNA/punycode hosts, a single trailing root
-        # dot and percent-encoded ASCII targets must stay usable.
+        # dot (canonicalized away at the hop boundary) and percent-encoded
+        # ASCII targets must stay usable.
         for url, expected_host in (
             ("http://[::1]:8080/image.png", "::1"),
             ("https://xn--e1afmkfd.xn--p1ai/icon.png", "xn--e1afmkfd.xn--p1ai"),
-            ("https://example.com./icon.png", "example.com."),
+            ("https://example.com./icon.png", "example.com"),
             (
                 "http://example.com/%D0%B8%D0%BA%D0%BE%D0%BD%D0%BA%D0%B0.png",
                 "example.com",
@@ -2831,6 +2851,77 @@ class DestinationPinnedFetchTests(unittest.TestCase):
             "remaining one (%.2f s elapsed for a 2 s attempt)" % elapsed,
         )
         self._assert_no_output(out)
+
+    # 15. a single terminal root dot is canonicalized away at the one point where
+    #     the hop's host is derived, so the resolution, the Host header and the
+    #     TLS server_hostname all use the same canonical name.  Reproduced
+    #     pre-fix by the dotted half below: Python/OpenSSL does not strip the root
+    #     dot when it matches the handshake hostname against the certificate, so
+    #     "localhost." failed verification against the very certificate the
+    #     undotted host verifies against (it reached DNS and TCP and failed at
+    #     TLS, after dispatch).
+
+    @unittest.skipUnless(HAS_OPENSSL, "openssl CLI required to mint the TLS fixture certificate")
+    def test_https_fetch_canonicalizes_one_trailing_root_dot(self):
+        cert, key = tls_fixture_dns_certificate("localhost")
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(str(cert), str(key))
+        server = _TlsFetchServer(("127.0.0.1", 0), server_context)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        real_create = self.module.ssl.create_default_context
+        server_names = []
+
+        class _RecordingContext:
+            """Records the TLS server_hostname while delegating to the real context."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def wrap_socket(self, sock, *args, **kwargs):
+                server_names.append(kwargs.get("server_hostname"))
+                return self._inner.wrap_socket(sock, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        def recording_create(*args, **kwargs):
+            # Only the trust anchor is injected; check_hostname and certificate
+            # verification stay on, against the URL hostname (server_hostname).
+            return _RecordingContext(real_create(cafile=str(cert)))
+
+        def loopback_policy(address):
+            # The fixture listens on 127.0.0.1; "localhost" (dotted or not) also
+            # resolves to the loopback ::1, so both fixture loopback addresses are
+            # permitted.  Every other address still defers to the production policy.
+            return str(address) in ("127.0.0.1", "::1") or self.module.is_public_address(address)
+
+        self.module.ssl.create_default_context = recording_create
+        try:
+            before = server.snapshot()
+            # Control first: the same URL and certificate without the root dot.
+            plain_out, plain_error = self._run(
+                "https://localhost:%d/image.png" % port, policy=loopback_policy
+            )
+            dotted_out, dotted_error = self._run(
+                "https://localhost.:%d/image.png" % port, policy=loopback_policy
+            )
+        finally:
+            self.module.ssl.create_default_context = real_create
+            server.shutdown()
+            server.server_close()
+        self.assertIsNone(plain_error, "the control fetch without the root dot failed")
+        self.assertEqual(plain_out.read_bytes(), REFERENCE_PNG)
+        self.assertIsNone(dotted_error, "a single trailing root dot broke the fetch")
+        self.assertEqual(dotted_out.read_bytes(), REFERENCE_PNG)
+        self.assertFalse(dotted_out.with_name(dotted_out.name + ".part").exists())
+        self.assertEqual(server.snapshot(), (before[0] + 2, before[1] + 2))
+        # The canonical name (no root dot) is what reached the Host header and the
+        # TLS handshake, not the provider's spelling of the same DNS name.
+        self.assertEqual(
+            server.host_headers, ["localhost:%d" % port, "localhost:%d" % port]
+        )
+        self.assertEqual(server_names, ["localhost", "localhost"])
 
 
 # --------------------------------------------------------------------------- #

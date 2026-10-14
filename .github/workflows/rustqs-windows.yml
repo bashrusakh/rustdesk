@@ -1047,6 +1047,16 @@ jobs:
           uses the hostname for SNI and certificate verification (``server_hostname``)
           while the TCP connection goes to the validated address.
 
+          Each hop's hostname is canonicalized once at that boundary: exactly one
+          terminal root dot (the DNS root label) is removed, and the resolution, the
+          ``Host`` header and the TLS ``server_hostname`` are all derived from that one
+          canonical name.  Python/OpenSSL does not strip the root dot when it matches a
+          handshake hostname against a certificate, so without canonicalization
+          ``example.com.`` would fail verification against a certificate for
+          ``example.com`` while a TLS stack that does strip it would accept the same
+          hop -- the outcome must not depend on the stack.  A host with any other empty
+          label (a second trailing dot included) is refused before resolution.
+
           Preserved behaviour, matching the curl pipeline this replaces:
 
             * http(s) only, for the initial URL and for every redirect target;
@@ -1480,8 +1490,17 @@ jobs:
               labels = host.split(".")
               if labels and not labels[-1]:
                   # A single trailing dot is the DNS root label; any other empty label
-                  # (including a second trailing dot) is not a host name.
+                  # (including a second trailing dot) is not a host name.  Canonicalize
+                  # exactly that one terminal root dot away once the name is known to be
+                  # usable: the resolution, the Host header and the TLS server_hostname
+                  # must all use the same canonical name.  Python/OpenSSL does not strip
+                  # the root dot when it matches a handshake hostname against a
+                  # certificate (a certificate for "example.com" fails verification for
+                  # "example.com."), while some other TLS stacks do, so leaving it in
+                  # would make the outcome depend on the stack.
                   labels = labels[:-1]
+                  if labels and all(labels):
+                      host = host[:-1]
               if not labels or any(label == "" for label in labels):
                   raise _Abort(
                       message=_refused_message(
