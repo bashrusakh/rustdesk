@@ -254,7 +254,9 @@ jobs:
           export CARGO_INCREMENTAL=0
           export DEB_ARCH=amd64
           cargo build --locked --lib --features hwcodec,flutter,unix-file-copy-paste --release
-          python3 ./build.py --flutter --skip-cargo
+          # Upstream #17089: build.py теперь по умолчанию ожидает drm-сборку (assert + libdrmtap).
+          # Cargo-строка min-test не содержит drm — гасим флагом --no-drm.
+          python3 ./build.py --flutter --skip-cargo --no-drm
 
       # L2 payload: положить custom_.txt рядом с бинарём в bundle (читается клиентом).
       - name: 'L2 payload: place custom_.txt into bundle'
