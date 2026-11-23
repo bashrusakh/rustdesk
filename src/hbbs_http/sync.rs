@@ -145,10 +145,6 @@ async fn start_hbbs_sync_async() {
                     if !ab_alias.is_empty() {
                         v[keys::OPTION_PRESET_ADDRESS_BOOK_ALIAS] = json!(ab_alias);
                     }
-                    let ab_password = Config::get_option(keys::OPTION_PRESET_ADDRESS_BOOK_PASSWORD);
-                    if !ab_password.is_empty() {
-                        v[keys::OPTION_PRESET_ADDRESS_BOOK_PASSWORD] = json!(ab_password);
-                    }
                     let ab_note = Config::get_option(keys::OPTION_PRESET_ADDRESS_BOOK_NOTE);
                     if !ab_note.is_empty() {
                         v[keys::OPTION_PRESET_ADDRESS_BOOK_NOTE] = json!(ab_note);
@@ -258,17 +254,26 @@ async fn start_hbbs_sync_async() {
                                     SENDER.lock().unwrap().send(conns).ok();
                                 }
                         }
+                        if let Some(strategy) = rsp.remove("strategy") {
+                            if let Ok(strategy) = serde_json::from_value::<StrategyOptions>(strategy) {
+                                #[cfg(all(target_os = "linux", feature = "drm"))]
+                                let drm_capture_was_on = crate::platform::linux::drm_capture_enabled();
+                                let result = handle_config_options(strategy.config_options).await;
+                                // Also after a rejected update: the options outside authentication are applied.
+                                #[cfg(all(target_os = "linux", feature = "drm"))]
+                                crate::platform::linux::sync_drm_capture_to_service(drm_capture_was_on).await;
+                                if let Err(error) = result {
+                                    hbb_common::throttled_log!(API_LOG_INTERVAL, error, "Strategy update rejected: {error}");
+                                    continue;
+                                }
+                                log::info!("strategy updated");
+                            }
+                        }
                         if let Some(rsp_modified_at) = rsp.remove("modified_at") {
                             if let Ok(rsp_modified_at) = serde_json::from_value::<i64>(rsp_modified_at) {
                                 if rsp_modified_at != modified_at {
                                     LocalConfig::set_option("strategy_timestamp".to_string(), rsp_modified_at.to_string());
                                 }
-                            }
-                        }
-                        if let Some(strategy) = rsp.remove("strategy") {
-                            if let Ok(strategy) = serde_json::from_value::<StrategyOptions>(strategy) {
-                                log::info!("strategy updated");
-                                handle_config_options(strategy.config_options);
                             }
                         }
                     }
@@ -289,7 +294,58 @@ fn heartbeat_url() -> String {
     format!("{}/api/heartbeat", url)
 }
 
-fn handle_config_options(config_options: HashMap<String, String>) {
+const BLOCKED_CONFIG_OPTIONS: &[&str] = &[
+    // Server endpoints and trust.
+    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+    "rendezvous-servers",
+    keys::OPTION_API_SERVER,
+    keys::OPTION_RELAY_SERVER,
+    keys::OPTION_KEY,
+    keys::OPTION_ICE_SERVERS,
+    // Transport security.
+    keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+    keys::OPTION_ALLOW_WEBSOCKET,
+    keys::OPTION_WEBSOCKET_PORT,
+    // Authentication and credentials.
+    "2fa",
+    "bot",
+    keys::OPTION_PRESET_ADDRESS_BOOK_PASSWORD,
+    keys::OPTION_ENABLE_TRUSTED_DEVICES,
+    keys::OPTION_TRUSTED_DEVICE_EXPIRATION,
+    // Deployment and address book metadata.
+    keys::OPTION_PRESET_ADDRESS_BOOK_NAME,
+    keys::OPTION_PRESET_ADDRESS_BOOK_TAG,
+    keys::OPTION_PRESET_ADDRESS_BOOK_ALIAS,
+    keys::OPTION_PRESET_ADDRESS_BOOK_NOTE,
+    keys::OPTION_PRESET_DEVICE_NAME,
+    keys::OPTION_PRESET_DEVICE_USERNAME,
+    keys::OPTION_PRESET_NOTE,
+    // Recording location and service state.
+    keys::OPTION_WINDOWS_SERVICE_VIDEO_SAVE_DIRECTORY,
+    "stop-service",
+    "reg_recovery",
+];
+
+fn filter_config_options(options: &mut HashMap<String, String>) {
+    let rejected: Vec<_> = BLOCKED_CONFIG_OPTIONS
+        .iter()
+        .copied()
+        .filter(|key| options.contains_key(*key))
+        .collect();
+    if !rejected.is_empty() {
+        hbb_common::throttled_log!(
+            crate::common::API_LOG_INTERVAL,
+            warn,
+            "Rejected heartbeat strategy options: {rejected:?}"
+        );
+    }
+    options.retain(|key, _| !BLOCKED_CONFIG_OPTIONS.contains(&key.as_str()));
+}
+
+async fn handle_config_options(
+    mut config_options: HashMap<String, String>,
+) -> hbb_common::ResultType<()> {
+    filter_config_options(&mut config_options);
     let mut options = Config::get_options();
     let default_settings = config::DEFAULT_SETTINGS.read().unwrap().clone();
     config_options
@@ -305,7 +361,29 @@ fn handle_config_options(config_options: HashMap<String, String>) {
             }
         })
         .count();
+    if crate::trusted_devices::config::changes_authentication(&options) {
+        let current = Config::get_options();
+        let mut non_auth_options = options.clone();
+        for key in [
+            "2fa",
+            keys::OPTION_ENABLE_TRUSTED_DEVICES,
+            keys::OPTION_TRUSTED_DEVICE_EXPIRATION,
+        ] {
+            match current.get(key) {
+                Some(value) => {
+                    non_auth_options.insert(key.to_owned(), value.clone());
+                }
+                None => {
+                    non_auth_options.remove(key);
+                }
+            }
+        }
+        // Authentication update failures must not block unrelated strategy options.
+        Config::set_options(non_auth_options);
+        return crate::trusted_devices::config::update_options(options).await;
+    }
     Config::set_options(options);
+    Ok(())
 }
 
 #[allow(unused)]
@@ -443,5 +521,104 @@ mod tests {
         ]
         .concat();
         assert_eq!(switch_grant_signed_msg("id1", "c1", "1700000000"), expected);
+    }
+}
+
+#[cfg(test)]
+mod strategy_tests {
+    use super::{filter_config_options, HashMap};
+
+    #[test]
+    fn strategy_cannot_replace_or_clear_server_trust_and_credentials() {
+        for value in ["attacker", "Y", "N", ""] {
+            let mut options = [
+                "custom-rendezvous-server",
+                "rendezvous-servers",
+                "api-server",
+                "relay-server",
+                "key",
+                "ice-servers",
+                "allow-insecure-tls-fallback",
+                "allow-websocket",
+                "websocket-port",
+                "2fa",
+                "bot",
+                "preset-address-book-password",
+                "enable-trusted-devices",
+                "trusted-device-expiration-days",
+                "preset-address-book-name",
+                "preset-address-book-tag",
+                "preset-address-book-alias",
+                "preset-address-book-note",
+                "preset-device-name",
+                "preset-device-username",
+                "preset-note",
+                "windows-service-video-save-directory",
+                "stop-service",
+                "reg_recovery",
+            ]
+            .into_iter()
+            .map(|key| (key.to_owned(), value.to_owned()))
+            .collect::<HashMap<_, _>>();
+            options.insert("enable-clipboard".to_owned(), "N".to_owned());
+            options.insert("allow-auto-disconnect".to_owned(), String::new());
+            filter_config_options(&mut options);
+            assert_eq!(
+                options,
+                HashMap::from([
+                    ("enable-clipboard".to_owned(), "N".to_owned()),
+                    ("allow-auto-disconnect".to_owned(), String::new()),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn existing_and_unknown_policy_options_are_preserved() {
+        let policy_keys = [
+            // Existing server strategy options.
+            "access-mode",
+            "enable-keyboard",
+            "enable-remote-printer",
+            "enable-clipboard",
+            "enable-file-transfer",
+            "enable-audio",
+            "enable-terminal",
+            "enable-tunnel",
+            "enable-remote-restart",
+            "enable-record-session",
+            "enable-block-input",
+            "enable-privacy-mode",
+            "enable-camera",
+            "allow-remote-config-modification",
+            "approve-mode",
+            "verification-method",
+            "temporary-password-length",
+            "allow-numeric-one-time-password",
+            "allow-hide-cm",
+            "enable-lan-discovery",
+            "direct-server",
+            "direct-access-port",
+            "whitelist",
+            "id-whitelist",
+            "allow-auto-disconnect",
+            "auto-disconnect-timeout",
+            "allow-remove-wallpaper",
+            // Security policy controls.
+            "allow-only-conn-window-open",
+            "allow-scope-violation-close",
+            "allow-scope-violation-alarm",
+            // Future strategy option.
+            "future-strategy-option",
+        ];
+        for value in ["Y", "N", ""] {
+            let mut options: HashMap<_, _> = policy_keys
+                .into_iter()
+                .map(|key| (key.to_owned(), value.to_owned()))
+                .collect();
+            let expected = options.clone();
+            filter_config_options(&mut options);
+            assert_eq!(options, expected);
+        }
     }
 }

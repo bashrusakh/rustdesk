@@ -428,6 +428,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
+    if (isWindows &&
+        !bind.isDisableInstallation() &&
+        bind.mainIsInstalled() &&
+        !bind.isOutgoingOnly() &&
+        !mainGetBoolOptionSync(kOptionStopService) &&
+        !bind.mainIsInstalledDaemon(prompt: false)) {
+      return buildInstallCard("", "install_daemon_tip", "Install", () async {
+        await rustDeskWinManager.closeAllSubWindows();
+        await start_service(true);
+      });
+    }
     if (!bind.isCustomClient() &&
         updateUrl.isNotEmpty &&
         !isCardClosed &&
@@ -480,6 +491,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         return buildInstallCard("Permissions", "config_screen", "Configure",
             () async {
           bind.mainIsCanScreenRecording(prompt: true);
+          // macOS shows the request prompt only once per app, so later
+          // presses would do nothing without opening the settings pane.
+          launchUrl(Uri.parse(
+              'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'));
           watchIsCanScreenRecording = true;
         }, help: 'Help', link: translate("doc_mac_permission"));
       } else if (!isOutgoingOnly && !bind.mainIsProcessTrusted(prompt: false)) {
@@ -534,7 +549,29 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           ));
         }
       }
-      if (bind.mainCurrentIsWayland()) {
+      final drmSupported = bind.mainIsInstalled() &&
+          bind.mainGetCommonSync(key: 'is-drm-capture-supported') == 'true';
+      if (drmSupported && mainGetBoolOptionSync(kOptionAllowDrmCapture)) {
+        // DRM capture reaches the session and the login screen: no warning.
+      } else if (drmSupported &&
+          !isOptionFixed(kOptionAllowDrmCapture) &&
+          !bind.isDisableSettings()) {
+        final currentIsWayland = bind.mainCurrentIsWayland();
+        if (currentIsWayland || bind.mainIsLoginWayland()) {
+          LinuxCards.add(buildInstallCard(
+              "Warning",
+              currentIsWayland ? "wayland-drm-tip" : "login-wayland-drm-tip",
+              "Enable", () async {
+            await mainSetBoolOption(kOptionAllowDrmCapture, true);
+            setState(() {});
+          },
+              marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
+              help: 'Help',
+              link: currentIsWayland
+                  ? 'https://rustdesk.com/docs/en/client/linux/#x11-required'
+                  : 'https://rustdesk.com/docs/en/client/linux/#login-screen'));
+        }
+      } else if (bind.mainCurrentIsWayland()) {
         LinuxCards.add(buildInstallCard(
             "Warning", "wayland_experiment_tip", "", () async {},
             marginTop: LinuxCards.isEmpty ? 20.0 : 5.0,
@@ -554,6 +591,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     }
     if (bind.isIncomingOnly()) {
+      final quitButtonText =
+          bind.mainGetBuildinOption(key: kOptionQuitButtonText).trim();
       return Align(
         alignment: Alignment.centerRight,
         child: OutlinedButton(
@@ -564,7 +603,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               exit(0);
             }
           },
-          child: Text(translate('Quit')),
+          child: Text(quitButtonText.isEmpty ? translate('Quit') : quitButtonText),
         ),
       ).marginAll(14);
     }
@@ -800,6 +839,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           password: call.arguments['password'],
           forceRelay: call.arguments['forceRelay'],
           connToken: call.arguments['connToken'],
+          loginMethod: call.arguments['loginMethod'] ?? '',
         );
       } else if (call.method == kWindowBumpMouse) {
         return RdPlatformChannel.instance.bumpMouse(

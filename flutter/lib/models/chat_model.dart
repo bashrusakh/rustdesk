@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
+import 'package:flutter_hbb/desktop/widgets/windows_cm_window_position.dart';
 import 'package:flutter_hbb/mobile/pages/home_page.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -18,6 +19,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import '../consts.dart';
 import '../common.dart';
 import '../common/widgets/overlay.dart';
+import '../desktop/pages/server_page.dart' show checkClickTime;
 import '../main.dart';
 import 'model.dart';
 
@@ -64,8 +66,11 @@ class ChatModel with ChangeNotifier {
   RxBool isWindowFocus = true.obs;
   BlockableOverlayState _blockableOverlayState = BlockableOverlayState();
   final Rx<VoiceCallStatus> _voiceCallStatus = Rx(VoiceCallStatus.notStarted);
+  final RxBool _softKeyboardRequested = false.obs;
+  bool _usingPhysicalChatInput = false;
 
   Rx<VoiceCallStatus> get voiceCallStatus => _voiceCallStatus;
+  RxBool get softKeyboardRequested => _softKeyboardRequested;
 
   TextEditingController textController = TextEditingController();
   RxInt mobileUnreadSum = 0.obs;
@@ -80,6 +85,8 @@ class ChatModel with ChangeNotifier {
 
   @override
   void dispose() {
+    inputNode.removeListener(_updateChatInputControl);
+    _restoreChatInputControl();
     textController.dispose();
     super.dispose();
   }
@@ -136,8 +143,15 @@ class ChatModel with ChangeNotifier {
             user: me,
             createdAt: DateTime.now(),
           );
-          send(message);
-          textController.clear();
+          if (isConnManager) {
+            checkSend(() {
+              send(message);
+              textController.clear();
+            });
+          } else {
+            send(message);
+            textController.clear();
+          }
           return KeyEventResult.handled;
         }
 
@@ -194,13 +208,18 @@ class ChatModel with ChangeNotifier {
     }
   }
 
-  showChatWindowOverlay({Offset? chatInitPos}) {
+  showChatWindowOverlay(
+      {Offset? chatInitPos, bool requestSoftKeyboard = true}) {
     if (chatWindowOverlayEntry != null) return;
     isWindowFocus.value = true;
     _blockableOverlayState.setMiddleBlocked(true);
 
     final overlayState = _blockableOverlayState.state;
     if (overlayState == null) return;
+    if (isMobile) {
+      _softKeyboardRequested.value = requestSoftKeyboard;
+      gFFI.invokeMethod("enable_soft_keyboard", true);
+    }
     if (isMobile &&
         !gFFI.chatModel.currentKey.isOut && // not in remote page
         gFFI.chatModel.latestReceivedKey != null) {
@@ -209,7 +228,8 @@ class ChatModel with ChangeNotifier {
     }
     final overlay = OverlayEntry(builder: (context) {
       return Listener(
-          onPointerDown: (_) {
+          onPointerDown: (event) {
+            _requestChatSoftKeyboard(event);
             if (!isWindowFocus.value) {
               isWindowFocus.value = true;
               _blockableOverlayState.setMiddleBlocked(true);
@@ -223,6 +243,10 @@ class ChatModel with ChangeNotifier {
     });
     overlayState.insert(overlay);
     chatWindowOverlayEntry = overlay;
+    if (isMobile && !requestSoftKeyboard) {
+      inputNode.addListener(_updateChatInputControl);
+      _updateChatInputControl();
+    }
     requestChatInputFocus();
   }
 
@@ -231,6 +255,9 @@ class ChatModel with ChangeNotifier {
       _blockableOverlayState.setMiddleBlocked(false);
       chatWindowOverlayEntry!.remove();
       chatWindowOverlayEntry = null;
+      _softKeyboardRequested.value = false;
+      inputNode.removeListener(_updateChatInputControl);
+      _restoreChatInputControl();
       return;
     }
   }
@@ -239,13 +266,14 @@ class ChatModel with ChangeNotifier {
       ((!(isDesktop || isWebDesktop) && chatIconOverlayEntry == null) ||
           chatWindowOverlayEntry == null);
 
-  toggleChatOverlay({Offset? chatInitPos}) {
+  toggleChatOverlay({Offset? chatInitPos, bool requestSoftKeyboard = true}) {
     if (_isChatOverlayHide()) {
-      gFFI.invokeMethod("enable_soft_keyboard", true);
+      if (!isMobile) gFFI.invokeMethod("enable_soft_keyboard", true);
       if (!(isDesktop || isWebDesktop)) {
         showChatIconOverlay();
       }
-      showChatWindowOverlay(chatInitPos: chatInitPos);
+      showChatWindowOverlay(
+          chatInitPos: chatInitPos, requestSoftKeyboard: requestSoftKeyboard);
     } else {
       hideChatIconOverlay();
       hideChatWindowOverlay();
@@ -298,8 +326,12 @@ class ChatModel with ChangeNotifier {
       _isShowCMSidePage = !_isShowCMSidePage;
       notifyListeners();
       await windowManager.show();
-      await windowManager.setSizeAlignment(
-          kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
+      if (isWindows) {
+        await setWindowsCmWindowBounds(kConnectionManagerWindowSizeClosedChat);
+      } else {
+        await windowManager.setSizeAlignment(
+            kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
+      }
     } else {
       final currentSelectedTab =
           gFFI.serverModel.tabController.state.value.selectedTabInfo;
@@ -310,8 +342,12 @@ class ChatModel with ChangeNotifier {
       }
       requestChatInputFocus();
       await windowManager.show();
-      await windowManager.setSizeAlignment(
-          kConnectionManagerWindowSizeOpenChat, Alignment.topRight);
+      if (isWindows) {
+        await setWindowsCmWindowBounds(kConnectionManagerWindowSizeOpenChat);
+      } else {
+        await windowManager.setSizeAlignment(
+            kConnectionManagerWindowSizeOpenChat, Alignment.topRight);
+      }
       _isShowCMSidePage = !_isShowCMSidePage;
       notifyListeners();
     }
@@ -441,6 +477,20 @@ class ChatModel with ChangeNotifier {
     notifyListeners();
   }
 
+  void checkSend(VoidCallback callback) {
+    final id = _currentKey.connId;
+    final text = textController.text;
+    checkClickTime(id, () {
+      if (_currentKey.connId == id &&
+          textController.text == text &&
+          parent.target?.serverModel.clients
+                  .any((client) => client.id == id && !client.disconnected) ==
+              true) {
+        callback();
+      }
+    });
+  }
+
   send(ChatMessage message) {
     String trimmedText = message.text.trim();
     if (trimmedText.isEmpty) {
@@ -520,6 +570,47 @@ class ChatModel with ChangeNotifier {
         inputNode.requestFocus();
       }
     });
+  }
+
+  void _requestChatSoftKeyboard(PointerDownEvent event) {
+    if (!isMobile || _softKeyboardRequested.value) return;
+    inputNode.context?.visitAncestorElements((element) {
+      if (element.widget is! TextField) return true;
+      final box = element.findRenderObject();
+      if (box is! RenderBox) return false;
+      final bounds = box.localToGlobal(Offset.zero) & box.size;
+      if (!bounds.contains(event.position)) return false;
+      _softKeyboardRequested.value = true;
+      _restoreChatInputControl();
+      // Reconnect so the platform receives the keyboard type instead of none.
+      inputNode.unfocus(disposition: UnfocusDisposition.previouslyFocusedChild);
+      scheduleMicrotask(() {
+        if (chatWindowOverlayEntry != null && _softKeyboardRequested.value) {
+          inputNode.requestFocus();
+        }
+      });
+      return false;
+    });
+  }
+
+  void _updateChatInputControl() {
+    final physicalChatFocused = chatWindowOverlayEntry != null &&
+        inputNode.hasFocus &&
+        !_softKeyboardRequested.value;
+    if (!physicalChatFocused) {
+      _restoreChatInputControl();
+      return;
+    }
+    if (_usingPhysicalChatInput) return;
+    _usingPhysicalChatInput = true;
+    // Keep the platform text-input connection for physical editing, without IME UI.
+    TextInput.setInputControl(null);
+  }
+
+  void _restoreChatInputControl() {
+    if (!_usingPhysicalChatInput) return;
+    _usingPhysicalChatInput = false;
+    TextInput.restorePlatformInputControl();
   }
 
   void onVoiceCallWaiting() {

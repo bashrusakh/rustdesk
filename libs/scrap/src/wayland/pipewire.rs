@@ -23,7 +23,7 @@ use gstreamer_app::AppSink;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
-use base::platform::linux::CMD_SH;
+use base::platform::linux::{WaylandDisplayInfo, CMD_SH};
 use hbb_common::{anyhow::anyhow, bail, config, serde_json, tokio, ResultType};
 
 use super::capturable::PixelProvider;
@@ -77,7 +77,9 @@ pub fn close_session() {
 
 #[inline]
 pub fn is_rdp_session_hold() -> bool {
-    RDP_SESSION_INFO.lock().unwrap().is_some()
+    // try_lock: a request waiting for the user holds the slot (no session yet), and so do the short
+    // looks while a session is set up. Busy answers no session rather than wait.
+    matches!(RDP_SESSION_INFO.try_lock(), Ok(info) if info.is_some())
 }
 
 pub fn try_close_session() {
@@ -157,6 +159,9 @@ pub struct PipeWireCapturable {
     pub position: (i32, i32),
     pub logical_size: (usize, usize),
     pub physical_size: (usize, usize),
+    // False when `physical_size` is the portal size standing in for a resolution get_res() could
+    // not read.
+    physical_size_measured: bool,
 }
 
 impl PipeWireCapturable {
@@ -168,7 +173,7 @@ impl PipeWireCapturable {
     ) -> Self {
         // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
         // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
-        let physical_size = get_res(Self {
+        let measured = get_res(Self {
             dbus_conn: conn.clone(),
             fd: fd.clone(),
             path: stream.path,
@@ -177,8 +182,10 @@ impl PipeWireCapturable {
             position: stream.position,
             logical_size: stream.size,
             physical_size: (0, 0),
-        })
-        .unwrap_or(stream.size);
+            physical_size_measured: false,
+        });
+        let physical_size_measured = measured.is_ok();
+        let physical_size = measured.unwrap_or(stream.size);
         *resolution.lock().unwrap() = Some(physical_size);
         Self {
             dbus_conn: conn,
@@ -189,6 +196,7 @@ impl PipeWireCapturable {
             position: stream.position,
             logical_size: stream.size,
             physical_size,
+            physical_size_measured,
         }
     }
 }
@@ -262,7 +270,14 @@ pub struct PipeWireRecorder {
     width: usize,
     height: usize,
     saved_raw_data: Vec<u8>, // for faster compare and copy
+    dmabuf_frame: Vec<u8>,   // last frame read from a linear DMA-BUF, rows packed to width * 4
 }
+
+// Compositors such as niri offer screencast buffers only as DMA-BUF, so the system-memory
+// pipeline never negotiates ("no more input formats"). Linear DMA-BUF can be read by the CPU,
+// so the fallback pipeline accepts it and `read_linear_dmabuf` copies the frame out.
+// A drm-format without a ":0x<modifier>" suffix means the linear modifier.
+const DMABUF_CAPS: &str = "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={XR24,XB24}";
 
 // Element creation fails the same way for a plugin that is not installed as for one that is
 // broken, so the tag does not claim which. Only the name travels to the peer -- it is what
@@ -277,6 +292,8 @@ fn gst_element(name: &str) -> ResultType<gst::Element> {
 impl PipeWireRecorder {
     pub fn new(capturable: PipeWireCapturable) -> ResultType<Self> {
         let pipeline = gst::Pipeline::new(None);
+        // Clock waits on stale capture timestamps can exhaust the compositor's buffers.
+        pipeline.use_clock(None::<&gst::Clock>);
 
         let src = gst_element("pipewiresrc")?;
         src.set_property("fd", &capturable.fd.as_raw_fd())?;
@@ -326,7 +343,21 @@ impl PipeWireRecorder {
             "[gstreamer] Setting pipeline {} to PLAYING state...",
             capturable.fd.as_raw_fd()
         );
-        pipeline.set_state(gst::State::Playing)?;
+        let (pipeline, appsink) = match pipeline.set_state(gst::State::Playing) {
+            Ok(_) => (pipeline, appsink),
+            Err(e) => {
+                warn!(
+                    "[gstreamer] System-memory pipeline {} failed ({}), retrying with linear DMA-BUF",
+                    capturable.fd.as_raw_fd(),
+                    e
+                );
+                // Release the PipeWire stream before the next pipeline connects to the same node.
+                if let Err(e) = pipeline.set_state(gst::State::Null) {
+                    warn!("[gstreamer] Failed to stop pipeline: {}", e);
+                }
+                build_dmabuf_pipeline(&capturable)?
+            }
+        };
 
         // If `is_server_running()` is false, it means using remote_desktop_portal,
         // which does not use multiple streams, so no need to wait for state change.
@@ -361,7 +392,275 @@ impl PipeWireRecorder {
             buffer_cropped: vec![],
             is_cropped: false,
             saved_raw_data: Vec::new(),
+            dmabuf_frame: Vec::new(),
         })
+    }
+}
+
+// Same as the pipeline in `PipeWireRecorder::new`, but for DMA-BUF: no videoconvert (it cannot
+// import DMA-BUF) and no always-copy (it copies only the PipeWire chunk, whose size is a
+// placeholder for DMA-BUF, 1 byte on niri; the frame is read through the fd instead).
+fn build_dmabuf_pipeline(capturable: &PipeWireCapturable) -> ResultType<(gst::Pipeline, AppSink)> {
+    let pipeline = gst::Pipeline::new(None);
+    // Clock waits on stale capture timestamps can exhaust the compositor's buffers.
+    pipeline.use_clock(None::<&gst::Clock>);
+
+    let src = gst_element("pipewiresrc")?;
+    src.set_property("fd", &capturable.fd.as_raw_fd())?;
+    src.set_property("path", &format!("{}", capturable.path))?;
+    src.set_property("keepalive_time", &1_000.as_raw_fd())?;
+
+    let sink = gst_element("appsink")?;
+    sink.set_property("drop", &true)?;
+    sink.set_property("max-buffers", &1u32)?;
+
+    pipeline.add_many(&[&src, &sink])?;
+    src.link(&sink)?;
+
+    let appsink = sink
+        .dynamic_cast::<AppSink>()
+        .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
+    let caps = DMABUF_CAPS
+        .parse::<gst::Caps>()
+        .map_err(|_| GStreamerError("Invalid DMA-BUF caps".into()))?;
+    appsink.set_caps(Some(&caps));
+
+    debug!(
+        "[gstreamer] Setting DMA-BUF pipeline {} to PLAYING state...",
+        capturable.fd.as_raw_fd()
+    );
+    if let Err(e) = pipeline.set_state(gst::State::Playing) {
+        if let Err(e) = pipeline.set_state(gst::State::Null) {
+            warn!("[gstreamer] Failed to stop DMA-BUF pipeline: {}", e);
+        }
+        return Err(e.into());
+    }
+    Ok((pipeline, appsink))
+}
+
+// libgstallocators is part of gst-plugins-base, which pipewiresrc and gstreamer-video need anyway.
+#[link(name = "gstallocators-1.0")]
+extern "C" {
+    fn gst_is_dmabuf_memory(mem: *mut std::ffi::c_void) -> std::os::raw::c_int;
+    fn gst_dmabuf_memory_get_fd(mem: *mut std::ffi::c_void) -> std::os::raw::c_int;
+}
+
+/// Copy a linear BGRx/RGBx DMA-BUF frame into `out` as packed rows of `w * 4` bytes.
+/// A normal map of such a buffer covers only the PipeWire chunk size, so read through the fd.
+/// Returns `Ok(false)`, with `out` unchanged, for a frame that does not fit its dmabuf.
+fn read_linear_dmabuf(
+    buf: &gst::Buffer,
+    w: usize,
+    h: usize,
+    out: &mut Vec<u8>,
+) -> Result<bool, Box<dyn Error>> {
+    use hbb_common::libc;
+    #[repr(C)]
+    struct DmaBufSync {
+        flags: u64,
+    }
+    // _IOW('b', 0, struct dma_buf_sync)
+    const DMA_BUF_IOCTL_SYNC: u64 = 0x4008_6200;
+    const DMA_BUF_SYNC_READ: u64 = 1;
+    const DMA_BUF_SYNC_END: u64 = 4;
+
+    if buf.n_memory() != 1 {
+        return Err(GStreamerError(format!("DMA-BUF with {} memories", buf.n_memory())).into());
+    }
+    let mem = buf.peek_memory(0);
+    let mem_ptr = unsafe { mem.as_ptr() } as *mut std::ffi::c_void;
+    if unsafe { gst_is_dmabuf_memory(mem_ptr) } == 0 {
+        return Err(GStreamerError("Buffer memory is not DMA-BUF".into()).into());
+    }
+    let fd = unsafe { gst_dmabuf_memory_get_fd(mem_ptr) };
+    if fd < 0 {
+        return Err(GStreamerError("DMA-BUF memory has no fd".into()).into());
+    }
+    let (stride, plane_offset) = match buf.get_meta::<gstreamer_video::VideoMeta>() {
+        Some(m) => (m.get_stride()[0].max(0) as usize, m.get_offset()[0]),
+        None => (w * 4, 0),
+    };
+    // Map only what the dmabuf holds, so a bad stride or offset is an error, not a SIGBUS.
+    let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if size <= 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let len = size as usize;
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // Sync makes the CPU view coherent with the GPU around the read.
+    // The kernel asks callers to restart it on EINTR / EAGAIN.
+    let sync = |flags: u64| -> Result<(), Box<dyn Error>> {
+        let mut arg = DmaBufSync { flags };
+        loop {
+            if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, &mut arg) } == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if !matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+                return Err(err.into());
+            }
+        }
+    };
+    let copied = sync(DMA_BUF_SYNC_READ).and_then(|_| {
+        let src = unsafe { std::slice::from_raw_parts(map as *const u8, len) };
+        let start = mem.get_offset() + plane_offset;
+        let packed = pack_rows(src, start, stride, w * 4, h, out);
+        if !packed {
+            // Caps can carry a new size while the buffer is still from the old allocation,
+            // like the system-memory size mismatch (pipewire#985): drop the frame.
+            trace!(
+                "DMA-BUF frame of {}x{} at offset {} and stride {} does not fit {} bytes, dropping it!",
+                w,
+                h,
+                start,
+                stride,
+                len
+            );
+        }
+        sync(DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END).map(|_| packed)
+    });
+    if unsafe { libc::munmap(map, len) } != 0 {
+        let err = std::io::Error::last_os_error();
+        // Runs once per frame, so a persistent failure must not write a line per frame.
+        hbb_common::throttled_log!(
+            Duration::from_secs(60),
+            warn,
+            "[gstreamer] Failed to unmap DMA-BUF frame: {}",
+            err
+        );
+    }
+    copied
+}
+
+/// Copy `h` rows of `row_len` bytes that start `stride` bytes apart at `start` into `out`.
+/// Returns false, with `out` unchanged, when the rows do not fit in `src`.
+fn pack_rows(
+    src: &[u8],
+    start: usize,
+    stride: usize,
+    row_len: usize,
+    h: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    // Checked: stride and offset come from the compositor, and a wrapped sum would pass the guard.
+    let end = stride
+        .checked_mul(h.saturating_sub(1))
+        .and_then(|n| n.checked_add(start))
+        .and_then(|n| n.checked_add(row_len));
+    if stride < row_len || end.map_or(true, |end| end > src.len()) {
+        return false;
+    }
+    out.clear();
+    out.reserve(row_len * h);
+    for y in 0..h {
+        let row = start + y * stride;
+        out.extend_from_slice(&src[row..row + row_len]);
+    }
+    true
+}
+
+/// Whether a `VideoCropMeta` rectangle `(x, y, width, height)` lies inside a `w` x `h` frame.
+fn crop_fits((x, y, crop_w, crop_h): (u32, u32, u32, u32), w: usize, h: usize) -> bool {
+    x.checked_add(crop_w).map_or(false, |r| r as usize <= w)
+        && y.checked_add(crop_h).map_or(false, |b| b as usize <= h)
+}
+
+/// GStreamer pixel format for a DRM fourcc name with the same byte order.
+fn drm_format_pix_fmt(drm_format: Option<&str>) -> Option<&'static str> {
+    match drm_format {
+        Some("XR24") => Some("BGRx"),
+        Some("XB24") => Some("RGBx"),
+        _ => None,
+    }
+}
+
+fn is_dmabuf_sample(sample: &gst::Sample) -> bool {
+    sample
+        .get_caps()
+        .and_then(|caps| caps.get_features(0))
+        .map_or(false, |f| f.contains("memory:DMABuf"))
+}
+
+impl PipeWireRecorder {
+    // Same steps as `capture` for system memory, with the frame read through the dmabuf fd.
+    fn capture_dmabuf(&mut self, sample: gst::Sample) -> Result<PixelProvider<'_>, Box<dyn Error>> {
+        let cap = sample
+            .get_caps()
+            .ok_or("Failed get caps")?
+            .get_structure(0)
+            .ok_or("Failed to get structure")?;
+        let w: i32 = cap.get_value("width")?.get_some()?;
+        let h: i32 = cap.get_value("height")?.get_some()?;
+        let w = w as usize;
+        let h = h as usize;
+        let drm_format = cap.get::<&str>("drm-format")?;
+        let pix_fmt = drm_format_pix_fmt(drm_format).ok_or_else(|| {
+            GStreamerError(format!("Unsupported DMA-BUF format {:?}", drm_format))
+        })?;
+
+        let buf = sample
+            .get_buffer_owned()
+            .ok_or_else(|| GStreamerError("Failed to get owned buffer.".into()))?;
+        let mut crop = buf
+            .get_meta::<gstreamer_video::VideoCropMeta>()
+            .map(|m| m.get_rect());
+        // only crop if necessary
+        if Some((0, 0, w as u32, h as u32)) == crop {
+            crop = None;
+        }
+        // The compositor sets the crop; one left from an old allocation must not slice past the frame.
+        if let Some(c) = crop.filter(|&c| !crop_fits(c, w, h)) {
+            trace!(
+                "DMA-BUF crop {:?} does not fit {}x{}, dropping it!",
+                c,
+                w,
+                h
+            );
+            return Ok(PixelProvider::NONE);
+        }
+        if !read_linear_dmabuf(&buf, w, h, &mut self.dmabuf_frame)? {
+            return Ok(PixelProvider::NONE);
+        }
+        if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, &self.dmabuf_frame) {
+            return Ok(PixelProvider::NONE);
+        }
+        let (width, height, data) = if let Some((x_off, y_off, w_crop, h_crop)) = crop {
+            let x_off = x_off as usize;
+            let y_off = y_off as usize;
+            let w_crop = w_crop as usize;
+            let h_crop = h_crop as usize;
+            self.buffer_cropped.clear();
+            // BGRx is 4 bytes per pixel
+            self.buffer_cropped.reserve(w_crop * h_crop * 4);
+            for y in y_off..(y_off + h_crop) {
+                let i = 4 * (w * y + x_off);
+                self.buffer_cropped
+                    .extend(&self.dmabuf_frame[i..i + 4 * w_crop]);
+            }
+            (w_crop, h_crop, self.buffer_cropped.as_slice())
+        } else {
+            (w, h, self.dmabuf_frame.as_slice())
+        };
+        match pix_fmt {
+            "BGRx" => Ok(PixelProvider::BGR0(width, height, data)),
+            "RGBx" => Ok(PixelProvider::RGB0(width, height, data)),
+            _ => Err(Box::new(GStreamerError(format!(
+                "Unreachable! Unknown pix_fmt, {}",
+                pix_fmt
+            )))),
+        }
     }
 }
 
@@ -371,6 +670,9 @@ impl Recorder for PipeWireRecorder {
             .appsink
             .try_pull_sample(gst::ClockTime::from_mseconds(timeout_ms))
         {
+            if is_dmabuf_sample(&sample) {
+                return self.capture_dmabuf(sample);
+            }
             let cap = sample
                 .get_caps()
                 .ok_or("Failed get caps")?
@@ -1289,6 +1591,26 @@ pub fn fill_displays(
     }
 
     if all_displays.displays.len() > 1 {
+        for (i, sd) in shared_displays.iter_mut().enumerate() {
+            if let crate::Display::WAYLAND(d) = sd {
+                let capturable = &mut d.0;
+                if let Some(origin) = reconciled_origin(
+                    capturable.position,
+                    capturable.physical_size,
+                    capturable.physical_size_measured,
+                    &all_displays.displays,
+                ) {
+                    warn!(
+                        "Position {:?} names no output of size {:?}, using {:?}.",
+                        capturable.position, capturable.physical_size, origin
+                    );
+                    capturable.position = origin;
+                    if let Some(pw_stream) = rdp_info.streams.get_mut(i) {
+                        pw_stream.position = origin;
+                    }
+                }
+            }
+        }
         sort_streams(&all_displays, shared_displays, &mut rdp_info.streams);
     }
 
@@ -1299,6 +1621,50 @@ pub fn fill_displays(
     });
 
     Ok(())
+}
+
+// The origin a stream takes when its position names no output of its size. Only a measured size
+// moves a position: when get_res() failed, the size is the portal size, which can be the mode of
+// another output and says less than the position does, whether the portal sent that position or
+// try_fill_positions restored it from its cache.
+fn reconciled_origin(
+    position: (i32, i32),
+    size: (usize, usize),
+    size_measured: bool,
+    outputs: &[WaylandDisplayInfo],
+) -> Option<(i32, i32)> {
+    if !size_measured {
+        return None;
+    }
+    corrected_origin(position, size, outputs)
+}
+
+// The origin for a stream whose position names no output of the stream's size (a rotated output
+// counts in either orientation), when exactly one output has that size. xdg-desktop-portal-hyprland reports every stream at (0, 0):
+// with no output there `sort_streams` dropped the stream, and with another output there the
+// stream took its origin and missed `try_fix_logical_size`, so the pointer landed on the wrong
+// output (#15731). With several outputs of that size the position is kept.
+fn corrected_origin(
+    position: (i32, i32),
+    size: (usize, usize),
+    outputs: &[WaylandDisplayInfo],
+) -> Option<(i32, i32)> {
+    let has_size = |o: &&WaylandDisplayInfo| {
+        let mode = (o.width as usize, o.height as usize);
+        mode == size || (o.transform % 180 != 0 && (mode.1, mode.0) == size)
+    };
+    if outputs
+        .iter()
+        .filter(has_size)
+        .any(|o| (o.x, o.y) == position)
+    {
+        return None;
+    }
+    let mut same_size = outputs.iter().filter(has_size);
+    match (same_size.next(), same_size.next()) {
+        (Some(o), None) => Some((o.x, o.y)),
+        _ => None,
+    }
 }
 
 fn try_fill_positions(
@@ -1603,6 +1969,7 @@ fn fill_multi_matched_positions_cursor(
                     position: pw_stream_with_cursor.position,
                     logical_size: pw_stream_with_cursor.size,
                     physical_size: (0, 0),
+                    physical_size_measured: false,
                 })?;
                 // Take first frame and copy owned buffer to avoid borrow across second capture
                 let (is_bgr, w, first_buf): (bool, usize, Vec<u8>) =
@@ -1723,32 +2090,116 @@ fn sort_streams(
             }
         }
     }
+    // Keep a stream whose position names no display, e.g. a full-workspace stream at (0, 0) when
+    // no display sits there (#17027). A stream at an origin another stream already took is still
+    // dropped.
+    for (s, d) in streams.drain(..).zip(shared_displays.drain(..)) {
+        if !displays
+            .displays
+            .iter()
+            .any(|wd| (wd.x, wd.y) == s.position)
+        {
+            sorted_streams.push(s);
+            sorted_shared_displays.push(d);
+        }
+    }
     *streams = sorted_streams;
     *shared_displays = sorted_shared_displays;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::stage_err;
+    use super::{corrected_origin, drm_format_pix_fmt, pack_rows, WaylandDisplayInfo};
 
     #[test]
-    fn stage_err_keeps_the_detail_safe_for_a_placeholder() {
+    fn a_strided_dmabuf_frame_comes_out_as_packed_rows() {
+        // 2x2 BGRx frame at offset 3 with stride 12: 4 bytes of padding after each row.
+        let mut src = vec![0xEE; 3 + 12 * 2];
+        src[3..11].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        src[15..23].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let mut out = Vec::new();
+        assert!(pack_rows(&src, 3, 12, 8, 2, &mut out));
+        assert_eq!(out, (1..=16).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn a_dmabuf_too_small_for_its_stride_is_dropped() {
+        let mut out = Vec::new();
+        assert!(pack_rows(&[1; 20], 0, 12, 8, 2, &mut out));
+        let frame = out.clone();
+        assert!(!pack_rows(&[2; 19], 0, 12, 8, 2, &mut out));
+        // A dropped frame leaves the last good one in place.
+        assert_eq!(out, frame);
+    }
+
+    #[test]
+    fn niri_drm_formats_map_to_encoder_pixel_formats() {
+        assert_eq!(drm_format_pix_fmt(Some("XR24")), Some("BGRx"));
+        assert_eq!(drm_format_pix_fmt(Some("XB24")), Some("RGBx"));
+        assert_eq!(drm_format_pix_fmt(Some("NV12")), None);
+    }
+
+    fn output(x: i32, y: i32, mode: (i32, i32)) -> WaylandDisplayInfo {
+        WaylandDisplayInfo {
+            name: String::new(),
+            x,
+            y,
+            width: mode.0,
+            height: mode.1,
+            logical_size: None,
+            refresh_rate: 60,
+            transform: 0,
+        }
+    }
+
+    #[test]
+    fn a_portal_position_naming_no_output_of_its_size_moves_to_the_only_one() {
+        // 1920x1080 at the origin, 2880x1800 to its right: xdph puts the right one at (0, 0).
+        let pair = [output(0, 0, (1920, 1080)), output(1920, 0, (2880, 1800))];
         assert_eq!(
-            stage_err("start", "declined", ""),
-            "wl-stage:start:declined:"
+            corrected_origin((0, 0), (2880, 1800), &pair),
+            Some((1920, 0))
         );
-        // Braces of its own would break the placeholder lookup on the peer.
+        // A real origin is kept.
+        assert_eq!(corrected_origin((1920, 0), (2880, 1800), &pair), None);
+        // Nothing starts at the origin (the hyprland layout in #15731).
+        let three = [
+            output(0, 120, (1920, 1200)),
+            output(1920, 0, (3440, 1440)),
+            output(5360, 180, (1920, 1080)),
+        ];
         assert_eq!(
-            stage_err("create-session", "dbus", "org.freedesktop.{Error}"),
-            "wl-stage:create-session:dbus:org.freedesktop.Error"
+            corrected_origin((0, 0), (3440, 1440), &three),
+            Some((1920, 0))
         );
+        // Two outputs of that size cannot be told apart: the position is kept.
+        let twins = [
+            output(0, 0, (2560, 1600)),
+            output(2560, 0, (1920, 1080)),
+            output(4480, 0, (1920, 1080)),
+        ];
+        assert_eq!(corrected_origin((0, 0), (1920, 1080), &twins), None);
+        // A portrait panel turned to landscape keeps its position next to a 1920x1080 output.
+        let turned = [
+            WaylandDisplayInfo {
+                transform: 90,
+                ..output(0, 0, (1080, 1920))
+            },
+            output(1920, 0, (1920, 1080)),
+        ];
+        assert_eq!(corrected_origin((0, 0), (1920, 1080), &turned), None);
+        // A rotated output that try_fill_positions could not match by its mode is found in its
+        // delivered orientation.
+        let turned_right = [
+            output(0, 0, (2560, 1440)),
+            WaylandDisplayInfo {
+                transform: 90,
+                ..output(2560, 0, (1080, 1920))
+            },
+        ];
         assert_eq!(
-            stage_err("select-sources", "internal", "one\ntwo"),
-            "wl-stage:select-sources:internal:one two"
-        );
-        assert_eq!(
-            stage_err("start", "internal", &"x".repeat(300)),
-            format!("wl-stage:start:internal:{}", "x".repeat(200))
+            corrected_origin((0, 0), (1920, 1080), &turned_right),
+            Some((2560, 0))
         );
     }
 }

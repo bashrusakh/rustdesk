@@ -67,7 +67,11 @@ lazy_static::lazy_static! {
         let x11 = base::platform::linux::is_x11_or_headless();
         #[cfg(feature = "drm")]
         {
-            if x11 && !display_server_forced() && is_login_screen_wayland() {
+            if x11
+                && drm_capture_enabled()
+                && !display_server_forced()
+                && is_login_screen_wayland()
+            {
                 log::info!(
                     "drm: seat0 is a Wayland login screen that reads as x11 upstream; \
                      treating it as Wayland so the DRM path is not disabled at the one \
@@ -251,19 +255,6 @@ mod gnome_monitor_layout_tests {
             Some(GnomeMonitorLayoutMode::Logical)
         );
     }
-
-    #[test]
-    fn maps_physical_layout() {
-        assert_eq!(
-            gnome_monitor_layout_mode_from_value(2),
-            Some(GnomeMonitorLayoutMode::Physical)
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_layout() {
-        assert_eq!(gnome_monitor_layout_mode_from_value(4), None);
-    }
 }
 
 #[inline]
@@ -300,6 +291,35 @@ thread_local! {
         xdo
     });
     static DISPLAY: RefCell<*mut c_void> = RefCell::new(unsafe { XOpenDisplay(std::ptr::null())});
+}
+
+pub fn right_alt_is_level3_shift() -> ResultType<bool> {
+    use hbb_common::x11::{keysym, xlib};
+    const XKB_USE_CORE_KBD: c_uint = 0x0100;
+    // A fresh connection avoids Xlib's stale keymap cache after a layout switch.
+    // This query runs only for a matched chord with physical Right Alt held.
+    let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
+    if display.is_null() {
+        bail!("X display unavailable");
+    }
+    let result = (|| {
+        let code = rdev::linux_keycode_from_key(rdev::Key::AltGr)
+            .ok_or_else(|| anyhow!("Right Alt has no X keycode"))?;
+        let mut state: xlib::XkbStateRec = unsafe { std::mem::zeroed() };
+        let status = unsafe { xlib::XkbGetState(display, XKB_USE_CORE_KBD, &mut state) };
+        if status != c_int::from(xlib::Success) {
+            bail!("XkbGetState failed: {}", status);
+        }
+        let symbol = unsafe {
+            xlib::XkbKeycodeToKeysym(display, code as _, state.group.into(), 0)
+        };
+        // Physical Right Alt is ordinary Alt on layouts such as US English.
+        Ok(matches!(symbol as u32, keysym::XK_ISO_Level3_Shift
+            | keysym::XK_ISO_Level3_Latch | keysym::XK_ISO_Level3_Lock
+            | keysym::XK_Mode_switch))
+    })();
+    unsafe { xlib::XCloseDisplay(display) };
+    result
 }
 
 // X11 error event structure for the custom error handler.
@@ -375,8 +395,135 @@ pub struct xcb_xfixes_get_cursor_image {
 
 #[inline]
 pub fn is_login_screen_wayland() -> bool {
-    let values = get_values_of_seat0_with_gdm_wayland(&[0, 2]);
+    let values = get_values_of_seat0_with_gdm_wayland(&[0, 2, 1]);
+    #[cfg(feature = "drm")]
+    if drm_capture_enabled() && is_wayland_tty_greeter(&values[0], &values[2]) {
+        return true;
+    }
     is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
+}
+
+/// greetd starts its greeter with no `XDG_SESSION_TYPE`, so logind records the session as
+/// `Type=tty` whatever the greeter draws with, and the display server then reads as x11. A greeter
+/// whose user has a compositor socket is a Wayland login screen all the same (cosmic-greeter,
+/// gtkgreet, ReGreet, ...); a console greeter (tuigreet, agreety) has none and is left as it was.
+/// A display server forced to x11 keeps the greeter on the x11 path, as `adopt_wayland_tty_greeter`
+/// does, so the login gate does not refuse a greeter the service serves over X11.
+#[cfg(feature = "drm")]
+fn is_wayland_tty_greeter(sid: &str, uid: &str) -> bool {
+    std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER").as_deref() != Ok(DISPLAY_SERVER_X11)
+        && has_wayland_socket(uid)
+        && is_tty_greeter_session(sid)
+}
+
+#[cfg(feature = "drm")]
+fn is_tty_greeter_session(sid: &str) -> bool {
+    if sid.is_empty() {
+        return false;
+    }
+    let failure = match Command::new(CMD_LOGINCTL.as_str())
+        .args(["show-session", "-p", "Class", "-p", "Type", sid])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            return is_tty_greeter_props(&String::from_utf8_lossy(&output.stdout));
+        }
+        Ok(output) => output.status.to_string(),
+        Err(err) => err.to_string(),
+    };
+    hbb_common::throttled_log!(
+        Duration::from_secs(60),
+        info,
+        "loginctl show-session {sid} failed ({failure}); not taken for a greetd greeter"
+    );
+    false
+}
+
+#[cfg(any(feature = "drm", test))]
+fn is_tty_greeter_props(props: &str) -> bool {
+    let has = |prop: &str| props.lines().any(|line| line.trim() == prop);
+    has("Class=greeter") && has("Type=tty")
+}
+
+/// Derived from the uid, not `XDG_RUNTIME_DIR`: the root service is given no such variable.
+#[cfg(feature = "drm")]
+fn has_wayland_socket(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid.bytes().all(|b| b.is_ascii_digit())
+        && dir_has_wayland_socket(Path::new(&format!("/run/user/{uid}")))
+}
+
+#[cfg(any(feature = "drm", test))]
+fn dir_has_wayland_socket(dir: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Expected until logind has created the runtime directory.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            hbb_common::throttled_log!(
+                Duration::from_secs(60),
+                info,
+                "Could not read {}: {err}; not taken for a greetd greeter",
+                dir.display()
+            );
+            return false;
+        }
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("wayland-")
+            && !name.ends_with(".lock")
+            && entry.file_type().map_or(false, |t| t.is_socket())
+    })
+}
+
+#[cfg(test)]
+mod tty_greeter_tests {
+    use super::*;
+
+    #[test]
+    fn a_greetd_greeter_running_a_compositor_is_a_wayland_login_screen() {
+        // What `loginctl show-session -p Class -p Type` prints for cosmic-greeter under greetd.
+        assert!(is_tty_greeter_props("Type=tty\nClass=greeter\n"));
+        assert!(!is_tty_greeter_props("Type=tty\nClass=user\n"));
+        assert!(!is_tty_greeter_props("Type=wayland\nClass=greeter\n"));
+
+        let dir = std::env::temp_dir().join(format!("rustdesk-tty-greeter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wayland-1.lock"), b"").unwrap();
+        assert!(
+            !dir_has_wayland_socket(&dir),
+            "a console greeter runs no compositor"
+        );
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("wayland-1")).unwrap();
+        assert!(dir_has_wayland_socket(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The root service sets this for a greeter `--server`: that process reads the greeter account's
+/// config, which has not synced from root yet when `IS_X11` is computed.
+#[cfg(feature = "drm")]
+pub(crate) const ENV_DRM_CAPTURE: &str = "RUSTDESK_DRM_CAPTURE";
+
+/// DRM capture is compiled in and `allow-drm-capture` is on. While it is off, the drm paths in
+/// this crate run as a build without it. The Wayland enumeration in `base` and `scrap` does not
+/// read it: with no compositor named in the environment it probes the seat's socket and backs
+/// off after a failure, and it logs an enumeration failure once until the next success.
+pub fn drm_capture_enabled() -> bool {
+    #[cfg(feature = "drm")]
+    {
+        use base::config::keys::OPTION_ALLOW_DRM_CAPTURE;
+        std::env::var(ENV_DRM_CAPTURE).as_deref() == Ok("Y")
+            || Config::get_bool_option(OPTION_ALLOW_DRM_CAPTURE)
+    }
+    #[cfg(not(feature = "drm"))]
+    {
+        false
+    }
 }
 
 /// An explicit `RUSTDESK_FORCED_DISPLAY_SERVER` is an operator override, and the root service
@@ -591,7 +738,17 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
                 unsafe {
                     let img = XFixesGetCursorImage(*d);
                     if !img.is_null() {
-                        res = Some((*img).cursor_serial as u64);
+                        // Hidden X11 cursors must leave the controller's previous shape visible.
+                        let count = (*img).width as usize * (*img).height as usize;
+                        if count != 0
+                            && !(*img).pixels.is_null()
+                            && cursor_image_has_visible_pixels(std::slice::from_raw_parts(
+                                (*img).pixels,
+                                count,
+                            ))
+                        {
+                            res = Some((*img).cursor_serial as u64);
+                        }
                         XFree(img as _);
                     }
                 }
@@ -599,6 +756,26 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
         }
     });
     Ok(res)
+}
+
+fn cursor_image_has_visible_pixels(pixels: &[c_long]) -> bool {
+    pixels.iter().any(|&p| ((p >> 24) & 0xff) != 0)
+}
+
+#[cfg(test)]
+mod cursor_image_tests {
+    use super::{c_long, cursor_image_has_visible_pixels};
+
+    #[test]
+    fn only_nonzero_alpha_makes_a_cursor_visible() {
+        assert!(!cursor_image_has_visible_pixels(&[]));
+        assert!(!cursor_image_has_visible_pixels(&[0, 0x00ff_ffff]));
+        assert!(cursor_image_has_visible_pixels(&[0, 0x0100_0000]));
+        let opaque = 0xff00_0000_u32;
+        assert!(cursor_image_has_visible_pixels(&[opaque as c_long]));
+        // 64-bit Xlib sign-extends each 32-bit pixel, so an opaque pixel arrives negative.
+        assert!(cursor_image_has_visible_pixels(&[opaque as i32 as c_long]));
+    }
 }
 
 pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
@@ -875,6 +1052,43 @@ fn get_all_term_values(uid: &str) -> Vec<String> {
     terms
 }
 
+fn append_audio_latency_envs(
+    envs: &mut Vec<(&'static str, String)>,
+    get_var: impl Fn(&str) -> Option<String>,
+) {
+    for key in ["PULSE_LATENCY_MSEC", "PIPEWIRE_LATENCY"] {
+        if let Some(value) = get_var(key).filter(|value| !value.is_empty()) {
+            envs.push((key, value));
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_latency_env_tests {
+    use super::append_audio_latency_envs;
+
+    #[test]
+    fn forwards_configured_values_without_creating_defaults() {
+        let mut envs = Vec::new();
+        append_audio_latency_envs(&mut envs, |key| match key {
+            "PULSE_LATENCY_MSEC" => Some("60".to_owned()),
+            "PIPEWIRE_LATENCY" => Some("1024/48000".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            envs,
+            vec![
+                ("PULSE_LATENCY_MSEC", "60".to_owned()),
+                ("PIPEWIRE_LATENCY", "1024/48000".to_owned()),
+            ]
+        );
+
+        envs.clear();
+        append_audio_latency_envs(&mut envs, |_| None);
+        assert!(envs.is_empty());
+    }
+}
+
 #[inline]
 fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
     match desktop {
@@ -905,6 +1119,13 @@ fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
                     ));
                 }
             }
+
+            append_audio_latency_envs(&mut envs, |key| std::env::var(key).ok());
+            #[cfg(feature = "drm")]
+            if desktop.is_login_wayland() && drm_capture_enabled() {
+                envs.push((ENV_DRM_CAPTURE, "Y".to_owned()));
+            }
+
             envs.push((
                 "TERM",
                 get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
@@ -1074,29 +1295,6 @@ pub fn start_os_service() {
         allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
     });
 
-    // DRM/KMS capture producer (opt-in `drm` feature): a dedicated thread + runtime that streams
-    // scanout frames to the user `--server` over the `_drm` service-scoped channel. Runs here
-    // because this process is the root service that already holds CAP_SYS_ADMIN for the in-process
-    // (direct-mode) libdrmtap read.
-    //
-    // Builder, like every other thread this feature starts: `thread::spawn` PANICS if the thread
-    // cannot be created (EAGAIN under a thread-count or memory limit), and here that panic would
-    // unwind out of `start_os_service` -- taking down the root service itself, for a feature whose
-    // failure should only cost DRM capture. Losing the producer leaves the consumer to fall back to
-    // PipeWire/X11, which is the same path a host without the feature takes.
-    #[cfg(feature = "drm")]
-    if let Err(err) = std::thread::Builder::new()
-        .name("drm-producer".into())
-        .spawn(|| {
-            crate::ipc::start_drm();
-        })
-    {
-        log::warn!(
-            "failed to spawn the drm capture producer thread: {err}; DRM capture is off for \
-             this boot and the consumer falls back to PipeWire/X11"
-        );
-    }
-
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     let (mut display, mut xauth): (String, String) = ("".to_owned(), "".to_owned());
@@ -1113,7 +1311,20 @@ pub fn start_os_service() {
 
     let mut cm0 = false;
     let mut last_restart = Instant::now();
+    #[cfg(feature = "drm")]
+    let mut drm_capture = DrmCaptureSwitch::new();
     while running.load(Ordering::SeqCst) {
+        #[cfg(feature = "drm")]
+        if drm_capture.poll() {
+            log::info!(
+                "drm capture switched {}; restarting --server",
+                if drm_capture.on { "on" } else { "off" }
+            );
+            desktop = Desktop::default();
+            stop_server(&mut server);
+            stop_server(&mut user_server);
+            force_stop_server();
+        }
         desktop.refresh();
         update_active_user_lookup_cache(&desktop);
 
@@ -1136,16 +1347,17 @@ pub fn start_os_service() {
                 // Run the login-screen --server as the active seat0 session user (the greeter
                 // account) rather than root, so the DRM capture GPU/EGL convert never loads the
                 // vendor GPU userspace in a privileged process. is_login_wayland() matches a GDM or
-                // SDDM Wayland greeter (is_gdm_user covers both), and desktop.uid is that greeter's
-                // uid, so this drops to whichever greeter owns seat0. A greeter is_gdm_user does not
-                // recognize (e.g. LightDM) never reaches this branch -- it takes the unprivileged
-                // else-branch below already. A genuine root graphical session (username=="root")
+                // SDDM Wayland greeter (is_gdm_user covers both) or a greetd one (tty_greeter), and
+                // desktop.uid is that greeter's uid, so this drops to whichever greeter owns seat0.
+                // A greeter neither recognizes (e.g. LightDM) never reaches this branch -- it takes
+                // the unprivileged else-branch below already. A genuine root graphical session (username=="root")
                 // has no lower uid to drop to, so it stays root. The whole branch is gated on the drm
-                // feature, so the drm-off build is upstream's single `start_server(None, ..)` line.
+                // feature and on allow-drm-capture; otherwise it is upstream's single
+                // `start_server(None, ..)` line.
                 #[cfg(not(feature = "drm"))]
                 start_server(None, &mut server);
                 #[cfg(feature = "drm")]
-                if desktop.username != "root" && !desktop.uid.is_empty() {
+                if drm_capture_enabled() && desktop.username != "root" && !desktop.uid.is_empty() {
                     start_server(Some(&desktop), &mut server);
                     // If dropping to the greeter uid did not produce a RUNNING server, fall back to a
                     // root --server so the login screen stays remotable instead of looping on a
@@ -1212,6 +1424,88 @@ pub fn start_os_service() {
     log::info!("Exit");
 }
 
+/// Follows `allow-drm-capture` from the service loop. The `_drm` producer starts the first time it
+/// is on and then stays up; while the option is off `handle_drm_conn` refuses every peer.
+#[cfg(feature = "drm")]
+struct DrmCaptureSwitch {
+    on: bool,
+    producer_started: bool,
+}
+
+#[cfg(feature = "drm")]
+impl DrmCaptureSwitch {
+    fn new() -> Self {
+        Self {
+            on: drm_capture_enabled(),
+            producer_started: false,
+        }
+    }
+
+    /// Whether the option changed since the last call: every `--server` decided its paths at start.
+    fn poll(&mut self) -> bool {
+        let on = drm_capture_enabled();
+        let changed = on != self.on;
+        self.on = on;
+        if self.on && !self.producer_started {
+            self.producer_started = true;
+            // DRM/KMS capture producer (opt-in `drm` feature): a dedicated thread + runtime that
+            // streams scanout frames to the user `--server` over the `_drm` service-scoped channel.
+            // Runs here because this process is the root service that already holds CAP_SYS_ADMIN
+            // for the in-process (direct-mode) libdrmtap read.
+            //
+            // Builder, like every other thread this feature starts: `thread::spawn` PANICS if the
+            // thread cannot be created (EAGAIN under a thread-count or memory limit), and here that
+            // panic would unwind out of `start_os_service` -- taking down the root service itself,
+            // for a feature whose failure should only cost DRM capture. Losing the producer leaves
+            // the consumer to fall back to PipeWire/X11, which is the same path a host without the
+            // feature takes.
+            if let Err(err) = std::thread::Builder::new()
+                .name("drm-producer".into())
+                .spawn(|| {
+                    crate::ipc::start_drm();
+                })
+            {
+                log::warn!(
+                    "failed to spawn the drm capture producer thread: {err}; DRM capture is off \
+                     for this boot and the consumer falls back to PipeWire/X11"
+                );
+            }
+        }
+        changed
+    }
+}
+
+/// The service acts on `allow-drm-capture` from its own copy of the config, which only a non-root
+/// `--server` syncs. A root `--server` that applied a change to the option hands its config over
+/// itself, and so does the CLI, or the change never takes effect. The UI does not: `SyncConfig`
+/// carries the whole config, and a long-lived process may hold an older copy of the rest.
+#[cfg(feature = "drm")]
+pub async fn sync_drm_capture_to_service(was_on: bool) {
+    use crate::ipc::{connect_trusted_device_service, Data};
+    use hbb_common::config::Config2;
+    if !is_root() || drm_capture_enabled() == was_on {
+        return;
+    }
+    let result = async {
+        let mut conn = connect_trusted_device_service(1000).await?;
+        let config2 = crate::trusted_devices::config::update(Config2::get_for_sync).await?;
+        let configs = Box::new((Config::get(), config2));
+        conn.send(&Data::SyncConfig(Some(configs))).await?;
+        conn.next_timeout(1000).await
+    }
+    .await;
+    match result {
+        Ok(Some(Data::SyncConfig(None))) => {
+            log::info!("allow-drm-capture changed as root, config synced to the service")
+        }
+        Ok(Some(Data::SecurityConfigError(err))) => {
+            log::warn!("the service rejected the allow-drm-capture sync: {err}")
+        }
+        Ok(_) => log::warn!("the service did not confirm the allow-drm-capture sync"),
+        Err(err) => log::warn!("failed to sync allow-drm-capture to the service: {err}"),
+    }
+}
+
 #[inline]
 /// Returns the cached active `(uid, username)` snapshot when available.
 /// Callers that require a fresh seat0 lookup should call `get_values_of_seat0` directly.
@@ -1239,8 +1533,9 @@ pub fn get_active_userid_fresh() -> String {
     // A Wayland greeter owns seat0 while it is up and the DRM backend serves it, so a uid gate that
     // cannot see it rejects the greeter's own `--server`. `Desktop::refresh` reads it the same way.
     #[cfg(feature = "drm")]
-    return get_values_of_seat0_with_gdm_wayland(&[1])[0].clone();
-    #[cfg(not(feature = "drm"))]
+    if drm_capture_enabled() {
+        return get_values_of_seat0_with_gdm_wayland(&[1])[0].clone();
+    }
     get_values_of_seat0(&[1])[0].clone()
 }
 
@@ -1266,7 +1561,12 @@ fn get_cm() -> bool {
 }
 
 pub fn is_login_wayland() -> bool {
-    let files = ["/etc/gdm3/custom.conf", "/etc/gdm/custom.conf"];
+    // Debian's gdm3 reads /etc/gdm3/daemon.conf instead of custom.conf.
+    let files = [
+        "/etc/gdm3/custom.conf",
+        "/etc/gdm/custom.conf",
+        "/etc/gdm3/daemon.conf",
+    ];
     match (
         Regex::new(r"# *WaylandEnable *= *false"),
         Regex::new(r"WaylandEnable *= *true"),
@@ -1302,6 +1602,11 @@ fn _get_display_manager() -> String {
 /// Returns the cached active username when available.
 /// Callers that require a fresh seat0 lookup should call `get_values_of_seat0` directly.
 pub fn get_active_username() -> String {
+    // Flatpak runs only inside the logged-in user's session, and Flathub builds
+    // cannot reach the host's loginctl.
+    if is_flatpak() {
+        return crate::username();
+    }
     if let Some((_, username)) = get_active_user_id_name_from_cache() {
         return username;
     }
@@ -1358,7 +1663,17 @@ pub fn is_prelogin() -> bool {
     }
     let name = get_active_username();
     if let Ok(res) = run_cmds(&format!("getent passwd {}", name)) {
-        return res.contains("/bin/false") || res.contains("/usr/sbin/nologin");
+        return res.lines().any(|entry| {
+            let shell = entry.trim().rsplit(':').next().unwrap_or_default();
+            matches!(
+                shell,
+                "/bin/false"
+                    | "/usr/bin/false"
+                    | "/usr/sbin/nologin"
+                    | "/sbin/nologin"
+                    | "/usr/bin/nologin"
+            )
+        });
     }
     false
 }
@@ -1474,12 +1789,58 @@ where
 }
 
 pub fn get_pa_monitor() -> String {
+    if let Some(monitor) = get_default_pa_monitor() {
+        return monitor;
+    }
     get_pa_sources()
         .drain(..)
         .map(|x| x.0)
         .filter(|x| x.contains("monitor"))
         .next()
         .unwrap_or("".to_owned())
+}
+
+// The first monitor in the source list can belong to an output the desktop does not play to.
+fn get_default_pa_monitor() -> Option<String> {
+    use pulsectl::controllers::*;
+    // The audio service retries about every second while PulseAudio is unavailable.
+    const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut handler = SinkController::create()
+        .map_err(|err| {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                warn,
+                "Failed to create SinkController: {:?}",
+                err
+            )
+        })
+        .ok()?;
+    let sink = handler
+        .get_server_info()
+        .map_err(|err| {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                warn,
+                "Failed to get the PulseAudio server info: {:?}",
+                err
+            )
+        })
+        .ok()?
+        .default_sink_name?;
+    handler
+        .get_device_by_name(&sink)
+        .map_err(|err| {
+            hbb_common::throttled_log!(
+                LOG_INTERVAL,
+                warn,
+                "Failed to get the default sink {}: {:?}",
+                sink,
+                err
+            )
+        })
+        .ok()?
+        .monitor_name
+        .filter(|name| !name.is_empty())
 }
 
 pub fn get_pa_source_name(desc: &str) -> String {
@@ -1874,13 +2235,17 @@ fn get_width_height_from_captures<'t>(caps: &Captures<'t>) -> Option<(i32, i32)>
 #[inline]
 fn get_xrandr_conn_pat(name: &str) -> String {
     format!(
-        r"{}\s+connected.+?(?P<width>\d+)x(?P<height>\d+)\+(?P<x>\d+)\+(?P<y>\d+).*?\n",
+        r"(?m)^{}\s+connected.+?(?P<width>\d+)x(?P<height>\d+)\+(?P<x>\d+)\+(?P<y>\d+).*?\n",
         name
     )
 }
 
+// The mode lines below an output. A mode name can have a suffix after its size, like the "i" of
+// "1920x1080i", so a TV's interlaced mode does not end the list.
+const XRANDR_MODES_PAT: &str = r"(?P<resolutions>(\s*\d+x\d+\S*\s+\d+.*\n)+)";
+
 pub fn resolutions(name: &str) -> Vec<Resolution> {
-    let resolutions_pat = r"(?P<resolutions>(\s*\d+x\d+\s+\d+.*\n)+)";
+    let resolutions_pat = XRANDR_MODES_PAT;
     let connected_pat = get_xrandr_conn_pat(name);
     let mut v = vec![];
     if let Ok(re) = Regex::new(&format!("{}{}", connected_pat, resolutions_pat)) {
@@ -1956,6 +2321,48 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
     bail!("Failed to find current resolution for {}", name);
 }
 
+#[cfg(test)]
+mod xrandr_tests {
+    use super::*;
+
+    #[test]
+    fn output_name_does_not_match_inside_another_name() {
+        let xrandr_output = "Screen 0: minimum 320 x 200, current 4480 x 1440, maximum 16384 x 16384
+eDP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 309mm x 174mm
+ 1920x1080 60.01*+ 59.97
+ 1280x720 60.00
+DP-1 connected 2560x1440+1920+0 (normal left inverted right x axis y axis) 597mm x 336mm
+ 2560x1440 59.95*+
+ 1920x1080 60.00
+";
+        let re = Regex::new(&get_xrandr_conn_pat("DP-1")).unwrap();
+        let caps = re.captures(xrandr_output).unwrap();
+        assert_eq!(get_width_height_from_captures(&caps), Some((2560, 1440)));
+    }
+
+    #[test]
+    fn interlaced_mode_does_not_end_the_mode_list() {
+        let xrandr_output =
+            "Screen 0: minimum 320 x 200, current 1920 x 1080, maximum 16384 x 16384
+HDMI-0 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 1600mm x 900mm
+ 1920x1080 60.00*+ 59.94 50.00
+ 1920x1080i 60.00 59.94 50.00
+ 1280x720 60.00 59.94 50.00
+ 640x480 75.00 59.94
+DP-0 disconnected (normal left inverted right x axis y axis)
+";
+        let re = Regex::new(&format!(
+            "{}{}",
+            get_xrandr_conn_pat("HDMI-0"),
+            XRANDR_MODES_PAT
+        ))
+        .unwrap();
+        let caps = re.captures(xrandr_output).unwrap();
+        assert!(caps["resolutions"].contains(" 1280x720 "));
+        assert!(caps["resolutions"].contains(" 640x480 "));
+    }
+}
+
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
     Command::new("xrandr")
         .args(vec![
@@ -2021,6 +2428,9 @@ mod desktop {
         pub home: String,
         pub dbus: String,
         pub wl_display: String,
+        /// `Class=greeter` with `Type=tty`, see `is_wayland_tty_greeter`.
+        #[cfg(feature = "drm")]
+        tty_greeter: bool,
     }
 
     impl Desktop {
@@ -2031,7 +2441,34 @@ mod desktop {
 
         #[inline]
         pub fn is_login_wayland(&self) -> bool {
+            #[cfg(feature = "drm")]
+            if self.tty_greeter && self.is_wayland() {
+                return true;
+            }
             super::is_gdm_user(&self.username) && self.protocol == DISPLAY_SERVER_WAYLAND
+        }
+
+        /// The greeter's compositor creates its socket after logind has registered the session,
+        /// so a greeter first seen without one is asked again on every refresh until it has one.
+        /// Every compositor variable is dropped, not only the x11 values guessed meanwhile: going
+        /// straight from a user session to the greeter keeps that session's WAYLAND_DISPLAY and
+        /// bus here, and an endpoint the greeter `--server` is handed is never searched past.
+        /// A display server forced to x11 is the operator's answer, so it is left alone, as
+        /// `IS_X11` does; one forced to Wayland agrees with the socket and is adopted.
+        #[cfg(feature = "drm")]
+        fn adopt_wayland_tty_greeter(&mut self) {
+            if self.tty_greeter
+                && !self.is_wayland()
+                && std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER").as_deref()
+                    != Ok(DISPLAY_SERVER_X11)
+                && super::has_wayland_socket(&self.uid)
+            {
+                self.protocol = DISPLAY_SERVER_WAYLAND.to_owned();
+                self.display.clear();
+                self.xauth.clear();
+                self.wl_display.clear();
+                self.dbus.clear();
+            }
         }
 
         fn get_display_xauth_wayland(&mut self) {
@@ -2374,6 +2811,11 @@ mod desktop {
         /// late Wayland display discovery instead of repeating the full seat lookup.
         pub fn refresh(&mut self) {
             if !self.sid.is_empty() && is_active_and_seat0(&self.sid) {
+                #[cfg(feature = "drm")]
+                if self.tty_greeter {
+                    self.adopt_wayland_tty_greeter();
+                    return;
+                }
                 // Xwayland display and xauth may not be available in a short time after login.
                 // Avoid scanning processes on X11, where Xwayland discovery cannot provide any
                 // useful session information.
@@ -2398,6 +2840,16 @@ mod desktop {
             self.uid = seat0_values[1].clone();
             self.username = seat0_values[2].clone();
             self.protocol = get_display_server_of_session(&self.sid).into();
+            #[cfg(feature = "drm")]
+            if super::drm_capture_enabled() {
+                self.tty_greeter = super::is_tty_greeter_session(&self.sid);
+                if self.tty_greeter {
+                    // `Type=tty` names no display server, and the fallback above read this
+                    // service's own environment: only a compositor socket makes it Wayland.
+                    self.protocol = DISPLAY_SERVER_X11.to_owned();
+                }
+                self.adopt_wayland_tty_greeter();
+            }
             if self.is_login_wayland() {
                 self.display = "".to_owned();
                 self.xauth = "".to_owned();
@@ -2414,9 +2866,11 @@ mod desktop {
                 // greeter as `gdm-greeter`, which that helper does not match -- measured on the
                 // test host, where the greeter server therefore takes the branch below and gets a
                 // fully populated environment. This is for the display managers whose greeter user
-                // does match.
+                // does match, and for greetd's Wayland greeters (`adopt_wayland_tty_greeter`).
                 #[cfg(feature = "drm")]
-                self.get_home();
+                if super::drm_capture_enabled() {
+                    self.get_home();
+                }
                 return;
             }
 
@@ -2430,29 +2884,6 @@ mod desktop {
             } else {
                 self.get_display_x11();
                 self.get_xauth_x11();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_desktop_env() {
-            let mut d = Desktop::default();
-            d.refresh();
-            if d.username == "root" {
-                assert_eq!(d.home, "/root");
-            } else {
-                if !d.username.is_empty() {
-                    let home = super::super::get_env_var("HOME");
-                    if !home.is_empty() {
-                        assert_eq!(d.home, home);
-                    } else {
-                        //
-                    }
-                }
             }
         }
     }

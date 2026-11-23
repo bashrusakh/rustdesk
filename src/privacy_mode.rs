@@ -29,7 +29,7 @@ pub mod macos;
 #[cfg(windows)]
 mod win_virtual_display;
 #[cfg(windows)]
-pub use win_virtual_display::restore_reg_connectivity;
+pub use win_virtual_display::{check_privacy_mode, restore_reg_connectivity};
 
 pub const INVALID_PRIVACY_MODE_CONN_ID: i32 = 0;
 pub const OCCUPIED: &'static str = "Privacy occupied by another one.";
@@ -63,6 +63,14 @@ pub trait PrivacyMode: Sync + Send {
 
     fn get_impl_key(&self) -> &str;
 
+    #[cfg(windows)]
+    fn add_prepared_virtual_display(&mut self, _index: u32) -> ResultType<()> {
+        bail!(
+            "Prepared virtual displays are unsupported for {}",
+            self.get_impl_key()
+        );
+    }
+
     #[inline]
     fn check_on_conn_id(&self, conn_id: i32) -> ResultType<bool> {
         let pre_conn_id = self.pre_conn_id();
@@ -75,6 +83,11 @@ pub trait PrivacyMode: Sync + Send {
         Ok(false)
     }
 
+    /// `INVALID_PRIVACY_MODE_CONN_ID` deliberately bypasses the ownership check, meaning
+    /// "turn it off whoever owns it": shutdown (`ipc::Data::Close`), `reset_all`, and
+    /// `TurnOnGuard`, which undoes a half-finished turn-on however far it got. A caller
+    /// acting for one connection must pass that connection's own id, or it can turn off
+    /// privacy mode belonging to another.
     #[inline]
     fn check_off_conn_id(&self, conn_id: i32) -> ResultType<()> {
         let pre_conn_id = self.pre_conn_id();
@@ -208,11 +221,66 @@ fn get_supported_impl(impl_key: &str) -> String {
     cur_impl
 }
 
-pub async fn turn_on_privacy(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>> {
+#[cfg(windows)]
+pub fn prepare_virtual_display(
+    impl_key: &str,
+    conn_id: i32,
+) -> ResultType<Option<oneshot::Receiver<ResultType<Option<u32>>>>> {
+    const LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    if get_supported_impl(impl_key) != PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
+        || !crate::virtual_display_manager::is_amyuni_idd()
+        || !crate::virtual_display_manager::is_virtual_display_supported()
+        || get_privacy_mode_conn_id()
+            .is_some_and(|owner| owner != INVALID_PRIVACY_MODE_CONN_ID && owner != conn_id)
+    {
+        return Ok(None);
+    }
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("privacy-prepare".to_owned())
+        .spawn(move || {
+            let result =
+                crate::virtual_display_manager::amyuni_idd::prepare_privacy_monitor(|| {
+                    tx.is_closed()
+                });
+            if let Err(Err(error)) = tx.send(result) {
+                hbb_common::throttled_log!(
+                    LOG_INTERVAL,
+                    debug,
+                    "Privacy mode preparation ended after cancellation: {}",
+                    error
+                );
+            }
+        })?;
+    Ok(Some(rx))
+}
+
+pub async fn turn_on_privacy(
+    impl_key: &str,
+    conn_id: i32,
+    #[cfg(windows)] prepared_display: Option<u32>,
+) -> Option<ResultType<bool>> {
+    #[cfg(windows)]
+    if get_supported_impl(impl_key) == PRIVACY_MODE_IMPL_WIN_VIRTUAL_DISPLAY
+        && crate::virtual_display_manager::is_amyuni_idd()
+    {
+        return turn_on_privacy_async(impl_key.to_string(), conn_id, prepared_display).await;
+    }
     if is_async_privacy_mode() {
-        turn_on_privacy_async(impl_key.to_string(), conn_id).await
+        turn_on_privacy_async(
+            impl_key.to_string(),
+            conn_id,
+            #[cfg(windows)]
+            prepared_display,
+        )
+        .await
     } else {
-        turn_on_privacy_sync(impl_key, conn_id)
+        turn_on_privacy_sync(
+            impl_key,
+            conn_id,
+            #[cfg(windows)]
+            prepared_display,
+        )
     }
 }
 
@@ -226,10 +294,19 @@ fn is_async_privacy_mode() -> bool {
 }
 
 #[inline]
-async fn turn_on_privacy_async(impl_key: String, conn_id: i32) -> Option<ResultType<bool>> {
+async fn turn_on_privacy_async(
+    impl_key: String,
+    conn_id: i32,
+    #[cfg(windows)] prepared_display: Option<u32>,
+) -> Option<ResultType<bool>> {
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let res = turn_on_privacy_sync(&impl_key, conn_id);
+        let res = turn_on_privacy_sync(
+            &impl_key,
+            conn_id,
+            #[cfg(windows)]
+            prepared_display,
+        );
         let _ = tx.send(res);
     });
     // Wait at most 7.5 seconds for the result.
@@ -244,7 +321,11 @@ async fn turn_on_privacy_async(impl_key: String, conn_id: i32) -> Option<ResultT
     }
 }
 
-fn turn_on_privacy_sync(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>> {
+fn turn_on_privacy_sync(
+    impl_key: &str,
+    conn_id: i32,
+    #[cfg(windows)] prepared_display: Option<u32>,
+) -> Option<ResultType<bool>> {
     // Check if privacy mode is already on or occupied by another one
     let mut privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
 
@@ -285,8 +366,39 @@ fn turn_on_privacy_sync(impl_key: &str, conn_id: i32) -> Option<ResultType<bool>
         }
     }
 
+    let privacy_mode = privacy_mode_lock.as_mut()?;
+    #[cfg(windows)]
+    if let Some(index) = prepared_display {
+        if let Err(error) = privacy_mode.add_prepared_virtual_display(index) {
+            return Some(Err(error));
+        }
+    }
+
     // turn on privacy mode
-    Some(privacy_mode_lock.as_mut()?.turn_on_privacy(conn_id))
+    Some(privacy_mode.turn_on_privacy(conn_id))
+}
+
+#[cfg(not(target_os = "ios"))]
+pub(crate) fn close_other_remote_connections_for_privacy(owner_id: i32) {
+    use crate::server::{AuthConnType, AUTHED_CONNS};
+
+    let privacy_mode_lock = PRIVACY_MODE.lock().unwrap();
+    // Ownership can change while the caller validates the capturer.
+    if privacy_mode_lock.as_ref().map(|mode| mode.pre_conn_id()) != Some(owner_id) {
+        return;
+    }
+    for connection in AUTHED_CONNS.lock().unwrap().iter() {
+        if connection.conn_type != AuthConnType::Remote || connection.conn_id == owner_id {
+            continue;
+        }
+        if let Err(err) = connection.sender.send(crate::ipc::Data::Close) {
+            hbb_common::log::debug!(
+                "Failed to close connection {} for privacy mode: {}",
+                connection.conn_id,
+                err
+            );
+        }
+    }
 }
 
 #[inline]
