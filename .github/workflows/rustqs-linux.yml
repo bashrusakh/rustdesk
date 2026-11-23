@@ -193,10 +193,28 @@ jobs:
           components: "rustfmt"
 
       # 12 GB swap: ffmpeg/vcpkg + flutter build eat > 7 GB RAM на ubuntu-24.04 runner.
+      # Инлайн вместо pierotofy/set-swap-space: на новом варианте образа swap только zram
+      # (/dev/zram0), а то действие делает fallocate по последнему свопу и падает
+      # ("fallocate failed: No space left on device"). Файловый своп (если есть) ресайзим
+      # как раньше; иначе создаём свой файл на /mnt и не трогаем zram.
       - name: Set Swap Space
-        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0
-        with:
-          swap-size-gb: 12
+        shell: bash
+        run: |
+          set -eu
+          SWAP_FILE=$(swapon --show=NAME,TYPE | awk 'NR>1 && $2=="file" {print $1; exit}')
+          if [ -z "${SWAP_FILE:-}" ]; then
+            SWAP_FILE=/mnt/swapfile
+          fi
+          if swapon --show=NAME | grep -Fxq "$SWAP_FILE"; then
+            sudo swapoff "$SWAP_FILE"
+          fi
+          sudo rm -f "$SWAP_FILE"
+          sudo fallocate -l 12G "$SWAP_FILE"
+          sudo chmod 600 "$SWAP_FILE"
+          sudo mkswap "$SWAP_FILE"
+          sudo swapon "$SWAP_FILE"
+          free -h
+          swapon --show
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
