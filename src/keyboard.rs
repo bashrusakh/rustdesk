@@ -2,14 +2,14 @@
 use crate::flutter;
 #[cfg(target_os = "windows")]
 use crate::platform::windows::{get_char_from_vk, get_unicode_from_vk};
-#[cfg(not(any(feature = "flutter", feature = "cli")))]
+#[cfg(not(feature = "flutter"))]
 use crate::ui::CUR_SESSION;
 use crate::ui_session_interface::{InvokeUiSession, Session};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::{client::get_key_state, common::GrabState};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::log;
-use hbb_common::message_proto::*;
+use base::message_proto::*;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use rdev::KeyCode;
 use rdev::{Event, EventType, Key};
@@ -469,7 +469,7 @@ static mut IS_LEFT_OPTION_DOWN: bool = false;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn get_keyboard_mode() -> String {
-    #[cfg(not(any(feature = "flutter", feature = "cli")))]
+    #[cfg(not(feature = "flutter"))]
     if let Some(session) = CUR_SESSION.lock().unwrap().as_ref() {
         return session.get_keyboard_mode();
     }
@@ -991,7 +991,7 @@ pub fn event_to_key_events(
 }
 
 pub fn send_key_event(key_event: &KeyEvent) {
-    #[cfg(not(any(feature = "flutter", feature = "cli")))]
+    #[cfg(not(feature = "flutter"))]
     if let Some(session) = CUR_SESSION.lock().unwrap().as_ref() {
         session.send_key_event(key_event);
     }
@@ -1003,7 +1003,7 @@ pub fn send_key_event(key_event: &KeyEvent) {
 }
 
 pub fn get_peer_platform() -> String {
-    #[cfg(not(any(feature = "flutter", feature = "cli")))]
+    #[cfg(not(feature = "flutter"))]
     if let Some(session) = CUR_SESSION.lock().unwrap().as_ref() {
         return session.peer_platform();
     }
